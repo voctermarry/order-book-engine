@@ -16,6 +16,7 @@ BUY = "BUY"
 SELL = "SELL"
 LIMIT = "LIMIT"
 MARKET = "MARKET"
+ICEBERG = "ICEBERG"
 
 GTC = "GTC"
 IOC = "IOC"
@@ -37,7 +38,7 @@ UNKNOWN_ORDER = "UNKNOWN_ORDER"
 
 _ALL_KEYS = frozenset(
     {"event_id", "type", "order_id", "side", "order_type", "quantity", "price",
-     "time_in_force"}
+     "time_in_force", "display_quantity"}
 )
 _CANCEL_KEYS = frozenset({"event_id", "type", "order_id"})
 _REQUIRED_ADD_KEYS = frozenset({"event_id", "type", "order_id", "side", "order_type", "quantity"})
@@ -123,10 +124,27 @@ class Engine:
         if obj.get("side") not in (BUY, SELL):
             return INVALID_SCHEMA
         order_type = obj.get("order_type")
-        if order_type not in (LIMIT, MARKET):
+        if order_type not in (LIMIT, MARKET, ICEBERG):
             return INVALID_SCHEMA
         if not _is_positive_int(obj.get("quantity")):
             return INVALID_SCHEMA
+        if order_type != ICEBERG and "display_quantity" in obj:
+            # Only iceberg orders carry a display slice size.
+            return INVALID_SCHEMA
+
+        if order_type == ICEBERG:
+            # Iceberg orders are always-priced GTC limit orders whose single
+            # maximum visible slice must not exceed the total quantity.
+            if not _is_positive_int(obj.get("price")):
+                return INVALID_SCHEMA
+            display_quantity = obj.get("display_quantity")
+            if not _is_positive_int(display_quantity) or display_quantity > obj["quantity"]:
+                return INVALID_SCHEMA
+            tif = obj.get("time_in_force")
+            if "time_in_force" in obj and tif != GTC:
+                # Only an omitted field or explicit GTC are accepted.
+                return INVALID_SCHEMA
+            return None
 
         if "price" in obj:
             price = obj["price"]
@@ -161,11 +179,16 @@ class Engine:
         order_type: str = obj["order_type"]
         quantity: int = obj["quantity"]
         remaining: int = quantity
-        limit: int | None = obj["price"] if order_type == LIMIT else None
-        # LIMIT defaults to GTC; MARKET keeps its historical immediate-or-cancel
-        # semantics. MARKET with explicit GTC is rejected during schema checks.
+        is_iceberg = order_type == ICEBERG
+        limit: int | None = obj["price"] if order_type in (LIMIT, ICEBERG) else None
+        # LIMIT/ICEBERG default to GTC; MARKET keeps its historical
+        # immediate-or-cancel semantics. MARKET with explicit GTC and ICEBERG
+        # with any other time-in-force are rejected during schema checks.
         tif: str = obj.get("time_in_force") or (
-            GTC if order_type == LIMIT else IOC
+            GTC if order_type in (LIMIT, ICEBERG) else IOC
+        )
+        display_quantity: int | None = (
+            obj["display_quantity"] if is_iceberg else None
         )
 
         if side == BUY:
@@ -183,14 +206,22 @@ class Engine:
 
         # FOK must either match the whole quantity against the pre-event book
         # or do nothing at all: no trades, no book change, no trade ids spent.
-        if tif == FOK and sum(q for p, q in totals.items() if tradable(p)) < quantity:
-            self._orders[order_id] = {
-                "side": side,
-                "price": limit,
-                "remaining": remaining,
-                "status": CANCELLED,
-            }
-            return event_id, UNFILLED_CANCELLED, None, []
+        # A resting iceberg offers its full remaining quantity to this check,
+        # including reserve that is not part of the visible book totals.
+        if tif == FOK:
+            available = 0
+            for price, queue in opposite.items():
+                if tradable(price):
+                    for maker_id in queue:
+                        available += self._orders[maker_id]["remaining"]
+            if available < quantity:
+                self._orders[order_id] = {
+                    "side": side,
+                    "price": limit,
+                    "remaining": remaining,
+                    "status": CANCELLED,
+                }
+                return event_id, UNFILLED_CANCELLED, None, []
 
         trades: list[dict[str, object]] = []
         while remaining > 0:
@@ -202,7 +233,13 @@ class Engine:
             while remaining > 0 and queue:
                 maker_id = queue[0]
                 maker = self._orders[maker_id]
-                matched = min(remaining, maker["remaining"])
+                if maker.get("visible") is not None:
+                    # A resting iceberg can only trade its current slice; the
+                    # reserve stays hidden until the slice is exhausted.
+                    maker_available = maker["visible"]
+                else:
+                    maker_available = maker["remaining"]
+                matched = min(remaining, maker_available)
                 maker["remaining"] -= matched
                 remaining -= matched
                 totals[price] -= matched
@@ -216,35 +253,58 @@ class Engine:
                     }
                 )
                 self._next_trade_id += 1
-                if maker["remaining"] == 0:
+                if maker.get("visible") is not None:
+                    maker["visible"] -= matched
+                    if maker["visible"] == 0:
+                        # The slice leaves the front immediately. With reserve
+                        # left, the next slice joins behind every order already
+                        # visible at this price, so this same taker may meet the
+                        # order again after those orders.
+                        queue.popleft()
+                        if maker["remaining"] > 0:
+                            new_slice = min(
+                                maker["display_quantity"], maker["remaining"]
+                            )
+                            maker["visible"] = new_slice
+                            totals[price] += new_slice
+                            queue.append(maker_id)
+                        else:
+                            maker["status"] = FILLED
+                elif maker["remaining"] == 0:
                     queue.popleft()
                     maker["status"] = FILLED
             if not queue:
                 del opposite[price]
                 del totals[price]
 
+        record: dict[str, object] = {"side": side, "price": limit}
         if remaining == 0:
             result = FILLED
-            status = FILLED
-        elif order_type == LIMIT and tif == GTC:
+            record["remaining"] = 0
+            record["status"] = FILLED
+        elif order_type in (LIMIT, ICEBERG) and tif == GTC:
             result = PARTIALLY_FILLED_RESTING if trades else RESTING
-            status = RESTING
+            record["remaining"] = remaining
+            record["status"] = RESTING
             own_book = self._bids if side == BUY else self._asks
             own_totals = self._bid_totals if side == BUY else self._ask_totals
             own_book.setdefault(limit, deque()).append(order_id)
-            own_totals[limit] = own_totals.get(limit, 0) + remaining
+            if is_iceberg:
+                # Only the first slice enters the book; the rest is reserve.
+                visible = min(display_quantity, remaining)
+                record["display_quantity"] = display_quantity
+                record["visible"] = visible
+            else:
+                visible = remaining
+            own_totals[limit] = own_totals.get(limit, 0) + visible
         else:
             # IOC leftovers never enter the book; a successful FOK is always
             # fully filled by construction of the pre-event availability check.
             result = PARTIALLY_FILLED_CANCELLED if trades else UNFILLED_CANCELLED
-            status = CANCELLED
+            record["remaining"] = remaining
+            record["status"] = CANCELLED
 
-        self._orders[order_id] = {
-            "side": side,
-            "price": limit,
-            "remaining": remaining,
-            "status": status,
-        }
+        self._orders[order_id] = record
         return event_id, result, None, trades
 
     def _cancel(
@@ -264,7 +324,10 @@ class Engine:
 
         queue = own_book[price]
         queue.remove(order_id)
-        own_totals[price] -= record["remaining"]
+        # Book totals hold only the current visible slice of an iceberg; its
+        # reserve is cancelled along with it but was never aggregated.
+        visible = record.get("visible", record["remaining"])
+        own_totals[price] -= visible
         if own_totals[price] == 0:
             del own_totals[price]
             del own_book[price]
