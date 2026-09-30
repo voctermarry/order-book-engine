@@ -178,6 +178,205 @@ def test_market_leftover_does_not_rest_and_cannot_be_cancelled():
     assert reason == "UNKNOWN_ORDER"
 
 
+def test_limit_ioc_outcomes():
+    # Fully filled against one resting order.
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 3, 100)])
+    _, result, reason, trades = engine.handle_line(
+        add("e2", "b1", "BUY", "LIMIT", 3, 100, time_in_force="IOC")
+    )
+    assert (result, reason) == ("FILLED", None)
+    assert [t["quantity"] for t in trades] == [3]
+    assert engine.snapshot() == ([], [])
+
+    # Partial fill: leftover is cancelled, nothing enters the bid book.
+    engine, _ = book_after([add("e3", "s2", "SELL", "LIMIT", 2, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e4", "b2", "BUY", "LIMIT", 5, 100, time_in_force="IOC")
+    )
+    assert result == "PARTIALLY_FILLED_CANCELLED"
+    assert [t["quantity"] for t in trades] == [2]
+    assert engine.snapshot() == ([], [])
+
+    # No trade when nothing satisfies the limit; book stays untouched.
+    engine, _ = book_after([add("e5", "s3", "SELL", "LIMIT", 1, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e6", "b3", "BUY", "LIMIT", 1, 99, time_in_force="IOC")
+    )
+    assert result == "UNFILLED_CANCELLED"
+    assert trades == []
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 1}]
+
+    # Sell-side IOC hits the highest bid and cancels the leftover.
+    engine, _ = book_after([add("e7", "b4", "BUY", "LIMIT", 2, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e8", "s4", "SELL", "LIMIT", 4, 100, time_in_force="IOC")
+    )
+    assert result == "PARTIALLY_FILLED_CANCELLED"
+    assert [t["maker_order_id"] for t in trades] == ["b4"]
+    assert engine.snapshot() == ([], [])
+
+
+def test_ioc_leftover_cannot_be_cancelled_and_trade_ids_continue():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 2, 100)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 5, 100, time_in_force="IOC"))
+    _, result, reason, _ = engine.handle_line(cancel("e3", "b1"))
+    assert (result, reason) == ("REJECTED", "UNKNOWN_ORDER")
+
+    # The unfilled IOC must not shadow later liquidity; ids stay sequential.
+    engine, _ = book_after(
+        [
+            add("e4", "s2", "SELL", "LIMIT", 1, 101),
+            add("e5", "s3", "SELL", "LIMIT", 1, 100),
+            add("e6", "s4", "SELL", "LIMIT", 1, 100),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(
+        add("e7", "b2", "BUY", "LIMIT", 1, 99, time_in_force="IOC")
+    )
+    assert result == "UNFILLED_CANCELLED"
+    assert trades == []
+    _, _, _, trades = engine.handle_line(add("e8", "b3", "BUY", "LIMIT", 2, 100))
+    assert [t["trade_id"] for t in trades] == [1, 2]
+    assert [t["maker_order_id"] for t in trades] == ["s3", "s4"]
+
+
+def test_limit_fok_success_is_all_or_nothing():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 99),
+            add("e2", "s2", "SELL", "LIMIT", 3, 100),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(
+        add("e3", "b1", "BUY", "LIMIT", 5, 100, time_in_force="FOK")
+    )
+    assert result == "FILLED"
+    assert trades == [
+        {"trade_id": 1, "maker_order_id": "s1", "taker_order_id": "b1",
+         "price": 99, "quantity": 2},
+        {"trade_id": 2, "maker_order_id": "s2", "taker_order_id": "b1",
+         "price": 100, "quantity": 3},
+    ]
+    assert engine.snapshot() == ([], [])
+
+    # A partially consumed maker keeps resting with its reduced quantity.
+    engine, _ = book_after([add("e4", "s3", "SELL", "LIMIT", 4, 100)])
+    _, _, _, trades = engine.handle_line(
+        add("e5", "b2", "BUY", "LIMIT", 3, 100, time_in_force="FOK")
+    )
+    assert [t["quantity"] for t in trades] == [3]
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 1}]
+
+
+def test_limit_fok_failure_changes_nothing():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 2, 100)])
+    line = add("e2", "b1", "BUY", "LIMIT", 5, 100, time_in_force="FOK")
+    _, result, reason, trades = engine.handle_line(line)
+    assert (result, reason) == ("UNFILLED_CANCELLED", None)
+    assert trades == []
+    # Snapshot equals the pre-event book.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+
+    # Enough size exists but outside the limit price: still nothing happens.
+    engine, _ = book_after([add("e3", "s2", "SELL", "LIMIT", 5, 101)])
+    _, result, _, trades = engine.handle_line(
+        add("e4", "b2", "BUY", "LIMIT", 5, 100, time_in_force="FOK")
+    )
+    assert result == "UNFILLED_CANCELLED"
+    assert trades == []
+    assert engine.snapshot()[1] == [{"price": 101, "quantity": 5}]
+
+    # No trade identifiers were consumed by either failed FOK.
+    _, _, _, trades = engine.handle_line(add("e5", "b3", "BUY", "LIMIT", 1, 101))
+    assert [t["trade_id"] for t in trades] == [1]
+
+
+def test_failed_fok_occupies_event_and_order_ids():
+    engine = Engine()
+    line = add("e1", "b1", "BUY", "LIMIT", 3, 100, time_in_force="FOK")
+    assert engine.handle_line(line)[1] == "UNFILLED_CANCELLED"
+    assert engine.handle_line(line)[1:3] == ("REJECTED", "DUPLICATE_EVENT_ID")
+    _, result, reason, _ = engine.handle_line(
+        add("e2", "b1", "SELL", "LIMIT", 1, 100, time_in_force="FOK")
+    )
+    assert (result, reason) == ("REJECTED", "DUPLICATE_ORDER_ID")
+    # The schema-valid duplicate-order event also consumed its event id.
+    assert engine.handle_line(add("e2", "o2", "SELL", "LIMIT", 1, 100))[2] == (
+        "DUPLICATE_EVENT_ID"
+    )
+
+
+def test_market_ioc_and_fok():
+    # Explicit IOC matches the historical market semantics.
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 2, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e2", "b1", "BUY", "MARKET", 5, time_in_force="IOC")
+    )
+    assert result == "PARTIALLY_FILLED_CANCELLED"
+    assert [t["quantity"] for t in trades] == [2]
+    assert engine.snapshot() == ([], [])
+
+    # FOK market order succeeds only when the whole quantity is available.
+    engine, _ = book_after([add("e3", "s2", "SELL", "LIMIT", 2, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e4", "b2", "BUY", "MARKET", 2, time_in_force="FOK")
+    )
+    assert result == "FILLED"
+    assert len(trades) == 1
+
+    engine, _ = book_after([add("e5", "s3", "SELL", "LIMIT", 2, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e6", "b3", "BUY", "MARKET", 3, time_in_force="FOK")
+    )
+    assert result == "UNFILLED_CANCELLED"
+    assert trades == []
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+
+    # Empty book FOK market order spends no trade ids.
+    engine = Engine()
+    _, result, _, trades = engine.handle_line(
+        add("e7", "b4", "SELL", "MARKET", 1, time_in_force="FOK")
+    )
+    assert result == "UNFILLED_CANCELLED"
+    assert trades == []
+
+
+@pytest.mark.parametrize("tif", ["GTC", "IOC", "FOK"])
+def test_limit_explicit_tif_requires_valid_price(tif):
+    engine = Engine()
+    line = json.dumps(
+        {"event_id": "e1", "type": "ADD", "order_id": "o1", "side": "BUY",
+         "order_type": "LIMIT", "quantity": 1, "time_in_force": tif}
+    )
+    assert engine.handle_line(line)[1:3] == ("REJECTED", "INVALID_SCHEMA")
+
+
+def test_time_in_force_schema_rejections():
+    engine = Engine()
+    for payload in [
+        # MARKET cannot be GTC.
+        {"event_id": "e1", "type": "ADD", "order_id": "o1", "side": "BUY",
+         "order_type": "MARKET", "quantity": 1, "time_in_force": "GTC"},
+        # Unknown string value.
+        {"event_id": "e2", "type": "ADD", "order_id": "o2", "side": "BUY",
+         "order_type": "LIMIT", "quantity": 1, "price": 100, "time_in_force": "DAY"},
+        # Non-string values.
+        {"event_id": "e3", "type": "ADD", "order_id": "o3", "side": "BUY",
+         "order_type": "LIMIT", "quantity": 1, "price": 100, "time_in_force": 123},
+        {"event_id": "e4", "type": "ADD", "order_id": "o4", "side": "BUY",
+         "order_type": "LIMIT", "quantity": 1, "price": 100, "time_in_force": None},
+    ]:
+        assert engine.handle_line(json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), payload
+
+    # Explicit LIMIT GTC with a valid price is accepted and behaves as before.
+    eid, result, reason, _ = engine.handle_line(
+        add("e5", "o5", "BUY", "LIMIT", 1, 100, time_in_force="GTC")
+    )
+    assert (eid, result, reason) == ("e5", "RESTING", None)
+
+
 def test_cancel_results():
     engine, _ = book_after([add("e1", "b1", "BUY", "LIMIT", 3, 100)])
     _, result, reason, trades = engine.handle_line(cancel("e2", "b1"))

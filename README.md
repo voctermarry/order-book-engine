@@ -39,7 +39,7 @@ order-book-engine replay     # 从标准输入回放订单事件
 ADD：
 
 ```json
-{"event_id": "e1", "type": "ADD", "order_id": "o1", "side": "BUY", "order_type": "LIMIT", "quantity": 5, "price": 100}
+{"event_id": "e1", "type": "ADD", "order_id": "o1", "side": "BUY", "order_type": "LIMIT", "quantity": 5, "price": 100, "time_in_force": "GTC"}
 ```
 
 - `event_id`：全流唯一字符串。
@@ -48,6 +48,12 @@ ADD：
 - `order_type`：`LIMIT` 或 `MARKET`。
 - `quantity`：正整数。
 - `price`：LIMIT 必填正整数；MARKET 不得带非空 `price`（可省略或为 `null`）。
+- `time_in_force`：可选，取值 `GTC`、`IOC`、`FOK`。
+  - LIMIT 省略时按 `GTC` 处理（余量入簿）；`GTC`、`IOC`、`FOK` 均要求有效 `price`。
+  - MARKET 省略时保持「立即成交、余量取消」语义；可显式指定 `IOC` 或 `FOK`，不得为 `GTC`。
+  - `IOC`：仅撮合事件到达时可成交的数量，余量一律取消、不入簿；完全成交为 `FILLED`，部分成交为 `PARTIALLY_FILLED_CANCELLED`，完全未成交为 `UNFILLED_CANCELLED`。
+  - `FOK`：先依据事件到达前的可成交盘口判断全部数量能否在限价范围内成交。数量足够时一次性生成全部成交；数量不足时不产生任何成交、不改变盘口、不消耗成交编号，返回 `UNFILLED_CANCELLED`。失败的 FOK 仍是已处理订单，其 `event_id` 与 `order_id` 均被占用。
+  - 非字符串或其他取值、MARKET 与 GTC 的组合均以 `INVALID_SCHEMA` 拒绝。
 
 CANCEL：
 
@@ -61,8 +67,8 @@ CANCEL：
 
 - 买单匹配最低卖价，卖单匹配最高买价；同价位先到者优先（价格时间优先）。
 - 限价单不得越过自身价格；成交价取被动单（maker）价格。
-- 限价单余量入簿；市价单余量取消；撤单不产生成交。
-- 成交编号从 1 开始连续递增。
+- GTC 限价单余量入簿；IOC 余量取消、绝不入簿；FOK 要么在事件前盘口上全部成交，要么完全不成交；市价单余量取消；撤单不产生成交。
+- 成交编号从 1 开始连续递增（失败的 FOK 不消耗编号）。
 
 ### 每个事件的输出
 
@@ -75,8 +81,9 @@ CANCEL：
 - `input_line`：去除行终止符后的原始输入文本。
 - `event_id`：可取得时为字符串，否则为 `null`。
 - `result`：
-  - 限价单：`FILLED`、`RESTING`、`PARTIALLY_FILLED_RESTING`
-  - 市价单：`FILLED`、`PARTIALLY_FILLED_CANCELLED`、`UNFILLED_CANCELLED`
+  - GTC 限价单：`FILLED`、`RESTING`、`PARTIALLY_FILLED_RESTING`
+  - IOC 限价单/市价单：`FILLED`、`PARTIALLY_FILLED_CANCELLED`、`UNFILLED_CANCELLED`
+  - FOK 限价单/市价单：`FILLED`、`UNFILLED_CANCELLED`
   - 撤单成功：`CANCELLED`
   - 拒绝：`REJECTED`（附加 `reason`）
 - `trades`：按发生顺序排列；每笔含 `maker_order_id`、`taker_order_id`、`price`、`quantity` 与 `trade_id`。
