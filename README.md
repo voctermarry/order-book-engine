@@ -48,6 +48,10 @@ ADD：
 - `order_type`：`LIMIT` 或 `MARKET`。
 - `quantity`：正整数。
 - `price`：LIMIT 必填正整数；MARKET 不得带非空 `price`（可省略或为 `null`）。
+- `time_in_force`：可选，仅限字符串 `GTC`、`IOC`、`FOK`。
+  - LIMIT 缺省按 `GTC` 处理，三种时效均要求有效 `price`。
+  - MARKET 缺省为“立即成交、余量取消”（等同 `IOC`），可显式指定 `IOC` 或 `FOK`；MARKET 与 `GTC` 的组合将被拒绝。
+  - 非字符串或其他取值一律以 `INVALID_SCHEMA` 拒绝。
 
 CANCEL：
 
@@ -61,7 +65,8 @@ CANCEL：
 
 - 买单匹配最低卖价，卖单匹配最高买价；同价位先到者优先（价格时间优先）。
 - 限价单不得越过自身价格；成交价取被动单（maker）价格。
-- 限价单余量入簿；市价单余量取消；撤单不产生成交。
+- `GTC` 限价单余量入簿；`IOC` 只撮合当时可成交数量，余量取消不入簿；`FOK` 先按事件前盘口判断全部数量能否在限价范围内成交，不足则不产生任何成交、不改变盘口、不消耗成交编号。
+- 市价单余量取消；撤单不产生成交。
 - 成交编号从 1 开始连续递增。
 
 ### 每个事件的输出
@@ -75,8 +80,10 @@ CANCEL：
 - `input_line`：去除行终止符后的原始输入文本。
 - `event_id`：可取得时为字符串，否则为 `null`。
 - `result`：
-  - 限价单：`FILLED`、`RESTING`、`PARTIALLY_FILLED_RESTING`
-  - 市价单：`FILLED`、`PARTIALLY_FILLED_CANCELLED`、`UNFILLED_CANCELLED`
+  - 限价单（`GTC`）：`FILLED`、`RESTING`、`PARTIALLY_FILLED_RESTING`
+  - `IOC`（限价或市价）：`FILLED`、`PARTIALLY_FILLED_CANCELLED`、`UNFILLED_CANCELLED`
+  - `FOK`（限价或市价）：`FILLED` 或 `UNFILLED_CANCELLED`（失败时 `trades` 为空、盘口不变，但 `event_id` 与 `order_id` 仍被占用）
+  - 市价单（缺省时效）：`FILLED`、`PARTIALLY_FILLED_CANCELLED`、`UNFILLED_CANCELLED`
   - 撤单成功：`CANCELLED`
   - 拒绝：`REJECTED`（附加 `reason`）
 - `trades`：按发生顺序排列；每笔含 `maker_order_id`、`taker_order_id`、`price`、`quantity` 与 `trade_id`。

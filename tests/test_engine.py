@@ -319,6 +319,166 @@ def test_rejection_keeps_book_trade_ids_and_priority():
     assert [t["maker_order_id"] for t in trades] == ["s1"]
 
 
+def test_limit_ioc_fills_what_it_can_and_never_rests():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 2, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e2", "b1", "BUY", "LIMIT", 5, 100, time_in_force="IOC")
+    )
+    assert result == "PARTIALLY_FILLED_CANCELLED"
+    assert [t["quantity"] for t in trades] == [2]
+    # The leftover must not rest on the book.
+    assert engine.snapshot() == ([], [])
+    _, result, reason, _ = engine.handle_line(cancel("e3", "b1"))
+    assert (result, reason) == ("REJECTED", "UNKNOWN_ORDER")
+
+    _, result, _, trades = engine.handle_line(
+        add("e4", "b2", "BUY", "LIMIT", 1, 100, time_in_force="IOC")
+    )
+    assert (result, trades) == ("UNFILLED_CANCELLED", [])
+
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 3, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e2", "b1", "BUY", "LIMIT", 3, 100, time_in_force="IOC")
+    )
+    assert result == "FILLED"
+    assert len(trades) == 1
+
+
+def test_limit_ioc_respects_its_own_price():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 2, 101)])
+    _, result, _, trades = engine.handle_line(
+        add("e2", "b1", "BUY", "LIMIT", 2, 100, time_in_force="IOC")
+    )
+    assert (result, trades) == ("UNFILLED_CANCELLED", [])
+    assert engine.snapshot() == ([], [{"price": 101, "quantity": 2}])
+
+
+def test_limit_fok_fills_in_full_when_liquidity_suffices():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100),
+            add("e2", "s2", "SELL", "LIMIT", 3, 101),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(
+        add("e3", "b1", "BUY", "LIMIT", 4, 101, time_in_force="FOK")
+    )
+    assert result == "FILLED"
+    assert [(t["trade_id"], t["maker_order_id"], t["price"], t["quantity"]) for t in trades] == [
+        (1, "s1", 100, 2),
+        (2, "s2", 101, 2),
+    ]
+    assert engine.snapshot() == ([], [{"price": 101, "quantity": 1}])
+
+
+def test_limit_fok_fails_without_trading_or_mutating_state():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100),
+            add("e2", "s2", "SELL", "LIMIT", 3, 101),
+        ]
+    )
+    before = engine.snapshot()
+    # Total liquidity is 5 but only 2 within the limit price.
+    _, result, _, trades = engine.handle_line(
+        add("e3", "b1", "BUY", "LIMIT", 3, 100, time_in_force="FOK")
+    )
+    assert (result, trades) == ("UNFILLED_CANCELLED", [])
+    assert engine.snapshot() == before
+
+    # Enough in total but the FOK quantity exceeds everything available.
+    _, result, _, trades = engine.handle_line(
+        add("e4", "b2", "BUY", "LIMIT", 6, 200, time_in_force="FOK")
+    )
+    assert (result, trades) == ("UNFILLED_CANCELLED", [])
+    assert engine.snapshot() == before
+
+    # Failed FOK consumed no trade ids: the next fill starts at 1.
+    _, result, _, trades = engine.handle_line(
+        add("e5", "b3", "BUY", "LIMIT", 2, 100, time_in_force="FOK")
+    )
+    assert result == "FILLED"
+    assert [t["trade_id"] for t in trades] == [1]
+
+    # Failed FOK still occupied its event id and order id.
+    assert engine.handle_line(
+        add("e4", "oX", "BUY", "LIMIT", 1, 100)
+    )[1:3] == ("REJECTED", "DUPLICATE_EVENT_ID")
+    assert engine.handle_line(
+        add("e6", "b2", "BUY", "LIMIT", 1, 100)
+    )[1:3] == ("REJECTED", "DUPLICATE_ORDER_ID")
+
+
+def test_market_explicit_ioc_matches_default_behaviour():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 2, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e2", "b1", "BUY", "MARKET", 5, time_in_force="IOC")
+    )
+    assert result == "PARTIALLY_FILLED_CANCELLED"
+    assert [t["quantity"] for t in trades] == [2]
+    assert engine.snapshot() == ([], [])
+
+
+def test_market_fok():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 3, 100)])
+    _, result, _, trades = engine.handle_line(
+        add("e2", "b1", "BUY", "MARKET", 3, time_in_force="FOK")
+    )
+    assert result == "FILLED"
+    assert len(trades) == 1
+
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 2, 100)])
+    before = engine.snapshot()
+    _, result, _, trades = engine.handle_line(
+        add("e2", "b1", "BUY", "MARKET", 3, time_in_force="FOK")
+    )
+    assert (result, trades) == ("UNFILLED_CANCELLED", [])
+    assert engine.snapshot() == before
+
+
+def test_time_in_force_schema_validation():
+    engine = Engine()
+    bad = [
+        # MARKET may not be combined with GTC.
+        add("e1", "o1", "BUY", "MARKET", 1, time_in_force="GTC"),
+        # Non-string time_in_force values.
+        add("e2", "o2", "BUY", "LIMIT", 1, 100, time_in_force=1),
+        add("e3", "o3", "BUY", "LIMIT", 1, 100, time_in_force=None),
+        add("e4", "o4", "BUY", "LIMIT", 1, 100, time_in_force=True),
+        # Unknown time_in_force value.
+        add("e5", "o5", "BUY", "LIMIT", 1, 100, time_in_force="DAY"),
+        add("e6", "o6", "BUY", "MARKET", 1, time_in_force="DAY"),
+        # CANCEL must not carry time_in_force.
+        json.dumps({"event_id": "e7", "type": "CANCEL", "order_id": "o1",
+                    "time_in_force": "GTC"}),
+        # LIMIT with IOC/FOK still requires a valid price.
+        add("e8", "o8", "BUY", "LIMIT", 1, time_in_force="IOC"),
+        add("e9", "o9", "BUY", "LIMIT", 1, price=0, time_in_force="FOK"),
+    ]
+    for line in bad:
+        assert engine.handle_line(line)[1:3] == ("REJECTED", "INVALID_SCHEMA"), line
+
+    # Explicit GTC on LIMIT behaves exactly like the default.
+    engine, _ = book_after([add("e1", "b1", "BUY", "LIMIT", 2, 100, time_in_force="GTC")])
+    assert engine.snapshot() == ([{"price": 100, "quantity": 2}], [])
+
+
+def test_old_streams_produce_identical_results_with_tif_defaults():
+    # The default (no time_in_force) semantics are unchanged: LIMIT rests,
+    # MARKET cancels its leftover.
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 2, 100)])
+    _, result, _, _ = engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 5, 100))
+    assert result == "PARTIALLY_FILLED_RESTING"
+    assert engine.snapshot() == ([{"price": 100, "quantity": 3}], [])
+    _, result, _, _ = engine.handle_line(add("e3", "b2", "BUY", "MARKET", 9))
+    assert result == "UNFILLED_CANCELLED"
+    assert engine.snapshot() == ([{"price": 100, "quantity": 3}], [])
+    _, result, _, trades = engine.handle_line(add("e4", "s2", "SELL", "MARKET", 9))
+    assert result == "PARTIALLY_FILLED_CANCELLED"
+    assert [t["quantity"] for t in trades] == [3]
+    assert engine.snapshot() == ([], [])
+
+
 def run_replay(text: str):
     stdin = io.TextIOWrapper(io.BytesIO(text.encode("utf-8")))
     stdout = io.TextIOWrapper(io.BytesIO())

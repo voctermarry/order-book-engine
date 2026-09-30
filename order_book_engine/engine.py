@@ -17,6 +17,11 @@ SELL = "SELL"
 LIMIT = "LIMIT"
 MARKET = "MARKET"
 
+GTC = "GTC"
+IOC = "IOC"
+FOK = "FOK"
+_TIF_VALUES = (GTC, IOC, FOK)
+
 FILLED = "FILLED"
 RESTING = "RESTING"
 PARTIALLY_FILLED_RESTING = "PARTIALLY_FILLED_RESTING"
@@ -32,7 +37,8 @@ DUPLICATE_ORDER_ID = "DUPLICATE_ORDER_ID"
 UNKNOWN_ORDER = "UNKNOWN_ORDER"
 
 _ALL_KEYS = frozenset(
-    {"event_id", "type", "order_id", "side", "order_type", "quantity", "price"}
+    {"event_id", "type", "order_id", "side", "order_type", "quantity", "price",
+     "time_in_force"}
 )
 _CANCEL_KEYS = frozenset({"event_id", "type", "order_id"})
 _REQUIRED_ADD_KEYS = frozenset({"event_id", "type", "order_id", "side", "order_type", "quantity"})
@@ -134,6 +140,13 @@ class Engine:
         elif order_type == LIMIT:
             return INVALID_SCHEMA
 
+        if "time_in_force" in obj:
+            tif = obj["time_in_force"]
+            if not isinstance(tif, str) or tif not in _TIF_VALUES:
+                return INVALID_SCHEMA
+            if order_type == MARKET and tif == GTC:
+                return INVALID_SCHEMA
+
         return None
 
     def _add(
@@ -148,6 +161,10 @@ class Engine:
         order_type: str = obj["order_type"]
         remaining: int = obj["quantity"]
         limit: int | None = obj["price"] if order_type == LIMIT else None
+        # LIMIT defaults to GTC; MARKET defaults to the historical
+        # "fill what is available now, cancel the rest" behaviour, which is
+        # exactly IOC.
+        tif: str = obj.get("time_in_force") or (GTC if order_type == LIMIT else IOC)
 
         if side == BUY:
             opposite = self._asks
@@ -161,6 +178,21 @@ class Engine:
 
             def tradable(price: int) -> bool:
                 return limit is None or price >= limit
+
+        if tif == FOK:
+            # All-or-nothing: the full quantity must be fillable within the
+            # price constraint against the book as it was before this event.
+            # Otherwise nothing trades, the book is untouched and no trade
+            # ids are consumed.
+            available = sum(qty for price, qty in totals.items() if tradable(price))
+            if available < remaining:
+                self._orders[order_id] = {
+                    "side": side,
+                    "price": limit,
+                    "remaining": remaining,
+                    "status": CANCELLED,
+                }
+                return event_id, UNFILLED_CANCELLED, None, []
 
         trades: list[dict[str, object]] = []
         while remaining > 0:
@@ -196,7 +228,7 @@ class Engine:
         if remaining == 0:
             result = FILLED
             status = FILLED
-        elif order_type == LIMIT:
+        elif tif == GTC:
             result = PARTIALLY_FILLED_RESTING if trades else RESTING
             status = RESTING
             own_book = self._bids if side == BUY else self._asks
@@ -204,6 +236,8 @@ class Engine:
             own_book.setdefault(limit, deque()).append(order_id)
             own_totals[limit] = own_totals.get(limit, 0) + remaining
         else:
+            # IOC never rests; a FOK order that reaches the matching loop is
+            # guaranteed to fill in full, so it never lands here either.
             result = PARTIALLY_FILLED_CANCELLED if trades else UNFILLED_CANCELLED
             status = CANCELLED
 
