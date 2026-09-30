@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "order-book-engine"
+version = "0.1.0"
+description = "Deterministic limit order book matching and execution analytics"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+order-book-engine = "order_book_engine.cli:main"
+
+[tool.setuptools]
+packages = ["order_book_engine"]
