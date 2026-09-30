@@ -30,6 +30,21 @@ def cancel(event_id, order_id):
     return json.dumps({"event_id": event_id, "type": "CANCEL", "order_id": order_id})
 
 
+def iceberg(event_id, order_id, side, quantity, price, display_quantity, **extra):
+    obj = {
+        "event_id": event_id,
+        "type": "ADD",
+        "order_id": order_id,
+        "side": side,
+        "order_type": "ICEBERG",
+        "quantity": quantity,
+        "price": price,
+        "display_quantity": display_quantity,
+    }
+    obj.update(extra)
+    return json.dumps(obj)
+
+
 def book_after(lines):
     engine = Engine()
     results = []
@@ -618,3 +633,394 @@ def test_replay_write_failure_is_io_error():
     code = replay.replay(stdin, BrokenPipe(), stderr)
     assert code == 1
     assert stderr.getvalue() == "ERROR_IO\n"
+
+
+# ---------------------------------------------------------------------------
+# ICEBERG
+# ---------------------------------------------------------------------------
+
+
+def test_iceberg_resting_exposes_only_display_slice():
+    engine = Engine()
+    eid, result, reason, trades = engine.handle_line(
+        iceberg("e1", "i1", "SELL", 10, 100, 3)
+    )
+    assert (eid, result, reason, trades) == ("e1", "RESTING", None, [])
+    assert engine.snapshot() == ([], [{"price": 100, "quantity": 3}])
+
+    # display == quantity is allowed and looks like an ordinary limit.
+    eid, result, _, _ = engine.handle_line(iceberg("e2", "i2", "BUY", 4, 99, 4))
+    assert (eid, result) == ("e2", "RESTING")
+    assert engine.snapshot()[0] == [{"price": 99, "quantity": 4}]
+
+
+def test_iceberg_explicit_gtc_and_default_match():
+    engine = Engine()
+    assert engine.handle_line(
+        iceberg("e1", "i1", "SELL", 5, 100, 2, time_in_force="GTC")
+    )[1] == "RESTING"
+    assert engine.handle_line(iceberg("e2", "i2", "SELL", 5, 100, 2))[1] == "RESTING"
+
+
+def test_iceberg_passive_slice_consumed_then_requeued_behind_peers():
+    engine, _ = book_after(
+        [
+            iceberg("e1", "i1", "SELL", 10, 100, 3),
+            add("e2", "s1", "SELL", "LIMIT", 2, 100),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(add("e3", "b1", "BUY", "LIMIT", 7, 100))
+    assert result == "FILLED"
+    # First slice of i1 (3), then the later ordinary order s1 (2), then the
+    # replenished slice of i1 (2) -- the taker meets i1 twice with s1 in between.
+    assert [(t["trade_id"], t["maker_order_id"], t["quantity"], t["price"]) for t in trades] == [
+        (1, "i1", 3, 100),
+        (2, "s1", 2, 100),
+        (3, "i1", 2, 100),
+    ]
+    # i1 has 5 left but the partially consumed slice only shows 1.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 1}]
+
+
+def test_iceberg_replenishment_keeps_price_time_priority_across_events():
+    # A replenished slice goes to the back of the same-price queue; an order
+    # arriving later must trade before the next taker meets the iceberg again.
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 8, 100, 2)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 2, 100))  # exhaust first slice
+    # Between events the replenished slice rests; a new resting seller lands
+    # ahead of it in arrival order.
+    engine.handle_line(add("e3", "s1", "SELL", "LIMIT", 3, 100))
+    _, _, _, trades = engine.handle_line(add("e4", "b2", "BUY", "LIMIT", 6, 100))
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [
+        ("i1", 2),
+        ("s1", 3),
+        ("i1", 1),
+    ]
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 1}]
+
+
+def test_iceberg_partial_slice_does_not_replenish_until_exhausted():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 1, 100))
+    # Slice partially consumed: 2 visible, reserve untouched, no requeue.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+    # It keeps its place at the front; the next taker hits it first.
+    _, _, _, trades = engine.handle_line(add("e3", "b2", "BUY", "LIMIT", 1, 100))
+    assert [t["maker_order_id"] for t in trades] == ["i1"]
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 1}]
+
+
+def test_iceberg_final_slice_is_smaller_and_order_fills():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 7, 100, 3)])
+    _, result, _, trades = engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 7, 100))
+    assert result == "FILLED"
+    assert [t["quantity"] for t in trades] == [3, 3, 1]
+    assert [t["maker_order_id"] for t in trades] == ["i1", "i1", "i1"]
+    assert [t["trade_id"] for t in trades] == [1, 2, 3]
+    assert engine.snapshot() == ([], [])
+
+
+def test_iceberg_passive_fill_status_and_cancel_unknown():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 3, 100, 3)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 3, 100))
+    # Fully filled iceberg cannot be cancelled.
+    _, result, reason, _ = engine.handle_line(cancel("e3", "i1"))
+    assert (result, reason) == ("REJECTED", "UNKNOWN_ORDER")
+
+
+def test_iceberg_taker_uses_full_remaining_not_display():
+    # An aggressive iceberg itself matches with all of its quantity, then rests
+    # only the display slice of its leftover.
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100),
+            add("e2", "s2", "SELL", "LIMIT", 3, 100),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(
+        iceberg("e3", "i9", "BUY", 10, 100, 2)
+    )
+    assert result == "PARTIALLY_FILLED_RESTING"
+    assert [t["quantity"] for t in trades] == [2, 3]
+    assert engine.snapshot()[0] == [{"price": 100, "quantity": 2}]
+
+
+def test_iceberg_taker_fully_filled_has_no_rest():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 4, 100)])
+    _, result, _, trades = engine.handle_line(
+        iceberg("e2", "i1", "BUY", 4, 100, 2)
+    )
+    assert result == "FILLED"
+    assert len(trades) == 1
+    assert engine.snapshot() == ([], [])
+
+
+def test_market_order_consumes_iceberg_replenishment():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 2)])
+    _, result, _, trades = engine.handle_line(add("e2", "m1", "BUY", "MARKET", 7))
+    assert result == "FILLED"
+    assert [t["quantity"] for t in trades] == [2, 2, 2, 1]
+    # Remaining 3 still hides behind the partially consumed slice of 1.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 1}]
+
+
+def test_ioc_consumes_iceberg_replenishment():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 2)])
+    _, result, _, trades = engine.handle_line(
+        add("e2", "q1", "BUY", "LIMIT", 5, 100, time_in_force="IOC")
+    )
+    assert result == "FILLED"
+    assert [t["quantity"] for t in trades] == [2, 2, 1]
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 1}]
+
+
+def test_ordinary_limit_consumes_iceberg_replenishment_and_rests():
+    engine, _ = book_after(
+        [
+            iceberg("e1", "i1", "SELL", 6, 100, 2),
+            add("e2", "s1", "SELL", "LIMIT", 1, 100),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(add("e3", "b1", "BUY", "LIMIT", 5, 100))
+    assert result == "FILLED"
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [
+        ("i1", 2),
+        ("s1", 1),
+        ("i1", 2),
+    ]
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+
+
+def test_iceberg_cancel_removes_visible_and_reserve():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    assert engine.handle_line(cancel("e2", "i1"))[1] == "CANCELLED"
+    assert engine.snapshot() == ([], [])
+    # Second cancel is unknown; the reserve cannot leak back.
+    assert engine.handle_line(cancel("e3", "i1"))[2] == "UNKNOWN_ORDER"
+
+
+def test_cancel_partially_consumed_iceberg_removes_visible_slice():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 4, 100))  # 3 + replenished 1
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+    assert engine.handle_line(cancel("e3", "i1"))[1] == "CANCELLED"
+    assert engine.snapshot() == ([], [])
+
+
+def test_fok_precheck_counts_full_iceberg_reserve():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 2)])
+    _, result, _, trades = engine.handle_line(
+        add("e2", "f1", "BUY", "LIMIT", 10, 100, time_in_force="FOK")
+    )
+    assert result == "FILLED"
+    assert [t["quantity"] for t in trades] == [2, 2, 2, 2, 2]
+    assert engine.snapshot() == ([], [])
+
+
+def test_fok_precheck_combines_visible_and_reserve_with_other_orders():
+    engine, _ = book_after(
+        [
+            iceberg("e1", "i1", "SELL", 7, 100, 2),
+            add("e2", "s1", "SELL", "LIMIT", 3, 100),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(
+        add("e3", "f1", "BUY", "LIMIT", 10, 100, time_in_force="FOK")
+    )
+    assert result == "FILLED"
+    assert [t["quantity"] for t in trades] == [2, 3, 2, 2, 1]
+
+
+def test_fok_failure_against_iceberg_changes_nothing():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 2)])
+    _, result, reason, trades = engine.handle_line(
+        add("e2", "f1", "BUY", "LIMIT", 11, 100, time_in_force="FOK")
+    )
+    assert result == "UNFILLED_CANCELLED"
+    assert reason is None
+    assert trades == []
+    # Visible slice untouched: the book does not reveal an exhausted slice and
+    # the reserve is unchanged.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+    # No trade identifier spent.
+    _, _, _, trades = engine.handle_line(add("e3", "b1", "BUY", "LIMIT", 1, 100))
+    assert trades[0]["trade_id"] == 1
+    # The failed FOK still occupies its ids.
+    assert engine.handle_line(
+        add("e2", "x", "BUY", "LIMIT", 1, 100, time_in_force="FOK")
+    )[2] == "DUPLICATE_EVENT_ID"
+    assert engine.handle_line(
+        add("e4", "f1", "BUY", "LIMIT", 1, 100)
+    )[2] == "DUPLICATE_ORDER_ID"
+
+
+def test_fok_partial_reserve_outside_limit_does_not_count():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 101, 2)])
+    _, result, _, trades = engine.handle_line(
+        add("e2", "f1", "BUY", "LIMIT", 1, 100, time_in_force="FOK")
+    )
+    assert result == "UNFILLED_CANCELLED"
+    assert trades == []
+    assert engine.snapshot()[1] == [{"price": 101, "quantity": 2}]
+
+
+def test_iceberg_schema_rejections():
+    engine = Engine()
+    payloads = [
+        # Missing display_quantity.
+        {"event_id": "e1", "type": "ADD", "order_id": "o1", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100},
+        # Missing price.
+        {"event_id": "e2", "type": "ADD", "order_id": "o2", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "display_quantity": 3},
+        # Non-positive / boolean / non-integer values.
+        {"event_id": "e3", "type": "ADD", "order_id": "o3", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100, "display_quantity": 0},
+        {"event_id": "e4", "type": "ADD", "order_id": "o4", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100, "display_quantity": -2},
+        {"event_id": "e5", "type": "ADD", "order_id": "o5", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100, "display_quantity": True},
+        {"event_id": "e6", "type": "ADD", "order_id": "o6", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100, "display_quantity": 2.5},
+        {"event_id": "e7", "type": "ADD", "order_id": "o7", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": True, "price": 100, "display_quantity": 1},
+        {"event_id": "e8", "type": "ADD", "order_id": "o8", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": False, "display_quantity": 1},
+        # display exceeds total quantity.
+        {"event_id": "e9", "type": "ADD", "order_id": "o9", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100, "display_quantity": 11},
+        # Forbidden time-in-force values (including null / non-string).
+        {"event_id": "e10", "type": "ADD", "order_id": "o10", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100,
+         "display_quantity": 3, "time_in_force": "IOC"},
+        {"event_id": "e11", "type": "ADD", "order_id": "o11", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100,
+         "display_quantity": 3, "time_in_force": "FOK"},
+        {"event_id": "e12", "type": "ADD", "order_id": "o12", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100,
+         "display_quantity": 3, "time_in_force": None},
+        {"event_id": "e13", "type": "ADD", "order_id": "o13", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100,
+         "display_quantity": 3, "time_in_force": 123},
+        # Unknown field.
+        {"event_id": "e14", "type": "ADD", "order_id": "o14", "side": "BUY",
+         "order_type": "ICEBERG", "quantity": 10, "price": 100,
+         "display_quantity": 3, "hidden": True},
+        # display_quantity is iceberg-only.
+        {"event_id": "e15", "type": "ADD", "order_id": "o15", "side": "BUY",
+         "order_type": "LIMIT", "quantity": 10, "price": 100, "display_quantity": 3},
+        {"event_id": "e16", "type": "ADD", "order_id": "o16", "side": "BUY",
+         "order_type": "MARKET", "quantity": 10, "display_quantity": 3},
+    ]
+    for payload in payloads:
+        line = json.dumps(payload)
+        eid, result, reason, trades = engine.handle_line(line)
+        assert (result, reason, trades) == ("REJECTED", "INVALID_SCHEMA", []), payload
+
+    # Nothing was occupied: the same ids and order ids are all still free.
+    assert engine.handle_line(
+        iceberg("e1", "o1", "BUY", 1, 100, 1)
+    )[1] == "RESTING"
+
+
+def test_iceberg_duplicate_event_and_order_ids():
+    engine = Engine()
+    line = iceberg("e1", "i1", "SELL", 10, 100, 2)
+    assert engine.handle_line(line)[1] == "RESTING"
+    assert engine.handle_line(line)[1:3] == ("REJECTED", "DUPLICATE_EVENT_ID")
+    _, result, reason, _ = engine.handle_line(
+        iceberg("e2", "i1", "BUY", 2, 100, 1)
+    )
+    assert (result, reason) == ("REJECTED", "DUPLICATE_ORDER_ID")
+    assert engine.handle_line(
+        add("e2", "o2", "SELL", "LIMIT", 1, 100)
+    )[2] == "DUPLICATE_EVENT_ID"
+
+
+def test_cancel_unknown_or_cancelled_or_filled_iceberg():
+    engine = Engine()
+    assert engine.handle_line(cancel("e1", "missing"))[2] == "UNKNOWN_ORDER"
+    engine.handle_line(iceberg("e2", "i1", "SELL", 3, 100, 3))
+    assert engine.handle_line(cancel("e3", "i1"))[1] == "CANCELLED"
+    assert engine.handle_line(cancel("e4", "i1"))[2] == "UNKNOWN_ORDER"
+
+    engine.handle_line(iceberg("e5", "i2", "SELL", 3, 100, 3))
+    engine.handle_line(add("e6", "b1", "BUY", "LIMIT", 3, 100))
+    assert engine.handle_line(cancel("e7", "i2"))[2] == "UNKNOWN_ORDER"
+
+
+def test_iceberg_rejection_keeps_book_trade_ids_and_queue():
+    engine, _ = book_after(
+        [
+            iceberg("e1", "i1", "SELL", 10, 100, 2),
+            add("e2", "s1", "SELL", "LIMIT", 2, 100),
+        ]
+    )
+    before = engine.snapshot()
+    # Schema rejections and duplicate ids must leave everything untouched.
+    engine.handle_line(
+        json.dumps({"event_id": "e9", "type": "ADD", "order_id": "o9", "side": "BUY",
+                    "order_type": "ICEBERG", "quantity": 10, "price": 100})
+    )
+    engine.handle_line(iceberg("e1", "dup1", "BUY", 2, 100, 1))
+    engine.handle_line(iceberg("e8", "i1", "BUY", 2, 100, 1))
+    assert engine.snapshot() == before
+
+    _, _, _, trades = engine.handle_line(add("e10", "b1", "BUY", "LIMIT", 3, 100))
+    assert [t["trade_id"] for t in trades] == [1, 2]
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [
+        ("i1", 2),
+        ("s1", 1),
+    ]
+
+
+def test_bid_side_iceberg_replenishes_at_passive_price():
+    engine, _ = book_after(
+        [
+            iceberg("e1", "i1", "BUY", 8, 100, 2),
+            add("e2", "b1", "BUY", "LIMIT", 2, 100),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(add("e3", "s1", "SELL", "LIMIT", 7, 100))
+    assert result == "FILLED"
+    # Passive price 100 throughout; iceberg re-meets the taker behind b1.
+    assert [(t["maker_order_id"], t["quantity"], t["price"]) for t in trades] == [
+        ("i1", 2, 100),
+        ("b1", 2, 100),
+        ("i1", 2, 100),
+        ("i1", 1, 100),
+    ]
+    assert engine.snapshot()[0] == [{"price": 100, "quantity": 1}]
+
+
+def test_replay_iceberg_end_to_end_byte_determinism():
+    stream = "\n".join(
+        [
+            iceberg("e1", "i1", "SELL", 5, 100, 2),
+            add("e2", "b1", "BUY", "LIMIT", 3, 100),
+            cancel("e3", "i1"),
+            iceberg("e4", "i2", "BUY", 5, 100, 2, time_in_force="IOC"),
+        ]
+    ) + "\n"
+    code, out1, err = run_replay(stream)
+    assert code == 0
+    assert err == ""
+    records = [json.loads(line) for line in out1.splitlines()]
+    assert [r["event_id"] for r in records] == ["e1", "e2", "e3", "e4"]
+    assert [r["result"] for r in records] == [
+        "RESTING",
+        "FILLED",
+        "CANCELLED",
+        "REJECTED",
+    ]
+    assert records[0]["asks"] == [{"price": 100, "quantity": 2}]
+    assert records[1]["trades"] == [
+        {"trade_id": 1, "maker_order_id": "i1", "taker_order_id": "b1",
+         "price": 100, "quantity": 2},
+        {"trade_id": 2, "maker_order_id": "i1", "taker_order_id": "b1",
+         "price": 100, "quantity": 1},
+    ]
+    assert records[3]["reason"] == "INVALID_SCHEMA"
+    assert records[3]["trades"] == []
+    _, out2, _ = run_replay(stream)
+    assert out2 == out1

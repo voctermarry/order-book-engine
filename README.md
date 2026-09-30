@@ -42,14 +42,22 @@ ADD：
 {"event_id": "e1", "type": "ADD", "order_id": "o1", "side": "BUY", "order_type": "LIMIT", "quantity": 5, "price": 100, "time_in_force": "GTC"}
 ```
 
+ICEBERG（冰山限价单）：
+
+```json
+{"event_id": "e2", "type": "ADD", "order_id": "o2", "side": "SELL", "order_type": "ICEBERG", "quantity": 100, "price": 100, "display_quantity": 10}
+```
+
 - `event_id`：全流唯一字符串。
 - `order_id`：唯一字符串。
 - `side`：`BUY` 或 `SELL`。
-- `order_type`：`LIMIT` 或 `MARKET`。
+- `order_type`：`LIMIT`、`MARKET` 或 `ICEBERG`。
 - `quantity`：正整数。
-- `price`：LIMIT 必填正整数；MARKET 不得带非空 `price`（可省略或为 `null`）。
+- `price`：LIMIT、ICEBERG 必填正整数；MARKET 不得带非空 `price`（可省略或为 `null`）。
+- `display_quantity`：仅 ICEBERG 必填，正整数且不得超过 `quantity`，表示单次公开的最大数量；LIMIT、MARKET 不得携带该字段。
 - `time_in_force`：可选，取值 `GTC`、`IOC`、`FOK`。
   - LIMIT 省略时按 `GTC` 处理（余量入簿）；`GTC`、`IOC`、`FOK` 均要求有效 `price`。
+  - ICEBERG 仅接受省略或显式 `GTC`；`IOC`、`FOK` 及其他取值一律 `INVALID_SCHEMA`。合法订单先以全部余量主动撮合，剩余部分只将 `min(display_quantity, remaining)` 纳入盘口，返回 `FILLED`、`PARTIALLY_FILLED_RESTING` 或 `RESTING`。
   - MARKET 省略时保持「立即成交、余量取消」语义；可显式指定 `IOC` 或 `FOK`，不得为 `GTC`。
   - `IOC`：仅撮合事件到达时可成交的数量，余量一律取消、不入簿；完全成交为 `FILLED`，部分成交为 `PARTIALLY_FILLED_CANCELLED`，完全未成交为 `UNFILLED_CANCELLED`。
   - `FOK`：先依据事件到达前的可成交盘口判断全部数量能否在限价范围内成交。数量足够时一次性生成全部成交；数量不足时不产生任何成交、不改变盘口、不消耗成交编号，返回 `UNFILLED_CANCELLED`。失败的 FOK 仍是已处理订单，其 `event_id` 与 `order_id` 均被占用。
@@ -68,6 +76,9 @@ CANCEL：
 - 买单匹配最低卖价，卖单匹配最高买价；同价位先到者优先（价格时间优先）。
 - 限价单不得越过自身价格；成交价取被动单（maker）价格。
 - GTC 限价单余量入簿；IOC 余量取消、绝不入簿；FOK 要么在事件前盘口上全部成交，要么完全不成交；市价单余量取消；撤单不产生成交。
+- ICEBERG 主动撮合时使用全部余量；被动成交时每笔只消耗当前公开片段。当前片段耗尽而仍有储备时，立即公开下一片 `min(display_quantity, remaining)` 并排到同价所有已有可见订单之后，因此同一主动单可能在其他同价单之后再次遇到它。各片沿用同一 `maker_order_id`，`trade_id` 连续递增，成交价始终取被动价。
+- `bids`/`asks` 各档只汇总公开量，不含 ICEBERG 储备；CANCEL 成功时同时移除公开量与储备。市价单、IOC、普通限价单均可在同一主动过程中连续消耗补片。
+- FOK 预检把限价范围内 ICEBERG 的全部余量（含未公开储备）计入可用量；预检失败时不补片、不改变盘口、不消耗成交编号。
 - 成交编号从 1 开始连续递增（失败的 FOK 不消耗编号）。
 
 ### 每个事件的输出
@@ -82,6 +93,7 @@ CANCEL：
 - `event_id`：可取得时为字符串，否则为 `null`。
 - `result`：
   - GTC 限价单：`FILLED`、`RESTING`、`PARTIALLY_FILLED_RESTING`
+  - ICEBERG：`FILLED`、`RESTING`、`PARTIALLY_FILLED_RESTING`（仅 GTC）
   - IOC 限价单/市价单：`FILLED`、`PARTIALLY_FILLED_CANCELLED`、`UNFILLED_CANCELLED`
   - FOK 限价单/市价单：`FILLED`、`UNFILLED_CANCELLED`
   - 撤单成功：`CANCELLED`
