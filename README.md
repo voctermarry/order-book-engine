@@ -2,7 +2,7 @@
 
 本项目是「限价订单簿撮合与执行分析平台」的代码仓库，用于逐步实现该方向的撮合、执行与风险分析能力。
 
-当前实现了单标的订单事件回放：从标准输入读取 UTF-8 JSON Lines，按价格时间优先撮合，并逐行输出确定性结果。
+当前实现了单标的订单事件回放：从标准输入读取 UTF-8 JSON Lines，按价格时间优先撮合，并逐行输出确定性结果；另支持 EXECUTION_REPORT 事件，按 `order_id` 查询已接受订单（含已结束订单、REPLACE 前后及冰山各补片）的累计执行分析。
 
 ## 环境与安装
 
@@ -84,6 +84,21 @@ REPLACE：
 
 替换成功时先移除目标全部余量，再将新委托作为本事件到达的 GTC 委托处理：即使参数未变也失去原队列优先级，不会与旧状态成交，但可作为 taker 撮合其他订单。无成交且余量入簿时 `result` 为 `REPLACED`，部分成交后入簿为 `PARTIALLY_FILLED_RESTING`，全部成交为 `FILLED`。冰山余量仅展示 `min(display_quantity, remaining)`，补片仍排到同价队尾。替换沿用原 `order_id`，不触发 `DUPLICATE_ORDER_ID`，且该 id 不允许后续 ADD 重用；移除、撮合与余量入簿是不可分割的状态变更。目标未知的有效事件占用 `event_id`，结构错误不占用。
 
+EXECUTION_REPORT：
+
+```json
+{"event_id": "e4", "type": "EXECUTION_REPORT", "order_id": "o1", "benchmark_price": 100}
+```
+
+查询一个**已接受订单**（含已结束订单）的累计执行情况：
+
+- `event_id`：全流唯一字符串。
+- `order_id`：目标订单的字符串标识；必须是曾被接受的订单。REPLACE 沿用同一 `order_id`，冰山各补片也沿用同一 id，因此替换前后的成交与每次补片成交全部归集到该订单。
+- `benchmark_price`：必填正整数（布尔值不算整数）。
+- 事件只能含上述四个字段；字段缺失、多出、`event_id`/`order_id` 非字符串或 `benchmark_price` 不合法均返回 `INVALID_SCHEMA`，且不占用 `event_id`。
+- 未知 `order_id` 返回 `REJECTED` 与 `UNKNOWN_ORDER`，该有效事件仍占用 `event_id`；重复事件返回 `DUPLICATE_EVENT_ID`。
+- 查询不撮合，不改变任何状态、盘口、队列顺序或下一 `trade_id`；成功时 `result` 为 `REPORTED`，`trades` 为空，`bids`/`asks` 为当前盘口，可对同一订单重复查询。
+
 ### 撮合规则
 
 - 买单匹配最低卖价，卖单匹配最高买价；同价位先到者优先（价格时间优先）。
@@ -119,8 +134,18 @@ REPLACE：
   - 市价单：与 IOC 相同
   - 撤单成功：`CANCELLED`
   - 替换成功：`REPLACED`、`PARTIALLY_FILLED_RESTING`、`FILLED`、`SELF_TRADE_PREVENTED`、`PARTIALLY_FILLED_SELF_TRADE_PREVENTED`
+  - 执行查询成功：`REPORTED`
   - 拒绝：`REJECTED`（附加 `reason`）
 - `self_trade_prevention`：仅在两种自成交防护结果下出现，序列化于 `result`/`reason` 之后、`trades` 之前，含 `maker_order_id`（触发的被动单）、`taker_order_id`（被取消的主动单）与 `cancelled_quantity`（取消量，等于触发时主动单的剩余量；FOK 预检触发时为原始委托量）。其他结果不得包含该字段。
+- `execution_analysis`：仅在 `REPORTED` 下出现，序列化于 `result`/`reason`/`self_trade_prevention` 之后、`trades` 之前，含：
+  - `side`：订单方向，`BUY` 或 `SELL`。
+  - `current_status`：仅取 `RESTING`、`FILLED`、`CANCELLED`（IOC/FOK/市价余量取消及自成交防护取消均归为 `CANCELLED`）。
+  - `open_quantity`：`RESTING` 订单的总余量（冰山含未公开储备）；其他状态为零。
+  - `filled_quantity`：累计成交数量。
+  - `executed_notional`：各笔成交价乘数量之和。
+  - `vwap`：无成交时为 `null`；否则为 `{"numerator": executed_notional, "denominator": filled_quantity}`。
+  - `slippage_notional`：买单为 `executed_notional − benchmark_price × filled_quantity`，卖单为其相反数；负值表示相对基准改善。
+  - `trade_attribution`：按 `trade_id` 升序的成交归因，每项含 `trade_id`、`role`（`MAKER` 或 `TAKER`）、`counterparty_order_id`（对手订单）、`event_id`（产生该笔成交的事件）、`price`、`quantity`。
 - `trades`：按发生顺序排列；每笔含 `maker_order_id`、`taker_order_id`、`price`、`quantity` 与 `trade_id`。
 - `bids` 按价格降序、`asks` 按价格升序，每档含整数 `price` 与汇总 `quantity`。
 
