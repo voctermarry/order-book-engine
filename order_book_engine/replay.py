@@ -41,7 +41,7 @@ def replay(stdin: object = sys.stdin, stdout: object = sys.stdout, stderr: objec
         if line == "":
             continue
 
-        event_id, result, reason, trades = engine.handle_line(line)
+        event_id, result, reason, trades, stp = engine.handle_line_full(line)
         bids, asks = engine.snapshot()
         payload: dict[str, object] = {
             "input_line": line,
@@ -50,6 +50,8 @@ def replay(stdin: object = sys.stdin, stdout: object = sys.stdout, stderr: objec
         }
         if reason is not None:
             payload["reason"] = reason
+        if stp is not None:
+            payload["self_trade_prevention"] = stp
         payload["trades"] = trades
         payload["bids"] = bids
         payload["asks"] = asks

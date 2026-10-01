@@ -1252,3 +1252,447 @@ def test_replace_replay_is_byte_deterministic():
     assert records[6]["reason"] == "UNKNOWN_ORDER"
     assert records[7]["reason"] == "DUPLICATE_EVENT_ID"
 
+
+# --------------------------------------------------------------------------
+# Self-trade prevention (account_id)
+# --------------------------------------------------------------------------
+
+
+def stp(line_engine, line):
+    return line_engine.handle_line_full(line)
+
+
+def test_account_id_is_accepted_on_every_add_variant():
+    engine = Engine()
+    assert stp(engine, add("e1", "o1", "BUY", "LIMIT", 1, 100, account_id="A"))[1] == "RESTING"
+    assert stp(engine, add("e2", "o2", "BUY", "MARKET", 1, account_id="A"))[1] == (
+        "UNFILLED_CANCELLED"
+    )
+    assert stp(
+        engine, iceberg("e3", "o3", "SELL", 4, 101, 2, account_id="A")
+    )[1] == "RESTING"
+    assert engine.snapshot()[1] == [{"price": 101, "quantity": 2}]
+
+
+def test_account_id_schema_rejections_consume_no_ids():
+    engine = Engine()
+    base = {"event_id": "eX", "type": "ADD", "order_id": "oX", "side": "BUY",
+            "order_type": "LIMIT", "quantity": 1, "price": 100}
+    for bad in ("", 0, 7, True, 1.5, None, ["A"], {"x": 1}):
+        payload = {**base, "account_id": bad}
+        assert stp(engine, json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), bad
+        # Structural rejection leaves both ids free.
+        assert stp(engine, json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), bad
+
+    # account_id belongs to ADD only; CANCEL and REPLACE must not carry it.
+    engine, _ = book_after([add("e0", "o0", "BUY", "LIMIT", 5, 100, account_id="A")])
+    assert engine.handle_line(
+        json.dumps({"event_id": "e1", "type": "CANCEL", "order_id": "o0",
+                    "account_id": "A"})
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+    assert stp(
+        engine,
+        json.dumps({"event_id": "e2", "type": "REPLACE", "order_id": "o0",
+                    "quantity": 3, "price": 100, "account_id": "A"}),
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+
+    # Nothing was consumed: the same ADD event id/order id now succeeds.
+    assert stp(engine, add("eX", "oX", "BUY", "LIMIT", 1, 100, account_id="A"))[1] == (
+        "RESTING"
+    )
+    assert engine.snapshot()[0] == [{"price": 100, "quantity": 6}]
+
+
+def test_self_trade_fires_only_when_both_sides_share_the_account():
+    # Identical accounts: blocked, no trade, book untouched.
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="A")])
+    _, result, reason, trades, info = stp(
+        engine, add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="A")
+    )
+    assert (result, reason) == ("SELF_TRADE_PREVENTED", None)
+    assert trades == []
+    assert info == {
+        "maker_order_id": "s1",
+        "taker_order_id": "b1",
+        "cancelled_quantity": 3,
+    }
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 5}]
+
+    # Different accounts trade normally.
+    engine, _ = book_after([add("e3", "s2", "SELL", "LIMIT", 5, 100, account_id="A")])
+    assert stp(engine, add("e4", "b2", "BUY", "LIMIT", 3, 100, account_id="B"))[1] == (
+        "FILLED"
+    )
+
+    # Maker tagged, taker untagged: trade.
+    engine, _ = book_after([add("e5", "s3", "SELL", "LIMIT", 5, 100, account_id="A")])
+    assert stp(engine, add("e6", "b3", "BUY", "LIMIT", 3, 100))[1] == "FILLED"
+
+    # Taker tagged, maker untagged: trade.
+    engine, _ = book_after([add("e7", "s4", "SELL", "LIMIT", 5, 100)])
+    assert stp(engine, add("e8", "b4", "BUY", "LIMIT", 3, 100, account_id="A"))[1] == (
+        "FILLED"
+    )
+
+
+def test_self_trade_prevention_works_on_the_sell_side():
+    engine, _ = book_after([add("e1", "b1", "BUY", "LIMIT", 5, 100, account_id="A")])
+    _, result, _, trades, info = stp(
+        engine, add("e2", "s1", "SELL", "LIMIT", 3, 100, account_id="A")
+    )
+    assert result == "SELF_TRADE_PREVENTED"
+    assert trades == []
+    assert info == {
+        "maker_order_id": "b1",
+        "taker_order_id": "s1",
+        "cancelled_quantity": 3,
+    }
+    assert engine.snapshot()[0] == [{"price": 100, "quantity": 5}]
+
+
+def test_self_trade_block_does_not_skip_or_change_the_passive_book():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="A"),
+            add("e2", "s2", "SELL", "LIMIT", 5, 100, account_id="B"),
+            add("e3", "s3", "SELL", "LIMIT", 5, 101, account_id="B"),
+        ]
+    )
+    _, result, _, trades, info = stp(
+        engine, add("e4", "b1", "BUY", "LIMIT", 8, 101, account_id="A")
+    )
+    assert result == "SELF_TRADE_PREVENTED"
+    assert trades == []
+    # s1 keeps its queue position and full size; liquidity behind is untouched.
+    assert info == {"maker_order_id": "s1", "taker_order_id": "b1",
+                    "cancelled_quantity": 8}
+    assert engine.snapshot()[1] == [
+        {"price": 100, "quantity": 10},
+        {"price": 101, "quantity": 5},
+    ]
+    # A later taker meets s1 first, proving its queue position is unchanged.
+    _, _, _, trades, _ = stp(engine, add("e5", "b2", "BUY", "LIMIT", 6, 101))
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [
+        ("s1", 5),
+        ("s2", 1),
+    ]
+
+
+def test_partial_fills_then_self_trade_block_keep_trades_and_trade_ids():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100, account_id="B"),
+            add("e2", "s2", "SELL", "LIMIT", 5, 100, account_id="A"),
+            add("e3", "s3", "SELL", "LIMIT", 5, 101, account_id="B"),
+        ]
+    )
+    _, result, _, trades, info = stp(
+        engine, add("e4", "b1", "BUY", "LIMIT", 6, 101, account_id="A")
+    )
+    assert result == "PARTIALLY_FILLED_SELF_TRADE_PREVENTED"
+    assert trades == [
+        {"trade_id": 1, "maker_order_id": "s1", "taker_order_id": "b1",
+         "price": 100, "quantity": 2}
+    ]
+    assert info == {"maker_order_id": "s2", "taker_order_id": "b1",
+                    "cancelled_quantity": 4}
+    # s2 and the level behind it were not touched by the block.
+    assert engine.snapshot()[1] == [
+        {"price": 100, "quantity": 5},
+        {"price": 101, "quantity": 5},
+    ]
+    # The earlier trade occupies trade id 1; the next event starts at 2.
+    _, _, _, trades, _ = stp(engine, add("e5", "b2", "BUY", "LIMIT", 1, 100))
+    assert trades[0]["trade_id"] == 2
+    assert trades[0]["maker_order_id"] == "s2"
+
+
+def test_self_trade_prevented_taker_cannot_be_cancelled_replaced_or_readded():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="A")])
+    assert stp(
+        engine, add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="A")
+    )[1] == "SELF_TRADE_PREVENTED"
+
+    assert engine.handle_line(cancel("e3", "b1"))[1:3] == ("REJECTED", "UNKNOWN_ORDER")
+    assert stp(engine, replace("e4", "b1", 3, 100))[1:3] == (
+        "REJECTED", "UNKNOWN_ORDER"
+    )
+    assert stp(engine, add("e5", "b1", "BUY", "LIMIT", 3, 100, account_id="A"))[1:3] == (
+        "REJECTED", "DUPLICATE_ORDER_ID"
+    )
+    # The event id stays occupied as well.
+    assert stp(engine, add("e2", "o9", "BUY", "LIMIT", 3, 100, account_id="A"))[1:3] == (
+        "REJECTED", "DUPLICATE_EVENT_ID"
+    )
+
+
+def test_ioc_self_trade_prevention():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="A")])
+    _, result, _, trades, info = stp(
+        engine, add("e2", "b1", "BUY", "LIMIT", 3, 100,
+                    time_in_force="IOC", account_id="A")
+    )
+    assert result == "SELF_TRADE_PREVENTED"
+    assert trades == []
+    assert info["cancelled_quantity"] == 3
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 5}]
+
+    # Partial IOC fill before the block reports the partial outcome.
+    engine, _ = book_after(
+        [
+            add("e3", "s2", "SELL", "LIMIT", 2, 100, account_id="B"),
+            add("e4", "s3", "SELL", "LIMIT", 5, 100, account_id="A"),
+        ]
+    )
+    _, result, _, trades, info = stp(
+        engine, add("e5", "b2", "BUY", "LIMIT", 5, 100,
+                    time_in_force="IOC", account_id="A")
+    )
+    assert result == "PARTIALLY_FILLED_SELF_TRADE_PREVENTED"
+    assert [t["quantity"] for t in trades] == [2]
+    assert info == {"maker_order_id": "s3", "taker_order_id": "b2",
+                    "cancelled_quantity": 3}
+
+
+def test_iceberg_self_trade_block_preserves_slice_and_reserve():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3, account_id="A")])
+    _, result, _, trades, info = stp(
+        engine, add("e2", "b1", "BUY", "LIMIT", 2, 100, account_id="A")
+    )
+    assert result == "SELF_TRADE_PREVENTED"
+    assert trades == []
+    assert info == {"maker_order_id": "i1", "taker_order_id": "b1",
+                    "cancelled_quantity": 2}
+    # The public slice is exactly as before the event.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 3}]
+    # A later taker meets the untouched first slice, then replenishment.
+    _, _, _, trades, _ = stp(engine, add("e3", "b2", "BUY", "LIMIT", 4, 100))
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [
+        ("i1", 3),
+        ("i1", 1),
+    ]
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+
+
+def test_fok_self_trade_prevention_is_atomic():
+    # Same-account order reached before the full quantity can be assembled.
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 99, account_id="B"),
+            add("e2", "s2", "SELL", "LIMIT", 5, 100, account_id="A"),
+        ]
+    )
+    _, result, _, trades, info = stp(
+        engine, add("e3", "b1", "BUY", "LIMIT", 6, 100,
+                    time_in_force="FOK", account_id="A")
+    )
+    assert result == "SELF_TRADE_PREVENTED"
+    assert trades == []
+    assert info == {"maker_order_id": "s2", "taker_order_id": "b1",
+                    "cancelled_quantity": 6}
+    # Nothing traded, nothing changed; no trade ids spent.
+    assert engine.snapshot()[1] == [
+        {"price": 99, "quantity": 2},
+        {"price": 100, "quantity": 5},
+    ]
+    _, _, _, trades, _ = stp(engine, add("e4", "b2", "BUY", "LIMIT", 1, 99))
+    assert trades[0]["trade_id"] == 1
+
+    # The cancelled FOK still occupies both ids.
+    assert stp(engine, add("e5", "b1", "BUY", "LIMIT", 1, 100, account_id="A"))[1:3] == (
+        "REJECTED", "DUPLICATE_ORDER_ID"
+    )
+
+
+def test_fok_self_trade_ordering_through_iceberg_replenishment():
+    # Slice 2 is public; s1 queues ahead of the replenished slice.
+    engine, _ = book_after(
+        [
+            iceberg("e1", "i1", "SELL", 10, 100, 2),
+            add("e2", "s1", "SELL", "LIMIT", 2, 100, account_id="A"),
+        ]
+    )
+    # 2 fits in the first slice: filled before the same-account order.
+    assert stp(
+        engine, add("e3", "b1", "BUY", "LIMIT", 2, 100,
+                    time_in_force="FOK", account_id="A")
+    )[1] == "FILLED"
+
+    # A 4-lot would need s1 (same account) before the replenished slice: blocked
+    # atomically with no trades and an unchanged book.
+    engine, _ = book_after(
+        [
+            iceberg("e4", "i2", "SELL", 10, 100, 2),
+            add("e5", "s2", "SELL", "LIMIT", 2, 100, account_id="A"),
+        ]
+    )
+    _, result, _, trades, info = stp(
+        engine, add("e6", "b2", "BUY", "LIMIT", 4, 100,
+                    time_in_force="FOK", account_id="A")
+    )
+    assert result == "SELF_TRADE_PREVENTED"
+    assert trades == []
+    assert info["cancelled_quantity"] == 4
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 4}]
+
+
+def test_fok_self_trade_prevention_vs_unfilled_cancelled():
+    # Same-account liquidity outside the limit is never reached: shortfall wins.
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 1, 100, account_id="B"),
+            add("e2", "s2", "SELL", "LIMIT", 10, 101, account_id="A"),
+        ]
+    )
+    _, result, _, trades, info = stp(
+        engine, add("e3", "b1", "BUY", "LIMIT", 6, 100,
+                    time_in_force="FOK", account_id="A")
+    )
+    assert result == "UNFILLED_CANCELLED"
+    assert trades == []
+    assert info is None
+    assert engine.snapshot()[1] == [
+        {"price": 100, "quantity": 1},
+        {"price": 101, "quantity": 10},
+    ]
+
+    # Enough fillable liquidity before the same-account order: still FILLED.
+    engine, _ = book_after(
+        [
+            add("e4", "s3", "SELL", "LIMIT", 5, 100, account_id="B"),
+            add("e5", "s4", "SELL", "LIMIT", 5, 101, account_id="A"),
+        ]
+    )
+    _, result, _, trades, info = stp(
+        engine, add("e6", "b2", "BUY", "LIMIT", 5, 101,
+                    time_in_force="FOK", account_id="A")
+    )
+    assert result == "FILLED"
+    assert info is None
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [
+        ("s3", 5),
+    ]
+    # The same-account order at 101 never participated and rests untouched.
+    assert engine.snapshot()[1] == [{"price": 101, "quantity": 5}]
+
+
+def test_replace_inherits_target_account_for_self_trade_prevention():
+    engine, _ = book_after(
+        [
+            add("e1", "b1", "BUY", "LIMIT", 2, 99, account_id="A"),
+            add("e2", "s1", "SELL", "LIMIT", 5, 100, account_id="A"),
+        ]
+    )
+    _, result, _, trades, info = stp(engine, replace("e3", "b1", 5, 100))
+    assert result == "SELF_TRADE_PREVENTED"
+    assert trades == []
+    assert info == {"maker_order_id": "s1", "taker_order_id": "b1",
+                    "cancelled_quantity": 5}
+    # The old bid remainder was removed and is not restored; the ask is intact.
+    assert engine.snapshot() == ([], [{"price": 100, "quantity": 5}])
+    # The replaced order is finished: no cancel or further replace possible.
+    assert engine.handle_line(cancel("e4", "b1"))[1:3] == ("REJECTED", "UNKNOWN_ORDER")
+    assert stp(engine, replace("e5", "b1", 5, 100))[1:3] == (
+        "REJECTED", "UNKNOWN_ORDER"
+    )
+
+
+def test_replace_partial_self_trade_prevention_does_not_restore_old_remainder():
+    engine, _ = book_after(
+        [
+            add("e1", "b1", "BUY", "LIMIT", 2, 99, account_id="A"),
+            add("e2", "s1", "SELL", "LIMIT", 2, 100, account_id="B"),
+            add("e3", "s2", "SELL", "LIMIT", 5, 100, account_id="A"),
+        ]
+    )
+    _, result, _, trades, info = stp(engine, replace("e4", "b1", 5, 100))
+    assert result == "PARTIALLY_FILLED_SELF_TRADE_PREVENTED"
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [("s1", 2)]
+    assert info == {"maker_order_id": "s2", "taker_order_id": "b1",
+                    "cancelled_quantity": 3}
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 5}]
+    assert engine.snapshot()[0] == []
+
+
+def test_replace_without_account_does_not_inherit_protection():
+    # Neither side carries an account, so an aggressive replacement trades.
+    engine, _ = book_after(
+        [
+            add("e1", "b1", "BUY", "LIMIT", 2, 99),
+            add("e2", "s1", "SELL", "LIMIT", 5, 100, account_id="A"),
+        ]
+    )
+    assert stp(engine, replace("e3", "b1", 5, 100))[1] == "FILLED"
+
+
+def test_handle_line_keeps_four_tuple_shape():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="A")])
+    eid, result, reason, trades = engine.handle_line(
+        add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="A")
+    )
+    assert (eid, result, reason, trades) == ("e2", "SELF_TRADE_PREVENTED", None, [])
+
+
+def test_replay_self_trade_prevention_shape_and_byte_determinism():
+    stream = "\n".join(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100, account_id="B"),
+            add("e2", "s2", "SELL", "LIMIT", 5, 100, account_id="A"),
+            add("e3", "b1", "BUY", "LIMIT", 6, 100, account_id="A"),
+            add("e4", "b2", "BUY", "LIMIT", 1, 100, account_id="A"),
+        ]
+    ) + "\n"
+    code, out1, err = run_replay(stream)
+    assert code == 0
+    assert err == ""
+    _, out2, _ = run_replay(stream)
+    assert out2 == out1
+
+    lines = out1.splitlines()
+    # Only the two prevented results carry the descriptor; others never do.
+    assert [json.loads(line).get("self_trade_prevention") is not None
+            for line in lines] == [False, False, True, True]
+    records = [json.loads(line) for line in lines]
+    assert records[2]["result"] == "PARTIALLY_FILLED_SELF_TRADE_PREVENTED"
+    assert records[2]["self_trade_prevention"] == {
+        "maker_order_id": "s2", "taker_order_id": "b1", "cancelled_quantity": 4
+    }
+    assert records[3]["result"] == "SELF_TRADE_PREVENTED"
+    assert records[3]["self_trade_prevention"] == {
+        "maker_order_id": "s2", "taker_order_id": "b2", "cancelled_quantity": 1
+    }
+    # The descriptor is serialized between result/reason and trades.
+    stp_line = lines[2]
+    assert (
+        stp_line.index('"self_trade_prevention"')
+        < stp_line.index('"trades"')
+    )
+
+
+def test_replay_without_account_id_is_byte_for_byte_compatible():
+    # Streams that never mention account_id must serialize exactly as before.
+    first_input = add("e1", "s1", "SELL", "LIMIT", 5, 100)
+    stream = "\n".join(
+        [
+            first_input,
+            add("e2", "b1", "BUY", "LIMIT", 3, 100),
+            cancel("e3", "s1"),
+        ]
+    ) + "\n"
+    _, out, _ = run_replay(stream)
+    records = [json.loads(line) for line in out.splitlines()]
+    for record in records:
+        assert "self_trade_prevention" not in record
+
+    # The first record matches the historical compact serialization exactly.
+    expected_first = (
+        '{"input_line":'
+        + json.dumps(first_input, ensure_ascii=False)
+        + ',"event_id":"e1","result":"RESTING","trades":[],'
+        '"bids":[],"asks":[{"price":100,"quantity":5}]}'
+    )
+    assert out.splitlines()[0] == expected_first
