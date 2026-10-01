@@ -133,6 +133,36 @@ ACCOUNT_REPORT：
 - `risk_exposure`：`|net_position| × mark_price`。
 - `mark_to_market_pnl`：`sell_notional − buy_notional + net_position × mark_price`。
 
+DAY_END_RECONCILIATION：
+
+```json
+{"event_id": "e6", "type": "DAY_END_RECONCILIATION", "expected_trades": [{"trade_id": 1, "maker_order_id": "s1", "taker_order_id": "b1", "price": 100, "quantity": 3}], "expected_accounts": [{"account_id": "acct-1", "net_position": 3, "cash_balance": -300}]}
+```
+
+日终对账查询：将调用方此前累计结果（外部记录）与引擎状态做全量对照，是只读分析，不撮合、不改变订单簿、订单状态、队列顺序、成交日志、账户集合或下一个成交编号：
+
+- `event_id`：非空字符串，全流唯一。
+- `expected_trades`：数组，外部记录的全部成交（可为空）。每项必须且只能含：
+  - `trade_id`：正整数。
+  - `maker_order_id`、`taker_order_id`：非空字符串。
+  - `price`、`quantity`：正整数。
+- `expected_accounts`：数组，外部记录的全部账户（可为空）。每项必须且只能含：
+  - `account_id`：非空字符串。
+  - `net_position`：整数（可为负或零）。
+  - `cash_balance`：整数（可为负或零），定义为卖出成交额减买入成交额。
+- 数组出现重复标识（同数组内两个相同 `trade_id`/`account_id`）、字段缺失或多出、成员类型不符（数组本身不是数组、成员不是对象等）、空标识、布尔值冒充整数，均以 `INVALID_SCHEMA` 拒绝且不占用 `event_id`；重复事件返回 `DUPLICATE_EVENT_ID`。
+
+引擎的实际成交集合为成交日志中的全部成交（按 `trade_id` 标识，REPLACE 与冰山补片沿用同一订单 id，每笔成交恰好出现一次）；实际账户集合为已接受且带 `account_id` 的 ADD 所建立的集合（包括从未成交或订单随后被撤销的账户，被拒绝 ADD 上的账户不算）。账户持仓与现金计入其订单作为 maker 或 taker 参与的全部历史成交（含 REPLACE 与冰山补片）：买入增加持仓、减少现金（`−price×quantity`），卖出相反。
+
+全部一致时 `result` 为 `RECONCILED`，否则为 `BREAKS_FOUND`。两种结果都返回空 `trades`、查询时盘口，并在 `result` 之后附加 `reconciliation`：
+
+- `trade_breaks`：成交差异，按 `trade_id` 升序；无差异时为空数组。
+- `account_breaks`：账户差异，按 `account_id` 升序；无差异时为空数组。
+- 每项含 `identifier`（成交为 `trade_id` 整数，账户为 `account_id` 字符串）、`expected`、`actual`、`reason`：
+  - 仅外部存在（引擎缺失）：`reason` 为 `MISSING_ACTUAL`，`actual` 为 `null`，`expected` 保留完整对象。
+  - 仅引擎存在（外部缺失）：`reason` 为 `MISSING_EXPECTED`，`expected` 为 `null`，`actual` 保留完整对象。
+  - 两侧都存在但任一字段不同：`reason` 为 `FIELD_MISMATCH`，两侧均保留完整对象；整数按精确值比较。
+
 ### 撮合规则
 
 - 买单匹配最低卖价，卖单匹配最高买价；同价位先到者优先（价格时间优先）。
@@ -170,10 +200,12 @@ ACCOUNT_REPORT：
   - 替换成功：`REPLACED`、`PARTIALLY_FILLED_RESTING`、`FILLED`、`SELF_TRADE_PREVENTED`、`PARTIALLY_FILLED_SELF_TRADE_PREVENTED`
   - 执行查询成功：`REPORTED`（附加 `execution_analysis`）
   - 账户查询成功：`REPORTED`（附加 `position_analysis`）
+  - 日终对账成功：`RECONCILED` 或 `BREAKS_FOUND`（均附加 `reconciliation`）
   - 拒绝：`REJECTED`（附加 `reason`）
 - `self_trade_prevention`：仅在两种自成交防护结果下出现，序列化于 `result`/`reason` 之后、`trades` 之前，含 `maker_order_id`（触发的被动单）、`taker_order_id`（被取消的主动单）与 `cancelled_quantity`（取消量，等于触发时主动单的剩余量；FOK 预检触发时为原始委托量）。其他结果不得包含该字段。
 - `execution_analysis`：仅在 EXECUTION_REPORT 的 `REPORTED` 结果下出现，序列化于 `result` 之后、`trades` 之前，字段见上文 EXECUTION_REPORT 一节。其他结果不得包含该字段。
 - `position_analysis`：仅在 ACCOUNT_REPORT 的 `REPORTED` 结果下出现，序列化于 `result` 之后、`trades` 之前，字段见上文 ACCOUNT_REPORT 一节。其他结果不得包含该字段。
+- `reconciliation`：仅在 DAY_END_RECONCILIATION 的 `RECONCILED`/`BREAKS_FOUND` 结果下出现，序列化于 `result` 之后、`trades` 之前，含 `trade_breaks`、`account_breaks`，字段见上文 DAY_END_RECONCILIATION 一节。其他结果不得包含该字段。
 - `trades`：按发生顺序排列；每笔含 `maker_order_id`、`taker_order_id`、`price`、`quantity` 与 `trade_id`。
 - `bids` 按价格降序、`asks` 按价格升序，每档含整数 `price` 与汇总 `quantity`。
 
@@ -187,7 +219,7 @@ ACCOUNT_REPORT：
 
 ## 多证券有序事件回放
 
-在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件仅覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT` 仍只属于基线 JSON Lines 入口）。
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件仅覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 仍只属于基线 JSON Lines 入口）。
 
 ### 命令行
 

@@ -2236,3 +2236,498 @@ def test_replay_account_report_shape_and_byte_determinism():
         < report_line.index('"position_analysis"')
         < report_line.index('"trades"')
     )
+
+
+# --------------------------------------------------------------------------
+# DAY_END_RECONCILIATION queries
+# --------------------------------------------------------------------------
+
+
+def reconciliation(event_id, expected_trades=None, expected_accounts=None):
+    return json.dumps(
+        {
+            "event_id": event_id,
+            "type": "DAY_END_RECONCILIATION",
+            "expected_trades": expected_trades if expected_trades is not None else [],
+            "expected_accounts": expected_accounts if expected_accounts is not None else [],
+        }
+    )
+
+
+def recon_query(engine, line):
+    return engine.handle_line_reconciliation(line)
+
+
+def trade_rec(trade_id, maker, taker, price, quantity):
+    return {
+        "trade_id": trade_id,
+        "maker_order_id": maker,
+        "taker_order_id": taker,
+        "price": price,
+        "quantity": quantity,
+    }
+
+
+def account_rec(account_id, net_position, cash_balance):
+    return {
+        "account_id": account_id,
+        "net_position": net_position,
+        "cash_balance": cash_balance,
+    }
+
+
+def test_reconciliation_reconciled_exact_match():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="B"),
+            add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="A"),
+        ]
+    )
+    line = reconciliation(
+        "e3",
+        expected_trades=[trade_rec(1, "s1", "b1", 100, 3)],
+        expected_accounts=[
+            account_rec("A", 3, -300),
+            account_rec("B", -3, 300),
+        ],
+    )
+    eid, result, reason, trades, stp, analysis, position, report = recon_query(engine, line)
+    assert (eid, result, reason) == ("e3", "RECONCILED", None)
+    assert (trades, stp, analysis, position) == ([], None, None, None)
+    assert report == {"trade_breaks": [], "account_breaks": []}
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+
+
+def test_reconciliation_empty_world_matches_empty_expectations():
+    engine = Engine()
+    eid, result, *rest, report = recon_query(engine, reconciliation("e1"))
+    assert (eid, result) == ("e1", "RECONCILED")
+    assert rest[:3] == [None, [], None]
+    assert report == {"trade_breaks": [], "account_breaks": []}
+
+
+def test_reconciliation_breach_reasons_and_identifier_ordering():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="B"),
+            add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="A"),
+        ]
+    )
+    # Trade 1 correct; external also claims trade 9 (only external -> MISSING_ACTUAL).
+    # Engine also has trade 2? No: wait for second fill below.
+    engine.handle_line(add("e3", "b2", "BUY", "LIMIT", 2, 100, account_id="A"))
+    # Now actual trades are 1 (3@100) and 2 (2@100). External omits 2
+    # (only engine -> MISSING_EXPECTED), claims 9, and mismatches 1's quantity.
+    line = reconciliation(
+        "e4",
+        expected_trades=[
+            trade_rec(1, "s1", "b1", 100, 2),       # FIELD_MISMATCH (quantity)
+            trade_rec(9, "x", "y", 1, 1),           # MISSING_ACTUAL
+        ],
+        expected_accounts=[
+            account_rec("A", 5, -500),
+            account_rec("C", 0, 0),                 # MISSING_ACTUAL
+            account_rec("B", -3, 300),              # FIELD_MISMATCH: actual -5
+        ],
+    )
+    *_, report = recon_query(engine, line)
+    assert [b["identifier"] for b in report["trade_breaks"]] == [1, 2, 9]
+    assert [b["reason"] for b in report["trade_breaks"]] == [
+        "FIELD_MISMATCH", "MISSING_EXPECTED", "MISSING_ACTUAL",
+    ]
+    assert [b["identifier"] for b in report["account_breaks"]] == ["B", "C"]
+    assert [b["reason"] for b in report["account_breaks"]] == [
+        "FIELD_MISMATCH", "MISSING_ACTUAL",
+    ]
+    # The missing side is null; the present side keeps the full object.
+    by_id = {b["identifier"]: b for b in report["trade_breaks"]}
+    assert by_id[2]["expected"] is None
+    assert by_id[2]["actual"] == trade_rec(2, "s1", "b2", 100, 2)
+    assert by_id[9]["actual"] is None
+    assert by_id[9]["expected"] == trade_rec(9, "x", "y", 1, 1)
+    by_acct = {b["identifier"]: b for b in report["account_breaks"]}
+    assert by_acct["B"]["expected"] == account_rec("B", -3, 300)
+    assert by_acct["B"]["actual"] == account_rec("B", -5, 500)
+    assert by_acct["C"]["actual"] is None
+    assert by_acct["C"]["expected"] == account_rec("C", 0, 0)
+    # Re-submitting the same line is a DUPLICATE_EVENT_ID rather than re-run.
+    _, result_dup, reason_dup, *_ = recon_query(engine, line)
+    assert (result_dup, reason_dup) == ("REJECTED", "DUPLICATE_EVENT_ID")
+
+
+def test_reconciliation_field_mismatch_variants():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 3, 100, account_id="B"),
+            add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="A"),
+        ]
+    )
+    actual_trade = trade_rec(1, "s1", "b1", 100, 3)
+    actual_a = account_rec("A", 3, -300)
+    actual_b = account_rec("B", -3, 300)
+
+    def run(event_id, trades, accounts):
+        *_, report = recon_query(engine, reconciliation(event_id, trades, accounts))
+        return report
+
+    # Exact: no breaks.
+    assert run("q1", [actual_trade], [actual_a, actual_b]) == {
+        "trade_breaks": [], "account_breaks": [],
+    }
+    # price differs, accounts still exact.
+    bad_price = trade_rec(1, "s1", "b1", 99, 3)
+    report = run("q2", [bad_price], [actual_a, actual_b])
+    assert report["trade_breaks"][0]["reason"] == "FIELD_MISMATCH"
+    # cash differs (exact integer comparison; no float tolerance).
+    report = run("q3", [actual_trade], [account_rec("A", 3, -299), actual_b])
+    assert report["account_breaks"][0]["reason"] == "FIELD_MISMATCH"
+    # negative and zero integers are legitimate values, not schema errors.
+    assert run("q4", [actual_trade], [account_rec("A", 0, 0), actual_b])
+    # net_position sign error is a mismatch, not a structural problem.
+    report = run("q5", [actual_trade], [account_rec("A", -3, -300), actual_b])
+    assert report["account_breaks"][0]["reason"] == "FIELD_MISMATCH"
+
+
+def test_reconciliation_includes_replace_and_iceberg_history():
+    engine, _ = book_after(
+        [add("e1", "b1", "BUY", "LIMIT", 5, 100, account_id="A")]
+    )
+    engine.handle_line(add("e2", "s1", "SELL", "LIMIT", 2, 100))       # b1 makes 2
+    assert engine.handle_line(replace("e3", "b1", 4, 101))[1] == "REPLACED"
+    engine.handle_line(add("e4", "s2", "SELL", "LIMIT", 4, 101))       # b1 makes 4
+    # An iceberg of account A replenishes twice under one maker id.
+    engine.handle_line(iceberg("e5", "i1", "SELL", 5, 102, 2, account_id="A"))
+    engine.handle_line(add("e6", "b2", "BUY", "LIMIT", 3, 102, account_id="W"))
+
+    actual_trades = [
+        trade_rec(1, "b1", "s1", 100, 2),
+        trade_rec(2, "b1", "s2", 101, 4),
+        trade_rec(3, "i1", "b2", 102, 2),
+        trade_rec(4, "i1", "b2", 102, 1),
+    ]
+    # Account A: bought 2@100 + 4@101 as maker (-604 cash), sold 3@102
+    # (+306) as iceberg maker; net +3 long, cash -298.
+    accounts = [
+        account_rec("A", 3, -604 + 306),
+        account_rec("W", 3, -306),
+    ]
+    *_, report = recon_query(
+        engine, reconciliation("q1", actual_trades, accounts)
+    )
+    assert report == {"trade_breaks": [], "account_breaks": []}
+
+
+def test_reconciliation_actual_account_set_rule():
+    # An accepted ADD with an account establishes the account even if the
+    # order never trades or is later cancelled; a rejected ADD does not.
+    engine, _ = book_after(
+        [add("e1", "o1", "BUY", "LIMIT", 1, 100, account_id="known")]
+    )
+    engine.handle_line(cancel("e2", "o1"))
+    engine.handle_line(
+        add("e3", "o1", "SELL", "LIMIT", 1, 100, account_id="rejected")
+    )  # DUPLICATE_ORDER_ID
+    *_, report = recon_query(
+        engine,
+        reconciliation("q1", expected_accounts=[account_rec("known", 0, 0)]),
+    )
+    assert report == {"trade_breaks": [], "account_breaks": []}
+
+    # The rejected account is not actual: expecting it breaks MISSING_ACTUAL.
+    *_, report = recon_query(
+        engine,
+        reconciliation(
+            "q2",
+            expected_accounts=[
+                account_rec("known", 0, 0),
+                account_rec("rejected", 0, 0),
+            ],
+        ),
+    )
+    assert report["account_breaks"] == [
+        {
+            "identifier": "rejected",
+            "expected": account_rec("rejected", 0, 0),
+            "actual": None,
+            "reason": "MISSING_ACTUAL",
+        }
+    ]
+
+
+def test_reconciliation_does_not_change_state_or_trade_ids():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100, account_id="B"),
+            add("e2", "s2", "SELL", "LIMIT", 2, 100),
+        ]
+    )
+    orders = {oid: dict(rec) for oid, rec in engine._orders.items()}
+    before = (
+        engine.snapshot(),
+        {p: list(q) for p, q in engine._bids.items()},
+        {p: list(q) for p, q in engine._asks.items()},
+        list(map(dict, engine._trade_log)),
+        set(engine._accounts),
+        engine._next_trade_id,
+        dict(orders),
+    )
+    recon_query(
+        engine,
+        reconciliation(
+            "e3",
+            expected_trades=[trade_rec(1, "wrong", "wrong", 1, 1)],
+        ),
+    )
+    after = (
+        engine.snapshot(),
+        {p: list(q) for p, q in engine._bids.items()},
+        {p: list(q) for p, q in engine._asks.items()},
+        list(map(dict, engine._trade_log)),
+        set(engine._accounts),
+        engine._next_trade_id,
+        {oid: dict(rec) for oid, rec in engine._orders.items()},
+    )
+    assert after == before
+    # The legal query occupied its event id, but nothing else moved.
+    assert "e3" in engine._event_ids
+
+    _, _, _, trades = engine.handle_line(add("e4", "b1", "BUY", "LIMIT", 2, 100))
+    assert [t["trade_id"] for t in trades] == [1]
+    assert [t["maker_order_id"] for t in trades] == ["s1"]
+
+
+def test_reconciliation_legal_query_occupies_event_id_duplicate_rejected():
+    engine = Engine()
+    line = reconciliation("e1")
+    assert recon_query(engine, line)[1] == "RECONCILED"
+    eid, result, reason, *_ = recon_query(engine, line)
+    assert (eid, result, reason) == ("e1", "REJECTED", "DUPLICATE_EVENT_ID")
+
+
+def test_reconciliation_schema_rejections_consume_no_event_id():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 3, 100, account_id="B"),
+            add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="A"),
+        ]
+    )
+    before = engine.snapshot()
+    good_trade = trade_rec(1, "s1", "b1", 100, 3)
+    good_account = account_rec("A", 3, -300)
+    other_account = account_rec("B", -3, 300)
+    base = {
+        "event_id": "eR",
+        "type": "DAY_END_RECONCILIATION",
+        "expected_trades": [good_trade],
+        "expected_accounts": [good_account, other_account],
+    }
+    payloads = [
+        {k: v for k, v in base.items() if k != "expected_trades"},
+        {k: v for k, v in base.items() if k != "expected_accounts"},
+        {k: v for k, v in base.items() if k != "event_id"},
+        {**base, "extra": 1},
+        {**base, "type": "EXECUTION_REPORT", "order_id": "o1",
+         "benchmark_price": 100},
+        {**base, "event_id": ""},
+        {**base, "event_id": 7},
+        {**base, "event_id": None},
+        {**base, "expected_trades": {}},
+        {**base, "expected_accounts": None},
+        {**base, "expected_trades": "[]"},
+        {**base, "expected_trades": [1]},
+        {**base, "expected_trades": [None]},
+        {**base, "expected_trades": [[]]},
+        {**base, "expected_trades": [{}]},
+        {**base, "expected_trades": [{**good_trade, "x": 1}]},
+        {**base, "expected_trades": [
+            {k: v for k, v in good_trade.items() if k != "trade_id"}]},
+        {**base, "expected_trades": [
+            {k: v for k, v in good_trade.items() if k != "maker_order_id"}]},
+        {**base, "expected_trades": [
+            {k: v for k, v in good_trade.items() if k != "taker_order_id"}]},
+        {**base, "expected_trades": [
+            {k: v for k, v in good_trade.items() if k != "price"}]},
+        {**base, "expected_trades": [
+            {k: v for k, v in good_trade.items() if k != "quantity"}]},
+        {**base, "expected_trades": [{**good_trade, "trade_id": 0}]},
+        {**base, "expected_trades": [{**good_trade, "trade_id": -4}]},
+        {**base, "expected_trades": [{**good_trade, "trade_id": True}]},
+        {**base, "expected_trades": [{**good_trade, "trade_id": 1.0}]},
+        {**base, "expected_trades": [{**good_trade, "trade_id": "1"}]},
+        {**base, "expected_trades": [{**good_trade, "maker_order_id": ""}]},
+        {**base, "expected_trades": [{**good_trade, "maker_order_id": 7}]},
+        {**base, "expected_trades": [{**good_trade, "maker_order_id": None}]},
+        {**base, "expected_trades": [{**good_trade, "taker_order_id": ""}]},
+        {**base, "expected_trades": [{**good_trade, "price": 0}]},
+        {**base, "expected_trades": [{**good_trade, "price": True}]},
+        {**base, "expected_trades": [{**good_trade, "price": 1.5}]},
+        {**base, "expected_trades": [{**good_trade, "quantity": False}]},
+        {**base, "expected_trades": [good_trade, good_trade]},
+        {**base, "expected_trades": [
+            {**good_trade, "trade_id": 2}, {**good_trade, "trade_id": 2}]},
+        {**base, "expected_accounts": [1]},
+        {**base, "expected_accounts": [{}]},
+        {**base, "expected_accounts": [{**good_account, "x": 1}]},
+        {**base, "expected_accounts": [
+            {k: v for k, v in good_account.items() if k != "account_id"}]},
+        {**base, "expected_accounts": [
+            {k: v for k, v in good_account.items() if k != "net_position"}]},
+        {**base, "expected_accounts": [
+            {k: v for k, v in good_account.items() if k != "cash_balance"}]},
+        {**base, "expected_accounts": [{**good_account, "account_id": ""}]},
+        {**base, "expected_accounts": [{**good_account, "account_id": 9}]},
+        {**base, "expected_accounts": [{**good_account, "net_position": True}]},
+        {**base, "expected_accounts": [{**good_account, "net_position": 1.0}]},
+        {**base, "expected_accounts": [{**good_account, "net_position": "3"}]},
+        {**base, "expected_accounts": [{**good_account, "net_position": None}]},
+        {**base, "expected_accounts": [{**good_account, "cash_balance": False}]},
+        {**base, "expected_accounts": [{**good_account, "cash_balance": 2.5}]},
+        {**base, "expected_accounts": [good_account, good_account]},
+    ]
+    for payload in payloads:
+        assert recon_query(engine, json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), payload
+        # Structural errors never occupy the event id.
+        assert recon_query(engine, json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), payload
+
+    # The book is untouched and the event id is still free.
+    assert engine.snapshot() == before
+    assert recon_query(engine, json.dumps(base))[1] == "RECONCILED"
+
+
+def test_reconciliation_deterministic_identifier_ordering():
+    # Break ordering must be stable across runs and independent of the
+    # caller's array order.
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="zeta"),
+            add("e2", "b1", "BUY", "LIMIT", 5, 100, account_id="alpha"),
+        ]
+    )
+    line = reconciliation(
+        "q1",
+        expected_trades=[
+            trade_rec(5, "m", "t", 1, 1),
+            trade_rec(1, "s1", "b1", 100, 1),
+            trade_rec(3, "m", "t", 1, 1),
+        ],
+        expected_accounts=[
+            account_rec("zeta", -9, 900),
+            account_rec("mid", 0, 0),
+            account_rec("alpha", 9, -900),
+        ],
+    )
+    *_, report1 = recon_query(engine, line)
+    *_, report2 = recon_query(engine, reconciliation(
+        "q2",
+        expected_trades=list(reversed([
+            trade_rec(5, "m", "t", 1, 1),
+            trade_rec(1, "s1", "b1", 100, 1),
+            trade_rec(3, "m", "t", 1, 1),
+        ])),
+        expected_accounts=list(reversed([
+            account_rec("zeta", -9, 900),
+            account_rec("mid", 0, 0),
+            account_rec("alpha", 9, -900),
+        ])),
+    ))
+    assert [b["identifier"] for b in report1["trade_breaks"]] == [1, 3, 5]
+    assert [b["identifier"] for b in report1["account_breaks"]] == [
+        "alpha", "mid", "zeta",
+    ]
+    # Expected-object contents echo the caller, but ordering of the break
+    # arrays is identical regardless of input order.
+    assert [b["identifier"] for b in report2["trade_breaks"]] == [1, 3, 5]
+    assert [b["identifier"] for b in report2["account_breaks"]] == [
+        "alpha", "mid", "zeta",
+    ]
+
+
+def test_reconciliation_other_event_types_reject_its_fields():
+    engine = Engine()
+    assert engine.handle_line(
+        add("e1", "o1", "BUY", "LIMIT", 1, 100, expected_trades=[])
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+    assert engine.handle_line(
+        json.dumps({"event_id": "e2", "type": "CANCEL", "order_id": "o1",
+                    "expected_accounts": []})
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+
+
+def test_replay_reconciliation_shape_and_byte_determinism():
+    stream = "\n".join(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="acct-s"),
+            add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="acct-b"),
+            reconciliation(
+                "e3",
+                expected_trades=[trade_rec(1, "s1", "b1", 100, 3)],
+                expected_accounts=[
+                    account_rec("acct-b", 3, -300),
+                    account_rec("acct-s", -3, 300),
+                ],
+            ),
+            reconciliation(
+                "e4",
+                expected_trades=[trade_rec(1, "s1", "b1", 100, 99)],
+                expected_accounts=[account_rec("acct-b", 3, -300)],
+            ),
+            reconciliation(
+                "e3",
+                expected_trades=[],
+                expected_accounts=[],
+            ),
+        ]
+    ) + "\n"
+    code, out1, err = run_replay(stream)
+    assert code == 0
+    assert err == ""
+    _, out2, _ = run_replay(stream)
+    assert out2 == out1
+
+    lines = out1.splitlines()
+    records = [json.loads(line) for line in lines]
+    assert [r["result"] for r in records] == [
+        "RESTING", "FILLED", "RECONCILED", "BREAKS_FOUND", "REJECTED",
+    ]
+    assert ["reconciliation" in r for r in records] == [
+        False, False, True, True, False,
+    ]
+    assert "execution_analysis" not in records[2]
+    assert "position_analysis" not in records[2]
+    assert records[2]["reconciliation"] == {
+        "trade_breaks": [], "account_breaks": [],
+    }
+    assert records[2]["trades"] == []
+    # The query echoes the book without changing it.
+    assert records[2]["asks"] == records[1]["asks"] == [
+        {"price": 100, "quantity": 2}
+    ]
+    assert records[3]["reconciliation"]["trade_breaks"] == [
+        {
+            "identifier": 1,
+            "expected": trade_rec(1, "s1", "b1", 100, 99),
+            "actual": trade_rec(1, "s1", "b1", 100, 3),
+            "reason": "FIELD_MISMATCH",
+        }
+    ]
+    assert records[3]["reconciliation"]["account_breaks"] == [
+        {
+            "identifier": "acct-s",
+            "expected": None,
+            "actual": account_rec("acct-s", -3, 300),
+            "reason": "MISSING_EXPECTED",
+        }
+    ]
+    assert records[4]["reason"] == "DUPLICATE_EVENT_ID"
+    assert "reconciliation" not in records[4]
+    # The report is serialized after the result and before the trades.
+    rec_line = lines[3]
+    assert (
+        rec_line.index('"result"')
+        < rec_line.index('"reconciliation"')
+        < rec_line.index('"trades"')
+    )

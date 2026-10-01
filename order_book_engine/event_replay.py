@@ -356,8 +356,8 @@ class EventReplayer:
         before_bids, before_asks = state.engine.level_totals()
         before_bids = dict(before_bids)
         before_asks = dict(before_asks)
-        _eid, engine_result, reason, trades, _stp, _analysis, _position = (
-            state.engine.handle_object_position(payload)
+        _eid, engine_result, reason, trades, _stp, _analysis, _position, _recon = (
+            state.engine.handle_object_reconciliation(payload)
         )
 
         # Dispatched: the well-formed event occupies its id however the

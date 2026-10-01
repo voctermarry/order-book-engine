@@ -41,8 +41,8 @@ def replay(stdin: object = sys.stdin, stdout: object = sys.stdout, stderr: objec
         if line == "":
             continue
 
-        event_id, result, reason, trades, stp, analysis, position = (
-            engine.handle_line_position(line)
+        event_id, result, reason, trades, stp, analysis, position, reconciliation = (
+            engine.handle_line_reconciliation(line)
         )
         bids, asks = engine.snapshot()
         payload: dict[str, object] = {
@@ -58,6 +58,8 @@ def replay(stdin: object = sys.stdin, stdout: object = sys.stdout, stderr: objec
             payload["execution_analysis"] = analysis
         if position is not None:
             payload["position_analysis"] = position
+        if reconciliation is not None:
+            payload["reconciliation"] = reconciliation
         payload["trades"] = trades
         payload["bids"] = bids
         payload["asks"] = asks
