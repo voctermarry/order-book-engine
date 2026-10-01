@@ -841,3 +841,69 @@ class Engine:
             for price in sorted(self._ask_totals)
         ]
         return bids, asks
+
+    def dump_state(self) -> dict[str, object]:
+        """Return a self-contained, JSON-safe copy of the whole engine state.
+
+        The result captures everything required to continue an identical
+        replay on a fresh instance: seen event and order ids, every order
+        record (including an iceberg's peak size, current visible slice and
+        reserve), both books with their price-time queue order, the visible
+        level totals, the next trade id counter, known accounts and the full
+        trade journal. Mutable containers are copied; the caller may persist
+        the result freely.
+        """
+        return {
+            "event_ids": sorted(self._event_ids),
+            "order_ids": sorted(self._order_ids),
+            "orders": {
+                oid: dict(self._orders[oid]) for oid in sorted(self._orders)
+            },
+            "bids": {
+                str(price): list(self._bids[price]) for price in sorted(self._bids)
+            },
+            "asks": {
+                str(price): list(self._asks[price]) for price in sorted(self._asks)
+            },
+            "bid_totals": {
+                str(price): self._bid_totals[price]
+                for price in sorted(self._bid_totals)
+            },
+            "ask_totals": {
+                str(price): self._ask_totals[price]
+                for price in sorted(self._ask_totals)
+            },
+            "next_trade_id": self._next_trade_id,
+            "accounts": sorted(self._accounts),
+            "trade_log": [dict(trade) for trade in self._trade_log],
+        }
+
+    @classmethod
+    def from_state(cls, state: dict[str, object]) -> Engine:
+        """Rebuild an engine from :meth:`dump_state` output.
+
+        Queue order, iceberg slice state and counters are restored exactly,
+        so trade ids generated afterwards continue the captured sequence.
+        """
+        engine = cls()
+        engine._event_ids = set(state["event_ids"])  # type: ignore[arg-type]
+        engine._order_ids = set(state["order_ids"])  # type: ignore[arg-type]
+        engine._orders = {
+            oid: dict(record) for oid, record in state["orders"].items()  # type: ignore[union-attr]
+        }
+        engine._bids = {
+            int(price): deque(queue) for price, queue in state["bids"].items()  # type: ignore[union-attr]
+        }
+        engine._asks = {
+            int(price): deque(queue) for price, queue in state["asks"].items()  # type: ignore[union-attr]
+        }
+        engine._bid_totals = {
+            int(price): qty for price, qty in state["bid_totals"].items()  # type: ignore[union-attr]
+        }
+        engine._ask_totals = {
+            int(price): qty for price, qty in state["ask_totals"].items()  # type: ignore[union-attr]
+        }
+        engine._next_trade_id = state["next_trade_id"]  # type: ignore[assignment]
+        engine._accounts = set(state["accounts"])  # type: ignore[arg-type]
+        engine._trade_log = [dict(trade) for trade in state["trade_log"]]  # type: ignore[union-attr]
+        return engine

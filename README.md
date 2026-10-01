@@ -178,7 +178,107 @@ ACCOUNT_REPORT：
 
 拒绝原因：`INVALID_JSON`、`INVALID_SCHEMA`（非对象、缺字段、字段类型或枚举错误、未知字段）、`DUPLICATE_EVENT_ID`、`DUPLICATE_ORDER_ID`、`UNKNOWN_ORDER`、`UNKNOWN_ACCOUNT`。拒绝对象带空 `trades` 和拒绝前盘口，不改变订单簿、成交编号或后续优先级。
 
+## 确定性事件回放（多证券）
+
+在不改变既有 `Engine` 撮合优先级、拒绝规则与成交记录行为的前提下，包内提供多证券有序事件回放层，支持幂等重放与可续传的内存快照。该层**不新增任何隐式文件读写**：事件、结果与快照均由公开入口接收或返回，是否持久化完全由调用方决定。
+
+### 公开入口
+
+Python 包 `order_book_engine` 新增导出（既有 CLI 与 `Engine` 各入口保持不变）：
+
+- `replay_events(events, *, snapshot=None) -> dict`：一次公开调用提交有序事件列表，返回逐事件结果、最终盘口、跨证券按提交顺序的成交明细与结束快照；可选从快照开始。
+- `EventReplayer`：逐事件提交的有状态回放器（`submit(event)`、`replay(events)`、`final_books()`、`all_trades()`、`export_snapshot()`、`EventReplayer.from_snapshot(snapshot)`）。
+- `restore_snapshot(snapshot) -> EventReplayer`：校验并恢复快照，失败抛 `SnapshotError`（`.code` 为 `SNAPSHOT_CORRUPT` / `SNAPSHOT_VERSION_UNSUPPORTED` / `CONFIG_MISMATCH`）。
+- `canonical_dumps(obj) -> bytes`：规范化 JSON 字节（紧凑分隔符、非 ASCII 不转义、键按类型稳定全序排序），用于幂等比较与摘要计算。
+- 状态常量：`ACCEPTED`、`REJECTED`、`DUPLICATE` 三种状态，以及 `INVALID_EVENT`、`SEQUENCE_GAP`、`OUT_OF_ORDER`、`EVENT_ID_CONFLICT`、`SNAPSHOT_CORRUPT`、`SNAPSHOT_VERSION_UNSUPPORTED`、`CONFIG_MISMATCH` 错误码；`format_version()` 返回快照格式版本。
+
+### 事件信封
+
+每个事件是一个对象，包裹一笔基线事件：
+
+```json
+{
+  "event_id": "e1",
+  "symbol": "AAA",
+  "sequence": 1,
+  "type": "ADD",
+  "event": {"event_id": "e1", "type": "ADD", "order_id": "o1", "side": "SELL", "order_type": "LIMIT", "quantity": 5, "price": 100}
+}
+```
+
+- 必须恰好包含 `event_id`（非空字符串，全局唯一）、`symbol`（非空字符串）、`sequence`（正整数，布尔不算整数）、`type`（非空字符串）与 `event`（基线事件对象）。
+- 内层事件原样转交给该证券独立的 `Engine`，故 ADD/CANCEL/REPLACE 各订单类型的撮合规则**完全沿用基线**，不重新定义；内层事件的 `event_id`、`type` 必须与信封一致。
+- 同一 `symbol` 按 `sequence` 从 1 开始严格递增处理；不同证券分别维护序列游标、已见事件、订单与盘口状态。即使时间戳/顺序完全相同，也严格按列表输入顺序处理，相同初始状态与事件流产出字段顺序稳定、数值表示一致、可逐字节比较的 JSON。
+- 采用逐事件提交语义：先前成功事件不会因后续失败而回滚；失败事件不留下订单、成交、计数器或盘口变更。
+
+### 逐事件结果
+
+```json
+{
+  "status": "ACCEPTED",
+  "code": null,
+  "event_id": "e2",
+  "symbol": "AAA",
+  "sequence": 2,
+  "type": "ADD",
+  "result": "FILLED",
+  "reason": null,
+  "self_trade_prevention": null,
+  "execution_analysis": null,
+  "position_analysis": null,
+  "trades": [{"trade_id": 1, "maker_order_id": "s1", "taker_order_id": "b1", "price": 100, "quantity": 5}],
+  "book_changes": {"before": {"bids": [], "asks": [{"price": 100, "quantity": 5}]}, "after": {"bids": [], "asks": []}}
+}
+```
+
+- `status`：`ACCEPTED`（基线正常处理，含基线业务接受/查询成功）、`REJECTED`（本层或基线业务拒绝）、`DUPLICATE`（已见 eventId 且规范化内容完全一致，不再撮合，返回上次结果）。
+- `code`：非业务拒绝时给出本层错误码；已接受与重复时为 `null`。基线业务拒绝（如撤改不存在的订单）时 `status` 为 `REJECTED`、`code` 为 `null`、`result` 为基线 `REJECTED`、`reason` 为基线原因（如 `UNKNOWN_ORDER`），继续沿用基线原有拒绝语义。
+- `result` / `reason` / `self_trade_prevention` / `execution_analysis` / `position_analysis`：基线返回值原样透传（无则为 `null`）。
+- `trades`：该事件产生的成交（基线形态）；DUPLICATE 回显原结果且**不再次撮合**。
+- `book_changes.before` / `after`：处理前后的该证券公开盘口，明确标识盘口变更；拒绝时前后相同且等于处理前盘口。
+
+### 错误码与序列语义
+
+- 缺必填字段、非法数值（含 `sequence <= 0`、布尔、非有限数）、`event` 非对象、内外层标识不一致、未知事件类型等结构问题：`INVALID_EVENT`，不占用该证券序列槽位（与基线结构错误不占用 eventId 对齐，同一 sequence 可改正后重交）。
+- 当前证券的 `sequence` 出现空洞：`SEQUENCE_GAP`；倒退：`OUT_OF_ORDER`。新证券必须从 1 开始，否则按空洞处理。
+- 已见 `event_id`：规范化内容完全一致返回 `DUPLICATE` 且不再次撮合；内容不一致返回 `EVENT_ID_CONFLICT`。
+- 撤改不存在或已终结订单：沿用基线 `UNKNOWN_ORDER` 等原有拒绝语义（`status=REJECTED`、`code=null`、`reason=UNKNOWN_ORDER`），该有效事件仍占用本证券该 sequence。
+- `replay_events` 不因某个事件失败而中断；逐事件提交，失败事件不留痕。
+
+### 快照
+
+可在任意成功事件之后调用 `EventReplayer.export_snapshot()` 或取 `replay_events` 返回的 `snapshot`。快照为纯内存 JSON 兼容对象，完整保留：
+
+- 各证券价格时间优先队列顺序、订单总余量；
+- 冰山订单当前展示量、峰值 `display_quantity` 及后续补量所需全部状态；
+- 各证券最后处理序列 `last_sequence`；
+- 各证券累计成交日志与「生成后续成交标识」所需的 `next_trade_id` 计数状态（不同证券各自从 1 开始）；
+- 已见事件的规范化内容摘要与逐事件结果（支撑恢复后的 DUPLICATE/CONFLICT 判定与跨证券成交顺序）；
+- 格式版本 `format_version`、撮合配置摘要 `config`/`config_digest` 及基于规范化内容计算的状态 SHA-256 摘要 `state_digest`。
+
+恢复时先验证版本、配置与摘要：
+
+- 版本不支持 → `SNAPSHOT_VERSION_UNSUPPORTED`；
+- 配置摘要或配置内容不一致 → `CONFIG_MISMATCH`；
+- 状态摘要不符或结构损坏 → `SNAPSHOT_CORRUPT`；
+- 任一校验失败都**不创建部分恢复状态**（调用前对象/新对象不受污染）。
+
+验证通过后续放，继续生成的逐笔成交标识、成交顺序与最终结果，与不中断的一次性回放**完全一致**。
+
+### 批量返回
+
+`replay_events` 返回：
+
+```json
+{
+  "results": [ /* 与输入等长、同序的逐事件结果 */ ],
+  "final_books": {"AAA": {"bids": [], "asks": []}},
+  "trades": [ /* 跨证券按提交顺序排列的全部成交，带 symbol/sequence/event_id */ ],
+  "snapshot": { /* 结束状态快照 */ }
+}
+```
+
 ## 现有公开接口
 
 - 命令行程序 `order-book-engine`（`version`、`replay`）
-- Python 包 `order_book_engine`，其 `__version__` 为当前版本号
+- Python 包 `order_book_engine`，其 `__version__` 为当前版本号；除多证券事件回放导出外，`Engine` 的 `dump_state()` / `Engine.from_state()` 提供单引擎完整状态的导出与恢复（用于快照实现，也可独立使用）。
