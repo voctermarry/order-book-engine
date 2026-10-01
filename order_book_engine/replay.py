@@ -51,6 +51,9 @@ def replay(stdin: object = sys.stdin, stdout: object = sys.stdout, stderr: objec
         if reason is not None:
             payload["reason"] = reason
         payload["trades"] = trades
+        stp = engine.last_self_trade_prevention
+        if stp is not None:
+            payload["self_trade_prevention"] = stp
         payload["bids"] = bids
         payload["asks"] = asks
         out_parts.append(_encode(payload))

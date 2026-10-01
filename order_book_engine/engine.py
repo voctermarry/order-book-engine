@@ -31,6 +31,8 @@ PARTIALLY_FILLED_CANCELLED = "PARTIALLY_FILLED_CANCELLED"
 UNFILLED_CANCELLED = "UNFILLED_CANCELLED"
 CANCELLED = "CANCELLED"
 REJECTED = "REJECTED"
+SELF_TRADE_PREVENTED = "SELF_TRADE_PREVENTED"
+PARTIALLY_FILLED_SELF_TRADE_PREVENTED = "PARTIALLY_FILLED_SELF_TRADE_PREVENTED"
 
 INVALID_JSON = "INVALID_JSON"
 INVALID_SCHEMA = "INVALID_SCHEMA"
@@ -40,7 +42,7 @@ UNKNOWN_ORDER = "UNKNOWN_ORDER"
 
 _ALL_KEYS = frozenset(
     {"event_id", "type", "order_id", "side", "order_type", "quantity", "price",
-     "time_in_force", "display_quantity"}
+     "time_in_force", "display_quantity", "account_id"}
 )
 _CANCEL_KEYS = frozenset({"event_id", "type", "order_id"})
 _REQUIRED_ADD_KEYS = frozenset({"event_id", "type", "order_id", "side", "order_type", "quantity"})
@@ -65,6 +67,12 @@ class Engine:
         self._bid_totals: dict[int, int] = {}
         self._ask_totals: dict[int, int] = {}
         self._next_trade_id = 1
+        self._last_stp: dict[str, object] | None = None
+
+    @property
+    def last_self_trade_prevention(self) -> dict[str, object] | None:
+        """Self-trade prevention details of the most recent event, if any."""
+        return self._last_stp
 
     def handle_line(self, line: str) -> tuple[str | None, str, str | None, list[dict[str, object]]]:
         """Process one input line (without line terminator).
@@ -73,6 +81,7 @@ class Engine:
         the event id when it can be obtained as a string, otherwise ``None``,
         and ``reason`` is set only for rejected events.
         """
+        self._last_stp = None
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
@@ -82,6 +91,7 @@ class Engine:
     def handle_object(
         self, obj: object
     ) -> tuple[str | None, str, str | None, list[dict[str, object]]]:
+        self._last_stp = None
         if not isinstance(obj, dict):
             return None, REJECTED, INVALID_SCHEMA, []
 
@@ -156,6 +166,13 @@ class Engine:
             return INVALID_SCHEMA
         if not keys >= _REQUIRED_ADD_KEYS:
             return INVALID_SCHEMA
+
+        if "account_id" in obj:
+            account_id = obj["account_id"]
+            # Self-trade prevention is opt-in per order and keyed by a
+            # non-empty account string; any other value is structural.
+            if not isinstance(account_id, str) or account_id == "":
+                return INVALID_SCHEMA
 
         if not isinstance(obj.get("order_id"), str):
             return INVALID_SCHEMA
@@ -250,33 +267,58 @@ class Engine:
         display_quantity: int | None = (
             obj["display_quantity"] if is_iceberg else None
         )
-
-        opposite, totals = self._opposite(side)
-        tradable = self._tradable_fn(side, limit)
+        account_id = obj.get("account_id")
 
         # FOK must either match the whole quantity against the pre-event book
         # or do nothing at all: no trades, no book change, no trade ids spent.
-        # A resting iceberg offers its full remaining quantity to this check,
-        # including reserve that is not part of the visible book totals.
+        # The precheck simulates the real price-time traversal, so a resting
+        # iceberg offers its reserve slice by slice, in the same order the
+        # match would publish it. Meeting a same-account maker before the
+        # full quantity is secured cancels the order atomically instead.
         if tif == FOK:
-            available = 0
-            for price, queue in opposite.items():
-                if tradable(price):
-                    for maker_id in queue:
-                        available += self._orders[maker_id]["remaining"]
-            if available < quantity:
-                self._orders[order_id] = {
+            outcome, stp_maker = self._fok_precheck(side, limit, quantity, account_id)
+            if outcome != "ok":
+                record = {
                     "side": side,
                     "price": limit,
                     "remaining": remaining,
                     "status": CANCELLED,
                 }
+                if account_id is not None:
+                    record["account_id"] = account_id
+                self._orders[order_id] = record
+                if outcome == "self_trade":
+                    self._last_stp = {
+                        "maker_order_id": stp_maker,
+                        "taker_order_id": order_id,
+                        "cancelled_quantity": quantity,
+                    }
+                    return event_id, SELF_TRADE_PREVENTED, None, []
                 return event_id, UNFILLED_CANCELLED, None, []
 
-        remaining, trades = self._match(order_id, side, limit, remaining)
+        remaining, trades, stp_maker = self._match(
+            order_id, side, limit, remaining, account_id
+        )
 
         record: dict[str, object] = {"side": side, "price": limit}
-        if remaining == 0:
+        if account_id is not None:
+            record["account_id"] = account_id
+        if stp_maker is not None:
+            # Self-trade prevention cancels the taker's whole leftover at the
+            # first same-account maker; the rest never rests and never skips
+            # ahead to other liquidity.
+            result = (
+                PARTIALLY_FILLED_SELF_TRADE_PREVENTED if trades
+                else SELF_TRADE_PREVENTED
+            )
+            record["remaining"] = remaining
+            record["status"] = CANCELLED
+            self._last_stp = {
+                "maker_order_id": stp_maker,
+                "taker_order_id": order_id,
+                "cancelled_quantity": remaining,
+            }
+        elif remaining == 0:
             result = FILLED
             record["remaining"] = 0
             record["status"] = FILLED
@@ -298,14 +340,73 @@ class Engine:
         self._orders[order_id] = record
         return event_id, result, None, trades
 
+    def _fok_precheck(
+        self, side: str, limit: int | None, quantity: int, account_id: object
+    ) -> tuple[str, str | None]:
+        """Simulate a FOK match without mutating the book.
+
+        Returns ``("ok", None)`` when the whole quantity would execute,
+        ``("insufficient", None)`` when the book cannot provide it, and
+        ``("self_trade", maker_id)`` when a same-account maker is met before
+        the full quantity is secured.
+        """
+        opposite, _ = self._opposite(side)
+        tradable = self._tradable_fn(side, limit)
+        prices = sorted(
+            (price for price in opposite if tradable(price)),
+            reverse=side == SELL,
+        )
+        need = quantity
+        sim_remaining: dict[str, int] = {}
+        sim_visible: dict[str, int | None] = {}
+        for price in prices:
+            queue = list(opposite[price])
+            index = 0
+            while need > 0 and index < len(queue):
+                maker_id = queue[index]
+                index += 1
+                maker = self._orders[maker_id]
+                if account_id is not None and maker.get("account_id") == account_id:
+                    return "self_trade", maker_id
+                remaining = sim_remaining.get(maker_id, maker["remaining"])
+                visible = sim_visible.get(maker_id, maker.get("visible"))
+                available = visible if visible is not None else remaining
+                matched = min(need, available)
+                need -= matched
+                remaining -= matched
+                sim_remaining[maker_id] = remaining
+                if visible is not None:
+                    visible -= matched
+                    if visible == 0 and remaining > 0:
+                        # The replenished slice joins behind the orders that
+                        # are already waiting at this price.
+                        visible = min(maker["display_quantity"], remaining)
+                        queue.append(maker_id)
+                    sim_visible[maker_id] = visible
+            if need == 0:
+                break
+        if need > 0:
+            return "insufficient", None
+        return "ok", None
+
     def _match(
-        self, order_id: str, side: str, limit: int | None, remaining: int
-    ) -> tuple[int, list[dict[str, object]]]:
-        """Match ``order_id`` as taker; return its leftover and the trades."""
+        self,
+        order_id: str,
+        side: str,
+        limit: int | None,
+        remaining: int,
+        account_id: object = None,
+    ) -> tuple[int, list[dict[str, object]], str | None]:
+        """Match ``order_id`` as taker.
+
+        Returns its leftover, the trades and, when self-trade prevention
+        fired, the same-account maker that stopped the match.
+        """
         opposite, totals = self._opposite(side)
         tradable = self._tradable_fn(side, limit)
 
         trades: list[dict[str, object]] = []
+        stp_maker: str | None = None
         while remaining > 0:
             candidates = [price for price in totals if tradable(price)]
             if not candidates:
@@ -315,6 +416,11 @@ class Engine:
             while remaining > 0 and queue:
                 maker_id = queue[0]
                 maker = self._orders[maker_id]
+                if account_id is not None and maker.get("account_id") == account_id:
+                    # Both sides name the same account: leave the maker
+                    # untouched and stop instead of trading or skipping it.
+                    stp_maker = maker_id
+                    break
                 if maker.get("visible") is not None:
                     # A resting iceberg can only trade its current slice; the
                     # reserve stays hidden until the slice is exhausted.
@@ -355,10 +461,12 @@ class Engine:
                 elif maker["remaining"] == 0:
                     queue.popleft()
                     maker["status"] = FILLED
+            if stp_maker is not None:
+                break
             if not queue:
                 del opposite[price]
                 del totals[price]
-        return remaining, trades
+        return remaining, trades, stp_maker
 
     def _rest(
         self,
@@ -404,6 +512,7 @@ class Engine:
             return event_id, REJECTED, UNKNOWN_ORDER, []
 
         side: str = record["side"]
+        account_id = record.get("account_id")
         is_iceberg = "display_quantity" in record
         display_quantity = obj.get("display_quantity")
         if display_quantity is None:
@@ -416,10 +525,29 @@ class Engine:
         self._remove_from_book(order_id, record)
 
         price: int = obj["price"]
-        remaining, trades = self._match(order_id, side, price, obj["quantity"])
+        remaining, trades, stp_maker = self._match(
+            order_id, side, price, obj["quantity"], account_id
+        )
 
+        # The replacement inherits the target's account, if it had one.
         new_record: dict[str, object] = {"side": side, "price": price}
-        if remaining == 0:
+        if account_id is not None:
+            new_record["account_id"] = account_id
+        if stp_maker is not None:
+            # Self-trade prevention cancels the replacement's leftover; the
+            # removed old order is not restored.
+            result = (
+                PARTIALLY_FILLED_SELF_TRADE_PREVENTED if trades
+                else SELF_TRADE_PREVENTED
+            )
+            new_record["remaining"] = remaining
+            new_record["status"] = CANCELLED
+            self._last_stp = {
+                "maker_order_id": stp_maker,
+                "taker_order_id": order_id,
+                "cancelled_quantity": remaining,
+            }
+        elif remaining == 0:
             result = FILLED
             new_record["remaining"] = 0
             new_record["status"] = FILLED
