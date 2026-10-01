@@ -7,7 +7,10 @@ matching rules, priorities, rejection semantics or trade record shapes:
 * A single public call (:func:`replay_events`) accepts an ordered stream of
   order events for one or several securities. Every security keeps its own
   sequence counter and its own book; events are applied strictly in input
-  order, so identical timestamps never reorder anything.
+  order, so identical timestamps never reorder anything. The stream covers
+  the baseline ADD/CANCEL/REPLACE behaviours and resumable TWAP parent orders
+  (TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT); plans never read a wall
+  clock and are advanced solely by TWAP_SLICE events.
 * Each event is committed individually: a later failure never rolls back an
   earlier success, and a failed event leaves no order, trade, counter or book
   change behind.
@@ -19,7 +22,8 @@ matching rules, priorities, rejection semantics or trade record shapes:
   configuration summary and a SHA-256 digest over their normalized content.
   Resumption verifies version, configuration and digest before touching any
   state, and continued replay produces trade ids, trade ordering and final
-  results identical to an uninterrupted one-shot run.
+  results identical to an uninterrupted one-shot run. Plan progress, reserved
+  derived order ids and cumulative plan analytics are part of the snapshot.
 
 The module never opens files: events and snapshots are received from, and
 returned to, the caller.
@@ -35,16 +39,25 @@ from collections import deque
 from . import __version__
 from .engine import (
     ADD,
+    BUY,
     CANCEL,
+    DUPLICATE_EVENT_ID,
+    DUPLICATE_ORDER_ID,
+    IOC,
+    LIMIT,
+    MARKET,
     REPLACE,
+    SELL,
     Engine,
+    _is_non_empty_str,
+    _is_positive_int,
 )
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION = "event-replay/1"
+FORMAT_VERSION = "event-replay/2"
 
 ACCEPTED = "ACCEPTED"
 REJECTED = "REJECTED"
@@ -56,21 +69,99 @@ SEQUENCE_GAP = "SEQUENCE_GAP"
 OUT_OF_ORDER = "OUT_OF_ORDER"
 EVENT_ID_CONFLICT = "EVENT_ID_CONFLICT"
 
+# TWAP parent-order rejection codes.
+UNKNOWN_EXECUTION_PLAN = "UNKNOWN_EXECUTION_PLAN"
+EXECUTION_PLAN_CLOSED = "EXECUTION_PLAN_CLOSED"
+DUPLICATE_EXECUTION_PLAN = "DUPLICATE_EXECUTION_PLAN"
+
+# TWAP event types.
+TWAP_START = "TWAP_START"
+TWAP_SLICE = "TWAP_SLICE"
+TWAP_CANCEL = "TWAP_CANCEL"
+TWAP_REPORT = "TWAP_REPORT"
+
+# TWAP plan lifecycle statuses.
+PLAN_ACTIVE = "ACTIVE"
+PLAN_COMPLETED = "COMPLETED"
+PLAN_CANCELLED = "CANCELLED"
+
 # Snapshot restoration failure codes.
 SNAPSHOT_CORRUPT = "SNAPSHOT_CORRUPT"
 SNAPSHOT_VERSION_UNSUPPORTED = "SNAPSHOT_VERSION_UNSUPPORTED"
 CONFIG_MISMATCH = "CONFIG_MISMATCH"
 
-#: Event types this replay layer accepts. Reports stay exclusive to the
-#: baseline JSON Lines entry point, so the ordered stream covers exactly the
-#: baseline mutating behaviours.
-SUPPORTED_TYPES = frozenset({ADD, CANCEL, REPLACE})
+#: Event types this replay layer accepts. The TWAP parent-order commands join
+#: the baseline mutating behaviours; the baseline read-only reports stay
+#: exclusive to the JSON Lines entry point.
+SUPPORTED_TYPES = frozenset(
+    {ADD, CANCEL, REPLACE, TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT}
+)
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
 _BASELINE_KEYS = frozenset(
     {"event_id", "type", "order_id", "side", "order_type", "quantity", "price",
      "time_in_force", "display_quantity", "account_id"}
 )
+_TWAP_START_KEYS = frozenset(
+    {"event_id", "type", "plan_id", "side", "total_quantity", "slice_count",
+     "order_type", "benchmark_price", "price", "account_id"}
+)
+_TWAP_START_REQUIRED = frozenset(
+    {"event_id", "type", "plan_id", "side", "total_quantity", "slice_count",
+     "order_type", "benchmark_price"}
+)
+_TWAP_PLAN_REF_KEYS = frozenset({"event_id", "type", "plan_id"})
+_TWAP_TYPES = frozenset({TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT})
+
+
+def _twap_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a TWAP command payload.
+
+    Mirrors the baseline contract: any field problem (missing or extra field,
+    wrong type, a non-positive integer where a positive one is required, an
+    empty identifier, a LIMIT without a positive price or a MARKET carrying
+    one, ...) is an ``INVALID_EVENT`` and consumes neither the event id nor the
+    sequence.
+    """
+    event_type = payload["type"]
+    if event_type == TWAP_START:
+        keys = set(payload)
+        if not keys >= _TWAP_START_REQUIRED or not keys <= _TWAP_START_KEYS:
+            return INVALID_EVENT
+        if not _is_non_empty_str(payload.get("plan_id")):
+            return INVALID_EVENT
+        if payload.get("side") not in (BUY, SELL):
+            return INVALID_EVENT
+        order_type = payload.get("order_type")
+        if order_type not in (LIMIT, MARKET):
+            return INVALID_EVENT
+        total_quantity = payload.get("total_quantity")
+        slice_count = payload.get("slice_count")
+        benchmark_price = payload.get("benchmark_price")
+        if not _is_positive_int(total_quantity):
+            return INVALID_EVENT
+        if not _is_positive_int(slice_count):
+            return INVALID_EVENT
+        if total_quantity < slice_count:
+            return INVALID_EVENT
+        if not _is_positive_int(benchmark_price):
+            return INVALID_EVENT
+        if order_type == LIMIT:
+            if not _is_positive_int(payload.get("price")):
+                return INVALID_EVENT
+        elif "price" in payload and payload["price"] is not None:
+            # MARKET plans must not carry a non-null price; omission or an
+            # explicit null is accepted.
+            return INVALID_EVENT
+        if "account_id" in payload and not _is_non_empty_str(payload.get("account_id")):
+            return INVALID_EVENT
+        return None
+    # TWAP_SLICE / TWAP_CANCEL / TWAP_REPORT are pure plan references.
+    if set(payload) != _TWAP_PLAN_REF_KEYS:
+        return INVALID_EVENT
+    if not _is_non_empty_str(payload.get("plan_id")):
+        return INVALID_EVENT
+    return None
 
 
 def _valid_timestamp(value: object) -> bool:
@@ -137,14 +228,142 @@ class SnapshotError(ValueError):
 # ---------------------------------------------------------------------------
 
 
+class ExecutionPlan:
+    """Mutable state of one resumable TWAP parent order on one security.
+
+    All cumulative analytics (filled quantity, notional, cancelled quantity)
+    are maintained incrementally, so a snapshot carries exactly the state a
+    continued or resumed slice needs. Slice quantities are fixed at creation:
+    the total is divided evenly across ``slice_count`` slices and the division
+    remainder is spread as one extra unit over the earliest slices.
+    """
+
+    __slots__ = (
+        "plan_id", "side", "order_type", "benchmark_price", "price",
+        "account_id", "slice_quantities", "released", "released_quantity",
+        "filled_quantity", "cancelled_quantity", "notional", "status",
+    )
+
+    def __init__(
+        self,
+        plan_id: str,
+        side: str,
+        order_type: str,
+        total_quantity: int,
+        slice_count: int,
+        benchmark_price: int,
+        price: int | None,
+        account_id: str | None,
+    ) -> None:
+        self.plan_id = plan_id
+        self.side = side
+        self.order_type = order_type
+        self.benchmark_price = benchmark_price
+        self.price = price
+        self.account_id = account_id
+        base, extra = divmod(total_quantity, slice_count)
+        self.slice_quantities: list[int] = [
+            base + (1 if index < extra else 0)
+            for index in range(slice_count)
+        ]
+        # Number of slices already released; also the index of the next one.
+        self.released = 0
+        self.released_quantity = 0
+        self.filled_quantity = 0
+        self.cancelled_quantity = 0
+        self.notional = 0
+        self.status = PLAN_ACTIVE
+
+    @property
+    def slice_count(self) -> int:
+        return len(self.slice_quantities)
+
+    @property
+    def total_quantity(self) -> int:
+        return sum(self.slice_quantities)
+
+    @property
+    def remaining_slices(self) -> int:
+        if self.status != PLAN_ACTIVE:
+            return 0
+        return self.slice_count - self.released
+
+    def child_order_id(self, slice_number: int) -> str:
+        """The deterministic derived order id of slice ``slice_number``.
+
+        Slice numbers are 1-based and joined with ``#``; the scheme is fixed,
+        so the same input stream always derives the same identifiers.
+        """
+        return f"{self.plan_id}#{slice_number}"
+
+    def child_ids(self) -> list[str]:
+        return [self.child_order_id(i + 1) for i in range(self.slice_count)]
+
+    def summary(
+        self,
+        *,
+        slice_number: int | None = None,
+        child_order_id: str | None = None,
+    ) -> dict[str, object]:
+        """Build the ``execution_plan`` object echoed by TWAP responses."""
+        vwap = (
+            {"numerator": self.notional, "denominator": self.filled_quantity}
+            if self.filled_quantity
+            else None
+        )
+        slippage = self.notional - self.benchmark_price * self.filled_quantity
+        if self.side == SELL:
+            # Mirror the buy formula: negative always means improvement.
+            slippage = -slippage
+        plan: dict[str, object] = {
+            "status": self.status,
+            "released_quantity": self.released_quantity,
+            "filled_quantity": self.filled_quantity,
+            "cancelled_quantity": self.cancelled_quantity,
+            "remaining_slices": self.remaining_slices,
+            "executed_notional": self.notional,
+            "vwap": vwap,
+            "slippage_notional": slippage,
+        }
+        if slice_number is not None:
+            plan["slice_number"] = slice_number
+        if child_order_id is not None:
+            plan["child_order_id"] = child_order_id
+        return plan
+
+    def to_json(self) -> dict[str, object]:
+        """Serialize the complete plan state for a snapshot."""
+        data: dict[str, object] = {
+            "plan_id": self.plan_id,
+            "side": self.side,
+            "order_type": self.order_type,
+            "benchmark_price": self.benchmark_price,
+            "price": self.price,
+            "account_id": self.account_id,
+            "slice_quantities": list(self.slice_quantities),
+            "released": self.released,
+            "released_quantity": self.released_quantity,
+            "filled_quantity": self.filled_quantity,
+            "cancelled_quantity": self.cancelled_quantity,
+            "notional": self.notional,
+            "status": self.status,
+        }
+        return data
+
+
 class _SymbolState:
-    __slots__ = ("engine", "last_sequence", "seen")
+    __slots__ = ("engine", "last_sequence", "seen", "plans", "plan_index")
 
     def __init__(self, engine: Engine | None = None) -> None:
         self.engine = engine or Engine()
         self.last_sequence = 0
         # eventId -> canonical payload content, in first-seen input order.
         self.seen: dict[str, str] = {}
+        # plan_id -> ExecutionPlan, in start order. Closed plans stay queryable.
+        self.plans: dict[str, ExecutionPlan] = {}
+        # child order id -> plan_id, for every derived id of every accepted
+        # plan, including slices not yet released.
+        self.plan_index: dict[str, str] = {}
 
 
 class EventReplayer:
@@ -283,9 +502,14 @@ class EventReplayer:
             if not set(event) <= envelope_keys:
                 return reject_envelope()
         else:
-            if not set(event) <= _ENVELOPE_KEYS | _BASELINE_KEYS:
+            # The inline form may carry envelope fields plus exactly the fields
+            # of its own payload kind.
+            allowed_payload_keys = self._allowed_payload_keys(event.get("type"))
+            if allowed_payload_keys is None or not set(event) <= (
+                _ENVELOPE_KEYS | allowed_payload_keys
+            ):
                 return reject_envelope()
-            # Keep event_id/type (baseline fields); strip only symbol,
+            # Keep event_id/type (payload fields); strip only symbol,
             # sequence and timestamp, which are envelope-only.
             payload = {
                 key: value
@@ -295,13 +519,16 @@ class EventReplayer:
         event_type = payload.get("type")
         if not isinstance(event_type, str) or event_type not in SUPPORTED_TYPES:
             return reject_envelope()
-        # Validate the full baseline schema up front, so malformed content is
+        # Validate the full payload schema up front, so malformed content is
         # classified INVALID_EVENT and reaches neither ordering nor the book.
-        if (
-            payload.get("event_id") != event_id
-            or Engine._schema_error(payload) is not None
-        ):
-            # The wrapper and the baseline payload must identify the same event.
+        # The wrapper and the payload must identify the same event.
+        if payload.get("event_id") != event_id:
+            return reject_envelope()
+        if event_type in _TWAP_TYPES:
+            schema_error = _twap_schema_error(payload)
+        else:
+            schema_error = Engine._schema_error(payload)
+        if schema_error is not None:
             return reject_envelope()
 
         # A symbol state is created only once the event is fully well formed;
@@ -348,11 +575,41 @@ class EventReplayer:
                 state=state if known_symbol else None,
             )
 
-        # ---- committed application through the baseline engine ----------
+        # ---- committed application ---------------------------------------
         # From here on the event is dispatched: register a brand new symbol
         # book and commit id/sequence exactly as the baseline does.
         if not known_symbol:
             self._symbols[symbol] = state
+
+        # A derived child id (``plan_id#slice``) is reserved from plan start;
+        # it occupies both the order-id and event-id role of the future child,
+        # so no external event — baseline or TWAP command — may reuse it as an
+        # event id.
+        if event_id in state.plan_index:
+            # Committed like every baseline business rejection: the well-formed
+            # event occupies its id and the sequence, but nothing else moves.
+            state.last_sequence = sequence
+            state.seen[event_id] = content
+            self._events[event_id] = (symbol, content)
+            bids, asks = state.engine.snapshot()
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": REJECTED,
+                "rejection_code": DUPLICATE_EVENT_ID,
+                "trades": [],
+                "book_changes": {"bids": [], "asks": []},
+                "bids": bids,
+                "asks": asks,
+            }
+
+        if event_type in _TWAP_TYPES:
+            out = self._dispatch_twap(
+                event, payload, event_type, state, symbol, sequence, content
+            )
+            return out
+
         before_bids, before_asks = state.engine.level_totals()
         before_bids = dict(before_bids)
         before_asks = dict(before_asks)
@@ -397,6 +654,229 @@ class EventReplayer:
             }
         return out
 
+    @staticmethod
+    def _allowed_payload_keys(inline_type: object) -> frozenset[str] | None:
+        """The payload fields an inline event of ``inline_type`` may carry."""
+        if inline_type in (ADD, CANCEL, REPLACE):
+            return _BASELINE_KEYS
+        if inline_type == TWAP_START:
+            return _TWAP_START_KEYS
+        if inline_type in (TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT):
+            return _TWAP_PLAN_REF_KEYS
+        return None
+
+    # -- TWAP handling ------------------------------------------------------
+
+    def _dispatch_twap(
+        self,
+        event: dict[str, object],
+        payload: dict[str, object],
+        event_type: str,
+        state: _SymbolState,
+        symbol: str,
+        sequence: int,
+        content: str,
+    ) -> dict[str, object]:
+        """Dispatch a structurally valid, in-sequence TWAP command.
+
+        Every branch commits the well-formed event id and advances the symbol
+        sequence, including business rejections: this matches the baseline
+        rule that a valid event occupies its id whatever the business result.
+        """
+        event_id: str = event["event_id"]
+
+        before_bids, before_asks = state.engine.level_totals()
+        before_bids = dict(before_bids)
+        before_asks = dict(before_asks)
+
+        if event_type == TWAP_START:
+            result_out = self._twap_start(payload, state)
+        elif event_type == TWAP_SLICE:
+            result_out = self._twap_slice(payload, state)
+        elif event_type == TWAP_CANCEL:
+            result_out = self._twap_cancel(payload, state)
+        else:
+            result_out = self._twap_report(payload, state)
+
+        # The structurally valid TWAP command occupies its event id and the
+        # symbol sequence whatever its business outcome.
+        state.last_sequence = sequence
+        state.seen[event_id] = content
+        self._events[event_id] = (symbol, content)
+
+        # Only a released slice can move the book; compute the change set with
+        # the same level-diff routine the baseline path uses, so drained
+        # levels and iceberg replenishment are reported identically.
+        book_changes = self._book_changes(state.engine, before_bids, before_asks)
+        return self._twap_response(
+            event_id, symbol, sequence, state, result_out, book_changes
+        )
+
+    def _twap_start(
+        self, payload: dict[str, object], state: _SymbolState
+    ) -> tuple[str, str | None, ExecutionPlan | None, None]:
+        """Create the plan and reserve its derived ids; no matching occurs."""
+        plan_id: str = payload["plan_id"]
+        if plan_id in state.plans:
+            return REJECTED, DUPLICATE_EXECUTION_PLAN, None, None
+        plan = ExecutionPlan(
+            plan_id=plan_id,
+            side=payload["side"],
+            order_type=payload["order_type"],
+            total_quantity=payload["total_quantity"],
+            slice_count=payload["slice_count"],
+            benchmark_price=payload["benchmark_price"],
+            price=payload.get("price") if payload["order_type"] == LIMIT else None,
+            account_id=payload.get("account_id"),
+        )
+        # Every derived id is reserved up front; a clash with an existing order
+        # or another plan's derived id rejects the start before anything is
+        # registered, so the event leaves no plan or reservation behind.
+        for child_id in plan.child_ids():
+            if state.engine.has_order_id(child_id) or child_id in state.plan_index:
+                return REJECTED, DUPLICATE_ORDER_ID, None, None
+        for child_id in plan.child_ids():
+            state.engine.reserve_order_id(child_id)
+            state.plan_index[child_id] = plan_id
+        state.plans[plan_id] = plan
+        return ACCEPTED, None, plan, None
+
+    def _twap_slice(
+        self, payload: dict[str, object], state: _SymbolState
+    ) -> tuple[str, str | None, ExecutionPlan | None, dict[str, object] | None]:
+        """Release the next slice as an IOC child order against current book."""
+        plan_id: str = payload["plan_id"]
+        plan = state.plans.get(plan_id)
+        if plan is None:
+            return REJECTED, UNKNOWN_EXECUTION_PLAN, None, None
+        if plan.status != PLAN_ACTIVE:
+            return REJECTED, EXECUTION_PLAN_CLOSED, None, None
+
+        slice_number = plan.released + 1
+        child_id = plan.child_order_id(slice_number)
+        quantity = plan.slice_quantities[plan.released]
+
+        child: dict[str, object] = {
+            "event_id": child_id,
+            "type": ADD,
+            "order_id": child_id,
+            "side": plan.side,
+            "order_type": plan.order_type,
+            "quantity": quantity,
+            "time_in_force": IOC,
+        }
+        if plan.order_type == LIMIT:
+            child["price"] = plan.price
+        if plan.account_id is not None:
+            child["account_id"] = plan.account_id
+
+        # The child id was reserved at plan start; release it immediately
+        # before the baseline ADD spends it through the regular path.
+        state.engine.release_order_id(child_id)
+        _eid, engine_result, reason, trades, _stp = state.engine.handle_object(child)
+        # A correctly synthesized child can only fail on a programming error;
+        # fail loudly rather than corrupt the plan counters.
+        if reason is not None:  # pragma: no cover - defensive
+            raise RuntimeError(f"TWAP slice child order rejected: {reason}")
+
+        traded_quantity = sum(trade["quantity"] for trade in trades)
+        plan.released += 1
+        plan.released_quantity += quantity
+        plan.filled_quantity += traded_quantity
+        plan.notional += sum(trade["price"] * trade["quantity"] for trade in trades)
+        if plan.released == plan.slice_count:
+            plan.status = PLAN_COMPLETED
+
+        slice_info = {
+            "slice_number": slice_number,
+            "child_order_id": child_id,
+            "engine_result": engine_result,
+            "trades": trades,
+        }
+        return ACCEPTED, None, plan, slice_info
+
+    def _twap_cancel(
+        self, payload: dict[str, object], state: _SymbolState
+    ) -> tuple[str, str | None, ExecutionPlan | None, None]:
+        """Count the unreleased quantity as cancelled and close the plan.
+
+        Purely a plan-state change: no resting order is touched, no trade id
+        or historical trade changes.
+        """
+        plan_id: str = payload["plan_id"]
+        plan = state.plans.get(plan_id)
+        if plan is None:
+            return REJECTED, UNKNOWN_EXECUTION_PLAN, None, None
+        if plan.status != PLAN_ACTIVE:
+            return REJECTED, EXECUTION_PLAN_CLOSED, None, None
+
+        unreleased = plan.total_quantity - plan.released_quantity
+        plan.cancelled_quantity += unreleased
+        plan.status = PLAN_CANCELLED
+        return ACCEPTED, None, plan, None
+
+    def _twap_report(
+        self, payload: dict[str, object], state: _SymbolState
+    ) -> tuple[str, str | None, ExecutionPlan | None, None]:
+        """Read-only cumulative plan summary; closed plans stay queryable."""
+        plan_id: str = payload["plan_id"]
+        plan = state.plans.get(plan_id)
+        if plan is None:
+            return REJECTED, UNKNOWN_EXECUTION_PLAN, None, None
+        return ACCEPTED, None, plan, None
+
+    @staticmethod
+    def _twap_response(
+        event_id: str,
+        symbol: str,
+        sequence: int,
+        state: _SymbolState,
+        result_out: tuple[str, str | None, ExecutionPlan | None, dict[str, object] | None],
+        book_changes: dict[str, list[dict[str, int]]],
+    ) -> dict[str, object]:
+        """Assemble the TWAP command result, including book and plan summary."""
+        status, code, plan, slice_info = result_out
+        bids, asks = state.engine.snapshot()
+        if status == ACCEPTED:
+            if slice_info is None:
+                # START, CANCEL and REPORT never move the book.
+                trades: list[dict[str, object]] = []
+                result: str | None = None
+                slice_number = child_order_id = None
+            else:
+                trades = slice_info["trades"]
+                result = slice_info["engine_result"]
+                slice_number = slice_info["slice_number"]
+                child_order_id = slice_info["child_order_id"]
+            out: dict[str, object] = {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": ACCEPTED,
+                "trades": trades,
+                "book_changes": book_changes,
+                "bids": bids,
+                "asks": asks,
+            }
+            if result is not None:
+                out["result"] = result
+            out["execution_plan"] = plan.summary(
+                slice_number=slice_number, child_order_id=child_order_id
+            ) if plan is not None else None
+            return out
+        # Business rejection: the book is untouched by the command itself.
+        return {
+            "event_id": event_id,
+            "symbol": symbol,
+            "sequence": sequence,
+            "status": REJECTED,
+            "rejection_code": code,
+            "trades": [],
+            "book_changes": {"bids": [], "asks": []},
+            "bids": bids,
+            "asks": asks,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Snapshot export / restoration
@@ -411,9 +891,11 @@ def _engine_to_json(state: _SymbolState) -> dict[str, object]:
             {"event_id": event_id, "content": content}
             for event_id, content in state.seen.items()
         ],
+        "plans": [state.plans[plan_id].to_json() for plan_id in sorted(state.plans)],
         "engine": {
             "event_ids": sorted(raw["event_ids"]),
             "order_ids": sorted(raw["order_ids"]),
+            "reserved_order_ids": sorted(raw["reserved_order_ids"]),
             "orders": {
                 order_id: raw["orders"][order_id]
                 for order_id in sorted(raw["orders"])
@@ -444,6 +926,112 @@ def _is_str_set_list(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
+def _non_negative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _parse_plan_entry(entry: dict[str, object]) -> "ExecutionPlan":
+    """Validate one serialized plan record and rebuild the :class:`ExecutionPlan`."""
+
+    def pos_int(name: str) -> int:
+        value = entry.get(name)
+        _require(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0,
+            f"plan {entry.get('plan_id')!r} {name} must be a positive integer",
+        )
+        return value
+
+    plan_id = entry.get("plan_id")
+    _require(_is_non_empty_str(plan_id), "plan plan_id must be a non-empty string")
+    side = entry.get("side")
+    _require(side in (BUY, SELL), f"plan {plan_id} has a bad side")
+    order_type = entry.get("order_type")
+    _require(order_type in (LIMIT, MARKET), f"plan {plan_id} has a bad order type")
+    benchmark_price = pos_int("benchmark_price")
+    price = entry.get("price")
+    if order_type == LIMIT:
+        _require(
+            isinstance(price, int) and not isinstance(price, bool) and price > 0,
+            f"plan {plan_id} LIMIT price must be a positive integer",
+        )
+    else:
+        _require(price is None, f"plan {plan_id} MARKET must not carry a price")
+    account_id = entry.get("account_id")
+    _require(
+        account_id is None or _is_non_empty_str(account_id),
+        f"plan {plan_id} account_id is malformed",
+    )
+    raw_slices = entry.get("slice_quantities")
+    _require(
+        isinstance(raw_slices, list) and len(raw_slices) > 0,
+        f"plan {plan_id} slice_quantities must be a non-empty list",
+    )
+    slice_quantities: list[int] = []
+    for value in raw_slices:
+        _require(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0,
+            f"plan {plan_id} slice quantities must be positive integers",
+        )
+        slice_quantities.append(value)
+    released = entry.get("released")
+    released_quantity = entry.get("released_quantity")
+    filled_quantity = entry.get("filled_quantity")
+    cancelled_quantity = entry.get("cancelled_quantity")
+    notional = entry.get("notional")
+    for name, value in (
+        ("released", released),
+        ("released_quantity", released_quantity),
+        ("filled_quantity", filled_quantity),
+        ("cancelled_quantity", cancelled_quantity),
+        ("notional", notional),
+    ):
+        _require(_non_negative_int(value), f"plan {plan_id} {name} must be a non-negative integer")
+    status = entry.get("status")
+    _require(
+        status in (PLAN_ACTIVE, PLAN_COMPLETED, PLAN_CANCELLED),
+        f"plan {plan_id} has a bad status",
+    )
+    slice_count = len(slice_quantities)
+    _require(0 <= released <= slice_count, f"plan {plan_id} released slice index out of range")
+    total_quantity = sum(slice_quantities)
+    _require(
+        released_quantity == sum(slice_quantities[:released]),
+        f"plan {plan_id} released_quantity does not match its slices",
+    )
+    _require(
+        filled_quantity <= released_quantity,
+        f"plan {plan_id} filled quantity exceeds released quantity",
+    )
+    if status == PLAN_ACTIVE:
+        _require(released < slice_count, f"plan {plan_id} is ACTIVE with no slices left")
+        _require(cancelled_quantity == 0, f"plan {plan_id} is ACTIVE but carries cancellations")
+    elif status == PLAN_COMPLETED:
+        _require(released == slice_count, f"plan {plan_id} is COMPLETED before all slices")
+        _require(cancelled_quantity == 0, f"plan {plan_id} is COMPLETED but carries cancellations")
+    else:
+        _require(released < slice_count, f"plan {plan_id} is CANCELLED after all slices")
+        _require(
+            cancelled_quantity == total_quantity - released_quantity,
+            f"plan {plan_id} cancelled quantity does not cover the unreleased remainder",
+        )
+
+    plan = ExecutionPlan.__new__(ExecutionPlan)
+    plan.plan_id = plan_id
+    plan.side = side
+    plan.order_type = order_type
+    plan.benchmark_price = benchmark_price
+    plan.price = price
+    plan.account_id = account_id
+    plan.slice_quantities = slice_quantities
+    plan.released = released
+    plan.released_quantity = released_quantity
+    plan.filled_quantity = filled_quantity
+    plan.cancelled_quantity = cancelled_quantity
+    plan.notional = notional
+    plan.status = status
+    return plan
+
+
 _ORDER_RECORD_KEYS = frozenset(
     {"side", "price", "remaining", "status", "account_id",
      "display_quantity", "visible"}
@@ -451,10 +1039,15 @@ _ORDER_RECORD_KEYS = frozenset(
 _TRADE_KEYS = frozenset(
     {"trade_id", "maker_order_id", "taker_order_id", "price", "quantity", "event_id"}
 )
-_SYMBOL_STATE_KEYS = frozenset({"last_sequence", "event_log", "engine"})
+_SYMBOL_STATE_KEYS = frozenset({"last_sequence", "event_log", "plans", "engine"})
 _ENGINE_KEYS = frozenset(
-    {"event_ids", "order_ids", "orders", "bids", "asks",
+    {"event_ids", "order_ids", "reserved_order_ids", "orders", "bids", "asks",
      "bid_totals", "ask_totals", "next_trade_id", "accounts", "trade_log"}
+)
+_PLAN_KEYS = frozenset(
+    {"plan_id", "side", "order_type", "benchmark_price", "price", "account_id",
+     "slice_quantities", "released", "released_quantity", "filled_quantity",
+     "cancelled_quantity", "notional", "status"}
 )
 _ENVELOPE_KEYS_SNAPSHOT = frozenset(
     {"format_version", "engine_version", "config", "config_digest",
@@ -485,16 +1078,71 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
         _require(event_id not in seen, "duplicate event id in symbol event log")
         seen[event_id] = content
 
+    # Partition the accepted events into baseline engine events and TWAP
+    # command events: the engine journal only knows the former plus the child
+    # orders synthesized for released slices, while every TWAP command id lives
+    # solely in the replay log.
+    baseline_event_ids: set[str] = set()
+    twap_event_ids: set[str] = set()
+    for event_id, content in seen.items():
+        try:
+            stored_type = json.loads(content).get("type")
+        except (ValueError, AttributeError):
+            _require(False, f"event log content for {event_id} is not a JSON object")
+            stored_type = None
+        if stored_type in _TWAP_TYPES:
+            twap_event_ids.add(event_id)
+        else:
+            baseline_event_ids.add(event_id)
+
+    plans_raw = data.get("plans")
+    _require(isinstance(plans_raw, list), "plans must be a list")
+    plans: dict[str, ExecutionPlan] = {}
+    plan_index: dict[str, str] = {}
+    released_child_ids: set[str] = set()
+    reserved_child_ids: set[str] = set()
+    for entry in plans_raw:
+        _require(isinstance(entry, dict), "plan entry must be an object")
+        _require(set(entry) == _PLAN_KEYS, "plan entry has unknown fields")
+        plan = _parse_plan_entry(entry)
+        plan_id = plan.plan_id
+        _require(plan_id not in plans, f"duplicate execution plan id {plan_id}")
+        for index in range(plan.slice_count):
+            child_id = plan.child_order_id(index + 1)
+            _require(
+                child_id not in plan_index,
+                f"derived order id {child_id} is claimed by two plans",
+            )
+            plan_index[child_id] = plan_id
+            if index < plan.released:
+                released_child_ids.add(child_id)
+            else:
+                reserved_child_ids.add(child_id)
+        plans[plan_id] = plan
+
     engine_data = data.get("engine")
     _require(isinstance(engine_data, dict), "engine state must be an object")
     _require(set(engine_data) == _ENGINE_KEYS, "engine state has unknown fields")
 
     event_ids = engine_data.get("event_ids")
     order_ids = engine_data.get("order_ids")
+    reserved_raw = engine_data.get("reserved_order_ids")
     accounts = engine_data.get("accounts")
     _require(_is_str_set_list(event_ids), "engine.event_ids must be a list of strings")
     _require(_is_str_set_list(order_ids), "engine.order_ids must be a list of strings")
+    _require(
+        _is_str_set_list(reserved_raw),
+        "engine.reserved_order_ids must be a list of strings",
+    )
     _require(_is_str_set_list(accounts), "engine.accounts must be a list of strings")
+    _require(
+        set(reserved_raw) == reserved_child_ids,
+        "reserved order ids do not match the plans' unreleased slices",
+    )
+    _require(
+        set(reserved_raw).isdisjoint(order_ids),
+        "an order id is both reserved and spent",
+    )
 
     orders = engine_data.get("orders")
     _require(isinstance(orders, dict), "engine.orders must be an object")
@@ -625,9 +1273,22 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
     for order_id in ask_queued:
         _require(orders[order_id]["side"] == "SELL", f"{order_id} rests on the wrong side")
 
-    # The id sets mirror exactly what the baseline engine would hold.
+    # The id sets mirror exactly what the baseline engine would hold. The
+    # engine only knows baseline events and synthesized child orders; TWAP
+    # command ids live solely in the replay layer's event log.
     _require(set(order_ids) == set(orders), "order_ids and order records disagree")
-    _require(set(event_ids) == set(seen), "engine event ids and event log disagree")
+    _require(
+        set(event_ids) == (baseline_event_ids - set(plan_index)) | released_child_ids,
+        "engine event ids do not match the baseline events and released slices",
+    )
+    _require(
+        released_child_ids <= set(order_ids),
+        "a released plan slice is missing an engine order record",
+    )
+    _require(
+        released_child_ids.isdisjoint(reserved_child_ids),
+        "a plan slice is both released and reserved",
+    )
     _require(last_sequence == len(seen),
              "last_sequence does not match the contiguous accepted event count")
 
@@ -679,12 +1340,75 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
         taker = orders[taker_id]
         _require(maker["side"] != taker["side"], "a trade cannot join two same-side orders")
 
+    # Cross-validate every plan against the engine journal and order records:
+    # released child ids must denote IOC child orders with the plan's side and
+    # account, the child's original quantity must equal its slice quantity, and
+    # the cumulative filled quantity / notional must match the trades exactly.
+    child_fill_qty: dict[str, int] = {}
+    child_notional: dict[str, int] = {}
+    for trade in trade_log:
+        taker_id = trade["taker_order_id"]
+        if taker_id in plan_index:
+            child_fill_qty[taker_id] = child_fill_qty.get(taker_id, 0) + trade["quantity"]
+            child_notional[taker_id] = (
+                child_notional.get(taker_id, 0) + trade["price"] * trade["quantity"]
+            )
+    for plan in plans.values():
+        plan_filled = 0
+        plan_notional = 0
+        for index in range(plan.slice_count):
+            child_id = plan.child_order_id(index + 1)
+            if index >= plan.released:
+                _require(
+                    child_id not in orders,
+                    f"plan {plan.plan_id} unreleased slice already has an order record",
+                )
+                continue
+            record = orders[child_id]
+            _require(record["side"] == plan.side,
+                     f"child {child_id} trades on the wrong side")
+            _require(record["status"] != "RESTING",
+                     f"IOC child {child_id} must not rest in the book")
+            _require(
+                record["price"] == plan.price,
+                f"child {child_id} price disagrees with its plan",
+            )
+            _require(
+                record.get("account_id") == plan.account_id,
+                f"child {child_id} account disagrees with its plan",
+            )
+            filled = child_fill_qty.get(child_id, 0)
+            slice_quantity = plan.slice_quantities[index]
+            _require(
+                filled + record["remaining"] == slice_quantity,
+                f"child {child_id} quantity does not match its plan slice",
+            )
+            plan_filled += filled
+            plan_notional += child_notional.get(child_id, 0)
+        _require(plan_filled == plan.filled_quantity,
+                 f"plan {plan.plan_id} filled quantity disagrees with the trade log")
+        _require(plan_notional == plan.notional,
+                 f"plan {plan.plan_id} notional disagrees with the trade log")
+
+    # Every derived id is either a released child order or an engine
+    # reservation; no plan id may be missing on either side, and external
+    # orders may never squat on a derived id.
+    _require(
+        set(plan_index) == released_child_ids | reserved_child_ids,
+        "plan derived ids disagree with engine order state",
+    )
+    _require(
+        released_child_ids.isdisjoint(reserved_child_ids),
+        "a plan slice is both released and reserved",
+    )
+
     # Deep copy so later caller mutation of the snapshot document can never
     # reach the live engine.
     engine = Engine(
         _state={
             "event_ids": set(event_ids),
             "order_ids": set(order_ids),
+            "reserved_order_ids": set(reserved_raw),
             "orders": copy.deepcopy(orders),
             "bids": bids,
             "asks": asks,
@@ -698,6 +1422,8 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
     state = _SymbolState(engine)
     state.last_sequence = last_sequence
     state.seen = seen
+    state.plans = plans
+    state.plan_index = plan_index
     return state
 
 
@@ -858,10 +1584,11 @@ def replay_events(
         Event objects in strict submission order. Each event carries
         ``event_id`` (non-empty string, unique across the whole stream),
         ``symbol`` (non-empty string), ``sequence`` (positive integer,
-        strictly increasing per symbol) and the baseline mutating payload —
-        either inline (``"type"`` plus the baseline ADD/CANCEL/REPLACE fields)
-        or nested under an ``"event"`` object that repeats ``event_id`` and
-        ``type``.
+        strictly increasing per symbol) and a payload — either inline
+        (``"type"`` plus the fields of that event kind) or nested under an
+        ``"event"`` object that repeats ``event_id`` and ``type``. Supported
+        kinds are the baseline ADD/CANCEL/REPLACE events and the TWAP
+        TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT commands.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
         a resumed run must pass the same configuration the snapshot carries.

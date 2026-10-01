@@ -98,6 +98,7 @@ class Engine:
             # user input, so it can be adopted verbatim without copying.
             self._event_ids: set[str] = _state["event_ids"]
             self._order_ids: set[str] = _state["order_ids"]
+            self._reserved_order_ids: set[str] = _state["reserved_order_ids"]
             self._orders: dict[str, dict[str, object]] = _state["orders"]
             self._bids: dict[int, deque[str]] = _state["bids"]
             self._asks: dict[int, deque[str]] = _state["asks"]
@@ -109,6 +110,11 @@ class Engine:
             return
         self._event_ids = set()
         self._order_ids = set()
+        # Identifiers reserved by future parent-order slices: they block reuse
+        # through ADD exactly like spent order ids, but have no order record
+        # until their slice is released. Always empty on the baseline entry
+        # points.
+        self._reserved_order_ids = set()
         self._orders = {}
         self._bids = {}
         self._asks = {}
@@ -458,7 +464,7 @@ class Engine:
         self, event_id: str, obj: dict[str, object]
     ) -> tuple[str, str, str | None, list[dict[str, object]], dict[str, object] | None]:
         order_id: str = obj["order_id"]
-        if order_id in self._order_ids:
+        if order_id in self._order_ids or order_id in self._reserved_order_ids:
             return event_id, REJECTED, DUPLICATE_ORDER_ID, [], None
         self._order_ids.add(order_id)
 
@@ -1069,6 +1075,26 @@ class Engine:
         """Raw visible-quantity aggregates keyed by price (bid, then ask)."""
         return self._bid_totals, self._ask_totals
 
+    def has_order_id(self, order_id: str) -> bool:
+        """Whether an id is already spent or reserved by any accepted order."""
+        return order_id in self._order_ids or order_id in self._reserved_order_ids
+
+    def reserve_order_id(self, order_id: str) -> None:
+        """Block an id from external ADD before its derived order is submitted.
+
+        Used by parent-order plans: every future slice id is reserved when the
+        plan starts, so a later external ADD can never occupy it. Releasing the
+        slice moves the id into the regular spent-id set.
+        """
+        self._reserved_order_ids.add(order_id)
+
+    def release_order_id(self, order_id: str) -> None:
+        """Clear a reservation immediately before the derived order is added.
+
+        The subsequent ADD then spends the id through the regular path.
+        """
+        self._reserved_order_ids.discard(order_id)
+
     def dump_state(self) -> dict[str, object]:
         """Export the complete mutable engine state for an authoritative owner.
 
@@ -1080,6 +1106,7 @@ class Engine:
         return {
             "event_ids": set(self._event_ids),
             "order_ids": set(self._order_ids),
+            "reserved_order_ids": set(self._reserved_order_ids),
             "orders": copy.deepcopy(self._orders),
             "bids": {p: deque(q) for p, q in self._bids.items()},
             "asks": {p: deque(q) for p, q in self._asks.items()},
@@ -1094,6 +1121,7 @@ class Engine:
         """Replace this engine's whole state from an authoritative export."""
         self._event_ids = set(state["event_ids"])
         self._order_ids = set(state["order_ids"])
+        self._reserved_order_ids = set(state.get("reserved_order_ids", ()))
         self._orders = copy.deepcopy(state["orders"])
         self._bids = {p: deque(q) for p, q in state["bids"].items()}
         self._asks = {p: deque(q) for p, q in state["asks"].items()}
