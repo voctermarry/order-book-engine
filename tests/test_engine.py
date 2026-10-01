@@ -948,3 +948,307 @@ def test_iceberg_replay_is_byte_deterministic():
     # A schema rejection leaves the book untouched.
     assert records[5]["asks"] == records[4]["asks"]
 
+
+# --------------------------------------------------------------------------
+# REPLACE events
+# --------------------------------------------------------------------------
+
+
+def replace(event_id, order_id, quantity, price, **extra):
+    obj = {
+        "event_id": event_id,
+        "type": "REPLACE",
+        "order_id": order_id,
+        "quantity": quantity,
+        "price": price,
+    }
+    obj.update(extra)
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def test_replace_resting_limit_moves_and_resizes():
+    engine, _ = book_after([add("e1", "o1", "BUY", "LIMIT", 5, 100)])
+    eid, result, reason, trades = engine.handle_line(replace("e2", "o1", 3, 101))
+    assert (eid, result, reason, trades) == ("e2", "REPLACED", None, [])
+    assert engine.snapshot() == ([{"price": 101, "quantity": 3}], [])
+
+
+def test_replace_loses_priority_even_with_unchanged_parameters():
+    engine, _ = book_after(
+        [
+            add("e1", "o1", "BUY", "LIMIT", 2, 100),
+            add("e2", "o2", "BUY", "LIMIT", 2, 100),
+        ]
+    )
+    _, result, _, _ = engine.handle_line(replace("e3", "o1", 2, 100))
+    assert result == "REPLACED"
+    # o1 rejoined behind o2, so o2 is matched first.
+    _, _, _, trades = engine.handle_line(add("e4", "s1", "SELL", "LIMIT", 2, 100))
+    assert [t["maker_order_id"] for t in trades] == ["o2"]
+    _, _, _, trades = engine.handle_line(add("e5", "s2", "SELL", "LIMIT", 2, 100))
+    assert [t["maker_order_id"] for t in trades] == ["o1"]
+
+
+def test_replace_matches_as_taker_and_can_fill():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 5, 100),
+            add("e2", "b1", "BUY", "LIMIT", 3, 99),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(replace("e3", "b1", 2, 100))
+    assert result == "FILLED"
+    assert trades == [
+        {"trade_id": 1, "maker_order_id": "s1", "taker_order_id": "b1",
+         "price": 100, "quantity": 2}
+    ]
+    assert engine.snapshot() == ([], [{"price": 100, "quantity": 3}])
+
+
+def test_replace_partially_filled_then_rests():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100),
+            add("e2", "b1", "BUY", "LIMIT", 1, 99),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(replace("e3", "b1", 5, 100))
+    assert result == "PARTIALLY_FILLED_RESTING"
+    assert [t["quantity"] for t in trades] == [2]
+    assert engine.snapshot() == ([{"price": 100, "quantity": 3}], [])
+
+
+def test_replace_never_trades_against_its_own_previous_state():
+    # The only order in the book is the target itself; repricing across the
+    # old position must not produce a self trade.
+    engine, _ = book_after([add("e1", "b1", "BUY", "LIMIT", 5, 100)])
+    _, result, _, trades = engine.handle_line(replace("e2", "b1", 5, 200))
+    assert (result, trades) == ("REPLACED", [])
+    assert engine.snapshot() == ([{"price": 200, "quantity": 5}], [])
+
+    # Same on the ask side with an iceberg target.
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    _, result, _, trades = engine.handle_line(replace("e2", "i1", 10, 50))
+    assert (result, trades) == ("REPLACED", [])
+    assert engine.snapshot() == ([], [{"price": 50, "quantity": 3}])
+
+
+def test_replace_quantity_is_new_remaining_total():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 4, 100),
+            add("e2", "b1", "BUY", "LIMIT", 10, 100),  # fills 4, rests 6
+        ]
+    )
+    assert engine.snapshot()[0] == [{"price": 100, "quantity": 6}]
+    # quantity is the new remaining total, unrelated to the 4 already filled.
+    _, result, _, _ = engine.handle_line(replace("e3", "b1", 2, 100))
+    assert result == "REPLACED"
+    assert engine.snapshot()[0] == [{"price": 100, "quantity": 2}]
+
+
+def test_replace_unknown_or_finished_target_is_unknown_order():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100),
+            add("e2", "b1", "BUY", "LIMIT", 2, 100),  # fills s1
+        ]
+    )
+    for line in (
+        replace("e3", "missing", 1, 100),   # never existed
+        replace("e4", "s1", 1, 100),        # filled maker
+        replace("e5", "b1", 1, 100),        # filled taker
+    ):
+        _, result, reason, trades = engine.handle_line(line)
+        assert (result, reason, trades) == ("REJECTED", "UNKNOWN_ORDER", [])
+
+    # A cancelled order cannot be replaced either.
+    engine, _ = book_after([add("e1", "o1", "BUY", "LIMIT", 1, 100)])
+    engine.handle_line(cancel("e2", "o1"))
+    assert engine.handle_line(replace("e3", "o1", 1, 100))[1:3] == (
+        "REJECTED", "UNKNOWN_ORDER"
+    )
+
+    # A valid event with an unknown target still occupies its event id.
+    assert engine.handle_line(replace("e3", "o1", 1, 100))[1:3] == (
+        "REJECTED", "DUPLICATE_EVENT_ID"
+    )
+
+
+def test_replace_rejections_change_nothing():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100),
+            add("e2", "s2", "SELL", "LIMIT", 2, 100),
+        ]
+    )
+    before = engine.snapshot()
+    engine.handle_line(replace("e3", "missing", 1, 100))     # UNKNOWN_ORDER
+    engine.handle_line(replace("e4", "s1", 0, 100))          # bad quantity
+    engine.handle_line(replace("e5", "s1", 1, 100, side="BUY"))  # extra field
+    assert engine.snapshot() == before
+
+    _, _, _, trades = engine.handle_line(add("e6", "b1", "BUY", "LIMIT", 2, 100))
+    assert [t["trade_id"] for t in trades] == [1]
+    assert [t["maker_order_id"] for t in trades] == ["s1"]
+
+
+def test_replace_schema_rejections_consume_no_event_id():
+    engine, _ = book_after([add("e0", "o1", "BUY", "LIMIT", 5, 100)])
+    base = {"event_id": "eR", "type": "REPLACE", "order_id": "o1",
+            "quantity": 3, "price": 100}
+    payloads = [
+        {k: v for k, v in base.items() if k != "quantity"},   # missing quantity
+        {k: v for k, v in base.items() if k != "price"},      # missing price
+        {k: v for k, v in base.items() if k != "order_id"},   # missing order_id
+        {**base, "side": "BUY"},                              # inherited field
+        {**base, "order_type": "LIMIT"},                      # inherited field
+        {**base, "time_in_force": "GTC"},                     # always GTC
+        {**base, "unknown_field": 1},                         # unknown field
+        {**base, "quantity": True},                           # bool quantity
+        {**base, "quantity": 0},                              # non-positive
+        {**base, "quantity": 1.5},                            # float quantity
+        {**base, "price": True},                              # bool price
+        {**base, "price": 0},                                 # non-positive
+        {**base, "price": 2.5},                               # float price
+        {**base, "display_quantity": 2},                      # limit target
+        {**base, "order_id": 7},                              # non-string id
+    ]
+    for payload in payloads:
+        assert engine.handle_line(json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), payload
+        # Structural errors never occupy the event id.
+        assert engine.handle_line(json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), payload
+
+    # The book and the target are untouched; the event id is still free.
+    assert engine.snapshot() == ([{"price": 100, "quantity": 5}], [])
+    _, result, reason, _ = engine.handle_line(json.dumps(base))
+    assert (result, reason) == ("REPLACED", None)
+    assert engine.snapshot() == ([{"price": 100, "quantity": 3}], [])
+
+
+def test_replace_duplicate_event_id():
+    engine, _ = book_after([add("e1", "o1", "BUY", "LIMIT", 5, 100)])
+    line = replace("e2", "o1", 3, 100)
+    assert engine.handle_line(line)[1] == "REPLACED"
+    assert engine.handle_line(line)[1:3] == ("REJECTED", "DUPLICATE_EVENT_ID")
+
+
+def test_replace_keeps_order_id_occupied():
+    engine, _ = book_after([add("e1", "o1", "BUY", "LIMIT", 5, 100)])
+    # Replacing does not trip DUPLICATE_ORDER_ID itself...
+    assert engine.handle_line(replace("e2", "o1", 3, 100))[1] == "REPLACED"
+    # ...but the id stays occupied for later ADDs, even after the replacement
+    # is fully filled.
+    engine.handle_line(add("e3", "s1", "SELL", "LIMIT", 3, 100))
+    assert engine.handle_line(add("e4", "o1", "SELL", "LIMIT", 1, 100))[1:3] == (
+        "REJECTED", "DUPLICATE_ORDER_ID"
+    )
+
+
+def test_replace_iceberg_defaults_to_original_peak_and_rests_one_slice():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    _, result, _, trades = engine.handle_line(replace("e2", "i1", 8, 101))
+    assert (result, trades) == ("REPLACED", [])
+    # Omitted display_quantity keeps the original peak of 3.
+    assert engine.snapshot()[1] == [{"price": 101, "quantity": 3}]
+    # The reserve follows the iceberg through replenishment.
+    _, _, _, trades = engine.handle_line(add("e3", "b1", "BUY", "LIMIT", 5, 101))
+    assert [t["quantity"] for t in trades] == [3, 2]
+    assert engine.snapshot()[1] == [{"price": 101, "quantity": 1}]
+
+
+def test_replace_iceberg_with_new_display_quantity():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    _, result, _, _ = engine.handle_line(
+        replace("e2", "i1", 9, 100, display_quantity=4)
+    )
+    assert result == "REPLACED"
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 4}]
+
+    # display_quantity must be a positive integer not above the new quantity.
+    for bad in (0, -1, True, 2.0, 10):
+        assert engine.handle_line(
+            replace("eX", "i1", 9, 100, display_quantity=bad)
+        )[1:3] == ("REJECTED", "INVALID_SCHEMA"), bad
+
+
+def test_replace_iceberg_visible_is_capped_by_remaining():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    _, result, _, _ = engine.handle_line(replace("e2", "i1", 2, 100))
+    assert result == "REPLACED"
+    # min(display_quantity, remaining): only 2 of the peak 3 is shown.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+
+
+def test_replace_iceberg_replenishes_behind_same_price_orders():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100),
+            iceberg("e2", "i1", "SELL", 6, 100, 2),
+        ]
+    )
+    # Move the iceberg onto s1's level: it joins behind s1.
+    _, result, _, _ = engine.handle_line(replace("e3", "i1", 6, 100))
+    assert result == "REPLACED"
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 4}]
+    _, _, _, trades = engine.handle_line(add("e4", "b1", "BUY", "LIMIT", 6, 100))
+    # s1 first, then the iceberg slices replenishing at the queue tail.
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [
+        ("s1", 2),
+        ("i1", 2),
+        ("i1", 2),
+    ]
+
+
+def test_replace_iceberg_fully_filled_as_taker():
+    engine, _ = book_after(
+        [
+            add("e1", "b1", "BUY", "LIMIT", 8, 100),
+            iceberg("e2", "i1", "SELL", 10, 101, 3),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(replace("e3", "i1", 8, 100))
+    assert result == "FILLED"
+    assert [t["quantity"] for t in trades] == [8]
+    assert engine.snapshot() == ([], [])
+
+
+def test_replace_replay_is_byte_deterministic():
+    stream = "\n".join(
+        [
+            iceberg("e1", "i1", "SELL", 10, 100, 3),
+            add("e2", "s2", "SELL", "LIMIT", 5, 100),
+            add("e3", "b1", "BUY", "LIMIT", 4, 99),
+            replace("e4", "b1", 6, 100),
+            replace("e5", "i1", 8, 100, display_quantity=2),
+            replace("e6", "s2", 1, 100, display_quantity=1),
+            replace("e7", "gone", 1, 100),
+            replace("e4", "b1", 1, 100),
+        ]
+    ) + "\n"
+    code, out1, err1 = run_replay(stream)
+    _, out2, err2 = run_replay(stream)
+    assert code == 0
+    assert (err1, err2) == ("", "")
+    assert out2 == out1
+
+    records = [json.loads(line) for line in out1.splitlines()]
+    assert [r["result"] for r in records] == [
+        "RESTING", "RESTING", "RESTING", "FILLED",
+        "REPLACED", "REJECTED", "REJECTED", "REJECTED",
+    ]
+    # b1 replaced to 6@100 takes the iceberg slice (3) and s2 (3) in full.
+    assert [(t["maker_order_id"], t["quantity"]) for t in records[3]["trades"]] == [
+        ("i1", 3),
+        ("s2", 3),
+    ]
+    # i1 re-rested at 100 showing its new slice of 2 behind s2's leftover 2.
+    assert records[4]["asks"] == [{"price": 100, "quantity": 4}]
+    assert records[5]["reason"] == "INVALID_SCHEMA"
+    assert records[6]["reason"] == "UNKNOWN_ORDER"
+    assert records[7]["reason"] == "DUPLICATE_EVENT_ID"
+
