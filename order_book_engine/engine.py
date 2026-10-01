@@ -12,6 +12,7 @@ from collections import deque
 
 ADD = "ADD"
 CANCEL = "CANCEL"
+REPLACE = "REPLACE"
 BUY = "BUY"
 SELL = "SELL"
 LIMIT = "LIMIT"
@@ -28,6 +29,7 @@ PARTIALLY_FILLED_RESTING = "PARTIALLY_FILLED_RESTING"
 PARTIALLY_FILLED_CANCELLED = "PARTIALLY_FILLED_CANCELLED"
 UNFILLED_CANCELLED = "UNFILLED_CANCELLED"
 CANCELLED = "CANCELLED"
+REPLACED = "REPLACED"
 REJECTED = "REJECTED"
 
 INVALID_JSON = "INVALID_JSON"
@@ -42,6 +44,10 @@ _ALL_KEYS = frozenset(
 )
 _CANCEL_KEYS = frozenset({"event_id", "type", "order_id"})
 _REQUIRED_ADD_KEYS = frozenset({"event_id", "type", "order_id", "side", "order_type", "quantity"})
+_REPLACE_KEYS = frozenset(
+    {"event_id", "type", "order_id", "quantity", "price", "display_quantity"}
+)
+_REQUIRED_REPLACE_KEYS = frozenset({"event_id", "type", "order_id", "quantity", "price"})
 
 
 def _is_positive_int(value: object) -> bool:
@@ -96,10 +102,11 @@ class Engine:
 
         if obj["type"] == CANCEL:
             return self._cancel(event_id, obj["order_id"])
+        if obj["type"] == REPLACE:
+            return self._replace(event_id, obj)
         return self._add(event_id, obj)
 
-    @staticmethod
-    def _schema_error(obj: dict[str, object]) -> str | None:
+    def _schema_error(self, obj: dict[str, object]) -> str | None:
         keys = set(obj)
         if not keys <= _ALL_KEYS:
             return INVALID_SCHEMA
@@ -111,6 +118,39 @@ class Engine:
             if keys != _CANCEL_KEYS:
                 return INVALID_SCHEMA
             if not isinstance(obj.get("order_id"), str):
+                return INVALID_SCHEMA
+            return None
+
+        if event_type == REPLACE:
+            if not keys <= _REPLACE_KEYS:
+                # side, order_type, time_in_force and any other field are
+                # inherited from the target and must not be carried.
+                return INVALID_SCHEMA
+            if not keys >= _REQUIRED_REPLACE_KEYS:
+                return INVALID_SCHEMA
+            if not isinstance(obj.get("order_id"), str):
+                return INVALID_SCHEMA
+            if not _is_positive_int(obj.get("quantity")):
+                return INVALID_SCHEMA
+            if not _is_positive_int(obj.get("price")):
+                return INVALID_SCHEMA
+            display_quantity = obj.get("display_quantity")
+            if "display_quantity" in obj and (
+                not _is_positive_int(display_quantity)
+                or display_quantity > obj["quantity"]
+            ):
+                return INVALID_SCHEMA
+            # A peak size belongs to iceberg orders only. Carrying it on a
+            # resting ordinary limit target is a structural error and must not
+            # occupy the event id; the target's type is inherited, so it is
+            # resolved from the live book here.
+            target = self._orders.get(obj["order_id"])
+            if (
+                "display_quantity" in obj
+                and target is not None
+                and target["status"] == RESTING
+                and "visible" not in target
+            ):
                 return INVALID_SCHEMA
             return None
 
@@ -286,16 +326,10 @@ class Engine:
             result = PARTIALLY_FILLED_RESTING if trades else RESTING
             record["remaining"] = remaining
             record["status"] = RESTING
-            own_book = self._bids if side == BUY else self._asks
+            visible = self._rest(
+                record, order_id, side, limit, remaining, display_quantity
+            )
             own_totals = self._bid_totals if side == BUY else self._ask_totals
-            own_book.setdefault(limit, deque()).append(order_id)
-            if is_iceberg:
-                # Only the first slice enters the book; the rest is reserve.
-                visible = min(display_quantity, remaining)
-                record["display_quantity"] = display_quantity
-                record["visible"] = visible
-            else:
-                visible = remaining
             own_totals[limit] = own_totals.get(limit, 0) + visible
         else:
             # IOC leftovers never enter the book; a successful FOK is always
@@ -307,13 +341,32 @@ class Engine:
         self._orders[order_id] = record
         return event_id, result, None, trades
 
-    def _cancel(
-        self, event_id: str, order_id: str
-    ) -> tuple[str, str, str | None, list[dict[str, object]]]:
-        record = self._orders.get(order_id)
-        if record is None or record["status"] != RESTING:
-            return event_id, REJECTED, UNKNOWN_ORDER, []
+    def _rest(
+        self,
+        record: dict[str, object],
+        order_id: str,
+        side: str,
+        limit: int | None,
+        remaining: int,
+        display_quantity: int | None,
+    ) -> int:
+        """Put the leftover of an arrived GTC order into its price queue.
 
+        Returns the visible quantity added to the book totals; for an iceberg
+        only the first slice is published and the rest stays as reserve.
+        """
+        own_book = self._bids if side == BUY else self._asks
+        own_book.setdefault(limit, deque()).append(order_id)
+        if display_quantity is not None:
+            visible = min(display_quantity, remaining)
+            record["display_quantity"] = display_quantity
+            record["visible"] = visible
+        else:
+            visible = remaining
+        return visible
+
+    def _withdraw(self, order_id: str, record: dict[str, object]) -> None:
+        """Remove a resting order's full size (visible slice plus reserve)."""
         price = record["price"]
         if record["side"] == BUY:
             own_book = self._bids
@@ -324,13 +377,129 @@ class Engine:
 
         queue = own_book[price]
         queue.remove(order_id)
-        # Book totals hold only the current visible slice of an iceberg; its
-        # reserve is cancelled along with it but was never aggregated.
         visible = record.get("visible", record["remaining"])
         own_totals[price] -= visible
         if own_totals[price] == 0:
             del own_totals[price]
             del own_book[price]
+
+    def _replace(
+        self, event_id: str, obj: dict[str, object]
+    ) -> tuple[str, str, str | None, list[dict[str, object]]]:
+        order_id: str = obj["order_id"]
+        record = self._orders.get(order_id)
+        # Only ordinary LIMIT and ICEBERG orders rest in the book; a filled,
+        # cancelled or never-seen target cannot be replaced.
+        if record is None or record["status"] != RESTING:
+            return event_id, REJECTED, UNKNOWN_ORDER, []
+
+        side: str = record["side"]
+        is_iceberg = "visible" in record
+        quantity: int = obj["quantity"]
+        limit: int = obj["price"]
+        if "display_quantity" in obj:
+            display_quantity: int | None = obj["display_quantity"]
+        elif is_iceberg:
+            # Omitting the peak keeps the original iceberg's peak.
+            display_quantity = record["display_quantity"]
+        else:
+            display_quantity = None
+
+        # The replacement is indivisible: the whole resting target (visible
+        # slice and reserve) leaves the book before the new order arrives, so
+        # it can never match its own former state and always loses priority.
+        self._withdraw(order_id, record)
+
+        remaining = quantity
+        if side == BUY:
+            opposite = self._asks
+            totals = self._ask_totals
+
+            def tradable(price: int) -> bool:
+                return price <= limit
+        else:
+            opposite = self._bids
+            totals = self._bid_totals
+
+            def tradable(price: int) -> bool:
+                return price >= limit
+
+        trades: list[dict[str, object]] = []
+        while remaining > 0:
+            candidates = [price for price in totals if tradable(price)]
+            if not candidates:
+                break
+            price = min(candidates) if side == BUY else max(candidates)
+            queue = opposite[price]
+            while remaining > 0 and queue:
+                maker_id = queue[0]
+                maker = self._orders[maker_id]
+                if maker.get("visible") is not None:
+                    maker_available = maker["visible"]
+                else:
+                    maker_available = maker["remaining"]
+                matched = min(remaining, maker_available)
+                maker["remaining"] -= matched
+                remaining -= matched
+                totals[price] -= matched
+                trades.append(
+                    {
+                        "trade_id": self._next_trade_id,
+                        "maker_order_id": maker_id,
+                        "taker_order_id": order_id,
+                        "price": price,
+                        "quantity": matched,
+                    }
+                )
+                self._next_trade_id += 1
+                if maker.get("visible") is not None:
+                    maker["visible"] -= matched
+                    if maker["visible"] == 0:
+                        queue.popleft()
+                        if maker["remaining"] > 0:
+                            new_slice = min(
+                                maker["display_quantity"], maker["remaining"]
+                            )
+                            maker["visible"] = new_slice
+                            totals[price] += new_slice
+                            queue.append(maker_id)
+                        else:
+                            maker["status"] = FILLED
+                elif maker["remaining"] == 0:
+                    queue.popleft()
+                    maker["status"] = FILLED
+            if not queue:
+                del opposite[price]
+                del totals[price]
+
+        new_record: dict[str, object] = {"side": side, "price": limit}
+        if remaining == 0:
+            result = FILLED
+            new_record["remaining"] = 0
+            new_record["status"] = FILLED
+        else:
+            # A successful replacement is a fresh GTC order; when nothing
+            # trades the outcome is REPLACED rather than RESTING.
+            result = PARTIALLY_FILLED_RESTING if trades else REPLACED
+            new_record["remaining"] = remaining
+            new_record["status"] = RESTING
+            visible = self._rest(
+                new_record, order_id, side, limit, remaining, display_quantity
+            )
+            own_totals = self._bid_totals if side == BUY else self._ask_totals
+            own_totals[limit] = own_totals.get(limit, 0) + visible
+
+        self._orders[order_id] = new_record
+        return event_id, result, None, trades
+
+    def _cancel(
+        self, event_id: str, order_id: str
+    ) -> tuple[str, str, str | None, list[dict[str, object]]]:
+        record = self._orders.get(order_id)
+        if record is None or record["status"] != RESTING:
+            return event_id, REJECTED, UNKNOWN_ORDER, []
+
+        self._withdraw(order_id, record)
 
         record["status"] = CANCELLED
         record["remaining"] = 0

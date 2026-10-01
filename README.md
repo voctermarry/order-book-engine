@@ -65,6 +65,23 @@ CANCEL：
 
 按 `order_id` 撤销未成交余量；已成交、已撤销或不存在的订单返回 `UNKNOWN_ORDER`。撤销 ICEBERG 时同时移除当前公开片段与全部储备（盘口仅曾汇总公开量）。
 
+REPLACE：
+
+```json
+{"event_id": "e3", "type": "REPLACE", "order_id": "o1", "quantity": 8, "price": 101, "display_quantity": 2}
+```
+
+- `event_id`：全流唯一字符串。
+- `order_id`：目标订单，沿用其原 `order_id`；`side` 与订单类型均继承目标，事件中不得携带。
+- `quantity`：新的剩余总量（正整数），不含此前成交量。
+- `price`：正整数。
+- `display_quantity`：仅当目标为 ICEBERG 时可给，为不大于新 `quantity` 的正整数；省略时沿用原峰值。普通 LIMIT 目标携带该字段按 `INVALID_SCHEMA` 拒绝。
+- 事件缺字段，或含 `side`、`order_type`、`time_in_force` 等任何未知字段，或字段类型错误（布尔值不算整数）时，均以 `INVALID_SCHEMA` 拒绝，且不占用 `event_id`。
+- 仅 `RESTING` 的普通 LIMIT 或 ICEBERG 可替换；目标不存在或已结束（已成交、已撤销）时返回 `REJECTED`/`UNKNOWN_ORDER`。该事件是结构合法的有效事件，仍占用其 `event_id`；重复 `event_id` 返回 `DUPLICATE_EVENT_ID`。
+- 成功时先移除目标的全部余量（含 ICEBERG 未公开储备），再将新委托作为本事件到达的 GTC 委托处理：即使参数未变也失去原队列优先级，且不得与旧状态自身成交，但可作为 taker 主动撮合其他订单，其余成交规则不变。
+- 移除、撮合与余量入簿是不可分割的状态变更。沿用原 `order_id`，不触发 `DUPLICATE_ORDER_ID`，且该 `order_id` 仍不允许后续 ADD 重用。
+- 结果：无成交且余量入簿为 `REPLACED`；部分成交后入簿为 `PARTIALLY_FILLED_RESTING`；全部成交为 `FILLED`。ICEBERG 余量只展示 `min(display_quantity, remaining)`，补片仍排到同价队尾。
+
 ### 撮合规则
 
 - 买单匹配最低卖价，卖单匹配最高买价；同价位先到者优先（价格时间优先）。
@@ -88,6 +105,7 @@ CANCEL：
   - IOC 限价单/市价单：`FILLED`、`PARTIALLY_FILLED_CANCELLED`、`UNFILLED_CANCELLED`
   - FOK 限价单/市价单：`FILLED`、`UNFILLED_CANCELLED`
   - 撤单成功：`CANCELLED`
+  - REPLACE 成功：`FILLED`、`PARTIALLY_FILLED_RESTING`、`REPLACED`
   - 拒绝：`REJECTED`（附加 `reason`）
 - `trades`：按发生顺序排列；每笔含 `maker_order_id`、`taker_order_id`、`price`、`quantity` 与 `trade_id`。
 - `bids` 按价格降序、`asks` 按价格升序，每档含整数 `price` 与汇总 `quantity`。

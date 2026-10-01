@@ -948,3 +948,348 @@ def test_iceberg_replay_is_byte_deterministic():
     # A schema rejection leaves the book untouched.
     assert records[5]["asks"] == records[4]["asks"]
 
+
+# --------------------------------------------------------------------------
+# REPLACE events
+# --------------------------------------------------------------------------
+
+
+def replace(event_id, order_id, quantity, price, **extra):
+    obj = {
+        "event_id": event_id,
+        "type": "REPLACE",
+        "order_id": order_id,
+        "quantity": quantity,
+        "price": price,
+    }
+    obj.update(extra)
+    return json.dumps(obj)
+
+
+def test_replace_resting_limit_is_replaced_and_loses_priority():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 1, 100),
+            add("e2", "s2", "SELL", "LIMIT", 1, 100),
+            add("e3", "s3", "SELL", "LIMIT", 1, 100),
+        ]
+    )
+    eid, result, reason, trades = engine.handle_line(replace("e4", "s1", 1, 100))
+    assert (eid, result, reason, trades) == ("e4", "REPLACED", None, [])
+    # Identical parameters still cost the order its time priority.
+    _, _, _, trades = engine.handle_line(add("e5", "b1", "BUY", "LIMIT", 2, 100))
+    assert [t["maker_order_id"] for t in trades] == ["s2", "s3"]
+    # The replaced order is now at the back of the same price queue.
+    _, _, _, trades = engine.handle_line(add("e6", "b2", "BUY", "LIMIT", 1, 100))
+    assert [t["maker_order_id"] for t in trades] == ["s1"]
+
+
+def test_replace_can_change_price_and_quantity_and_side_is_inherited():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 5, 100)])
+    eid, result, reason, trades = engine.handle_line(replace("e2", "s1", 3, 101))
+    assert (eid, result, reason) == ("e2", "REPLACED", None)
+    assert trades == []
+    # It remains a SELL at the new, larger price with the new total quantity.
+    assert engine.snapshot()[1] == [{"price": 101, "quantity": 3}]
+
+
+def test_replace_new_quantity_excludes_previous_volume():
+    # An iceberg that already sold part of itself: quantity starts fresh.
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 4, 100))
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+    _, result, _, _ = engine.handle_line(replace("e3", "i1", 8, 100, display_quantity=2))
+    assert result == "REPLACED"
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+    # Exactly the new total (8) is available, not 6 + 8.
+    _, _, _, trades = engine.handle_line(add("e4", "b2", "BUY", "LIMIT", 20, 100))
+    assert [t["quantity"] for t in trades] == [2, 2, 2, 2]
+    assert sum(t["quantity"] for t in trades) == 8
+    assert engine.snapshot()[1] == []
+
+
+def test_replace_is_taker_and_can_cross_other_orders():
+    # A resting SELL replaced to a price that crosses a resting BID takes it.
+    engine, _ = book_after(
+        [
+            add("e1", "bM", "BUY", "LIMIT", 2, 100),
+            add("e2", "sT", "SELL", "LIMIT", 5, 101),
+        ]
+    )
+    eid, result, reason, trades = engine.handle_line(replace("e3", "sT", 5, 100))
+    assert (eid, result, reason) == ("e3", "PARTIALLY_FILLED_RESTING", None)
+    assert trades == [
+        {"trade_id": 1, "maker_order_id": "bM", "taker_order_id": "sT",
+         "price": 100, "quantity": 2}
+    ]
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 3}]
+
+
+def test_replace_fully_filled_is_filled_and_books_empty():
+    engine, _ = book_after(
+        [
+            add("e1", "bM", "BUY", "LIMIT", 3, 100),
+            add("e2", "sT", "SELL", "LIMIT", 3, 101),
+        ]
+    )
+    eid, result, reason, trades = engine.handle_line(replace("e3", "sT", 3, 100))
+    assert (eid, result, reason) == ("e3", "FILLED", None)
+    assert [t["quantity"] for t in trades] == [3]
+    assert engine.snapshot() == ([], [])
+    # Trade ids keep advancing afterwards.
+    engine.handle_line(add("e4", "s2", "SELL", "LIMIT", 1, 100))
+    _, _, _, trades = engine.handle_line(add("e5", "b2", "BUY", "LIMIT", 1, 100))
+    assert [t["trade_id"] for t in trades] == [2]
+
+
+def test_replace_does_not_cross_its_own_removed_state():
+    # The target is the only bid; replacing it at the same crossing-capable
+    # price must not match itself.
+    engine, _ = book_after([add("e1", "b1", "BUY", "LIMIT", 5, 100)])
+    _, result, _, trades = engine.handle_line(replace("e2", "b1", 8, 100))
+    assert result == "REPLACED"
+    assert trades == []
+    assert engine.snapshot()[0] == [{"price": 100, "quantity": 8}]
+
+
+def test_replace_consumes_maker_iceberg_slices_with_queue_replenish():
+    # The target is a plain resting SELL moved to cross a resting iceberg bid
+    # plus a plain bid ahead of its replenished slice.
+    engine, _ = book_after(
+        [
+            iceberg("e1", "i1", "BUY", 6, 100, 2),
+            add("e2", "b2", "BUY", "LIMIT", 2, 100),
+            add("e3", "sT", "SELL", "LIMIT", 8, 101),
+        ]
+    )
+    _, result, _, trades = engine.handle_line(replace("e4", "sT", 8, 100))
+    # i1 slice 2, b2 2, replenished i1 2, final i1 2.
+    assert result == "FILLED"
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [
+        ("i1", 2),
+        ("b2", 2),
+        ("i1", 2),
+        ("i1", 2),
+    ]
+    assert engine.snapshot() == ([], [])
+
+
+def test_replace_iceberg_inherits_peak_when_display_omitted():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 4, 100))
+    _, result, _, _ = engine.handle_line(replace("e3", "i1", 8, 100))
+    assert result == "REPLACED"
+    # Original peak 3 is retained even though the prior slice was partly used.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 3}]
+
+
+def test_replace_iceberg_new_peak_governs_fresh_slices():
+    engine, _ = book_after(
+        [
+            iceberg("e1", "i1", "SELL", 10, 100, 3),
+            add("e2", "s2", "SELL", "LIMIT", 5, 100),
+        ]
+    )
+    _, result, _, _ = engine.handle_line(replace("e3", "i1", 9, 100, display_quantity=2))
+    assert result == "REPLACED"
+    # The replacement joins the tail showing only its new peak.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 7}]
+    _, _, _, trades = engine.handle_line(add("e4", "b1", "BUY", "LIMIT", 7, 100))
+    assert [(t["maker_order_id"], t["quantity"]) for t in trades] == [
+        ("s2", 5),
+        ("i1", 2),
+    ]
+    # Its replenished slice also uses the new peak of 2.
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 2}]
+
+
+def test_replace_iceberg_equal_display_and_quantity_is_fully_visible():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    _, result, _, _ = engine.handle_line(replace("e2", "i1", 4, 100, display_quantity=4))
+    assert result == "REPLACED"
+    assert engine.snapshot()[1] == [{"price": 100, "quantity": 4}]
+
+
+def test_replace_unknown_or_finished_target_is_unknown_order():
+    engine = Engine()
+    assert engine.handle_line(replace("e1", "missing", 1, 100))[1:3] == (
+        "REJECTED", "UNKNOWN_ORDER"
+    )
+
+    engine.handle_line(add("e2", "s1", "SELL", "LIMIT", 1, 100))
+    engine.handle_line(add("e3", "b1", "BUY", "LIMIT", 1, 100))  # fills s1
+    assert engine.handle_line(replace("e4", "s1", 1, 100))[1:3] == (
+        "REJECTED", "UNKNOWN_ORDER"
+    )
+
+    engine.handle_line(add("e5", "s2", "SELL", "LIMIT", 1, 100))
+    engine.handle_line(cancel("e6", "s2"))
+    assert engine.handle_line(replace("e7", "s2", 1, 100))[1:3] == (
+        "REJECTED", "UNKNOWN_ORDER"
+    )
+
+    # An IOC/market order never rests, so it cannot be replaced either.
+    engine.handle_line(add("e8", "m1", "SELL", "MARKET", 1))
+    assert engine.handle_line(replace("e9", "m1", 1, 100))[1:3] == (
+        "REJECTED", "UNKNOWN_ORDER"
+    )
+
+
+def test_replace_unknown_target_consumes_event_id_but_schema_errors_do_not():
+    engine = Engine()
+    line = replace("e1", "missing", 1, 100)
+    assert engine.handle_line(line)[1:3] == ("REJECTED", "UNKNOWN_ORDER")
+    assert engine.handle_line(line)[1:3] == ("REJECTED", "DUPLICATE_EVENT_ID")
+
+    # Structural failures never occupy their event id.
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 2, 100))
+    bad = replace("e3", "b1", 0, 100)
+    assert engine.handle_line(bad)[1:3] == ("REJECTED", "INVALID_SCHEMA")
+    assert engine.handle_line(replace("e3", "b1", 2, 100))[1] == "REPLACED"
+
+    # display_quantity on a resting plain limit is structural: id is reusable.
+    bad_display = replace("e4", "b1", 2, 100, display_quantity=1)
+    assert engine.handle_line(bad_display)[1:3] == ("REJECTED", "INVALID_SCHEMA")
+    assert engine.handle_line(replace("e4", "b1", 2, 100))[1] == "REPLACED"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"event_id": "e1", "type": "REPLACE", "order_id": "o1", "quantity": 5},      # no price
+        {"event_id": "e2", "type": "REPLACE", "order_id": "o1", "price": 100},       # no quantity
+        {"event_id": "e3", "type": "REPLACE", "quantity": 5, "price": 100},          # no order_id
+        {"event_id": "e4", "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": 100, "side": "BUY"},                                               # inherited side
+        {"event_id": "e5", "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": 100, "order_type": "LIMIT"},                                       # inherited type
+        {"event_id": "e6", "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": 100, "time_in_force": "GTC"},                                      # inherited tif
+        {"event_id": "e7", "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": 100, "extra": 1},                                                  # unknown field
+        {"event_id": 8, "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": 100},                                                              # bad event_id
+        {"event_id": "e9", "type": "REPLACE", "order_id": 9, "quantity": 5,
+         "price": 100},                                                              # bad order_id
+        {"event_id": "e10", "type": "REPLACE", "order_id": "o1", "quantity": True,
+         "price": 100},                                                              # bool quantity
+        {"event_id": "e11", "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": False},                                                            # bool price
+        {"event_id": "e12", "type": "REPLACE", "order_id": "o1", "quantity": 5.0,
+         "price": 100},                                                              # float quantity
+        {"event_id": "e13", "type": "REPLACE", "order_id": "o1", "quantity": 0,
+         "price": 100},                                                              # non-positive
+        {"event_id": "e14", "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": -3},                                                               # negative price
+        {"event_id": "e15", "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": 100, "display_quantity": True},                                    # bool display
+        {"event_id": "e16", "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": 100, "display_quantity": 0},                                       # non-positive display
+        {"event_id": "e17", "type": "REPLACE", "order_id": "o1", "quantity": 5,
+         "price": 100, "display_quantity": 6},                                       # display > quantity
+    ],
+)
+def test_replace_schema_rejections(payload):
+    engine = Engine()
+    assert engine.handle_line(json.dumps(payload))[1:3] == (
+        "REJECTED", "INVALID_SCHEMA"
+    ), payload
+
+
+def test_replace_display_on_iceberg_target_is_accepted_but_not_on_limit():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+    assert engine.handle_line(
+        replace("e2", "i1", 8, 100, display_quantity=2)
+    )[1] == "REPLACED"
+
+    engine, _ = book_after([add("e3", "b1", "BUY", "LIMIT", 5, 100)])
+    assert engine.handle_line(
+        replace("e4", "b1", 5, 100, display_quantity=2)
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+
+
+def test_replace_keeps_order_id_and_blocks_later_add_reuse():
+    engine, _ = book_after([add("e1", "b1", "BUY", "LIMIT", 2, 100)])
+    assert engine.handle_line(replace("e2", "b1", 3, 100))[1] == "REPLACED"
+    assert engine.handle_line(add("e3", "b1", "BUY", "LIMIT", 1, 100))[2] == (
+        "DUPLICATE_ORDER_ID"
+    )
+    # The rejected ADD still consumed its event id.
+    assert engine.handle_line(add("e3", "o2", "BUY", "LIMIT", 1, 100))[2] == (
+        "DUPLICATE_EVENT_ID"
+    )
+
+
+def test_rejected_replace_changes_nothing():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100),
+            add("e2", "s2", "SELL", "LIMIT", 2, 100),
+        ]
+    )
+    before = engine.snapshot()
+    engine.handle_line(replace("e3", "ghost", 5, 100))
+    engine.handle_line(replace("e4", "s1", 0, 100))
+    engine.handle_line(
+        json.dumps({"event_id": "e5", "type": "REPLACE", "order_id": "s1",
+                    "quantity": 1, "price": 100, "side": "SELL"})
+    )
+    assert engine.snapshot() == before
+    _, _, _, trades = engine.handle_line(add("e6", "b1", "BUY", "LIMIT", 2, 100))
+    assert [t["trade_id"] for t in trades] == [1]
+    assert [t["maker_order_id"] for t in trades] == ["s1"]
+
+
+def test_replace_then_cancel_and_second_replace_unknown():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 3, 100)])
+    assert engine.handle_line(replace("e2", "s1", 4, 100))[1] == "REPLACED"
+    assert engine.handle_line(cancel("e3", "s1"))[1] == "CANCELLED"
+    assert engine.handle_line(replace("e4", "s1", 1, 100))[2] == "UNKNOWN_ORDER"
+
+
+def test_replace_replay_is_byte_deterministic():
+    stream = "\n".join(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 3, 100),
+            add("e2", "s2", "SELL", "LIMIT", 1, 102),
+            add("e3", "bM", "BUY", "LIMIT", 2, 99),
+            replace("e4", "s1", 5, 100),            # no cross, re-joins at 100
+            replace("e5", "s2", 5, 99),             # crosses bM, then rests at 99
+            replace("e6", "ghost", 1, 100),         # unknown order
+            replace("e7", "s1", 0, 100),            # invalid schema
+        ]
+    ) + "\n"
+    _, out1, err1 = run_replay(stream)
+    code, out2, err2 = run_replay(stream)
+    assert code == 0
+    assert (err1, err2) == ("", "")
+    assert out2 == out1
+
+    records = [json.loads(line) for line in out1.splitlines()]
+    # e4: s1 replaced at 100 while the only bid sits at 99, so it rests.
+    assert records[3]["event_id"] == "e4"
+    assert records[3]["result"] == "REPLACED"
+    assert records[3]["trades"] == []
+    assert records[3]["asks"] == [
+        {"price": 100, "quantity": 5},
+        {"price": 102, "quantity": 1},
+    ]
+    # e5: s2 withdrawn from 102 then crosses bM (2) at 99 and rests 3 there.
+    assert records[4]["result"] == "PARTIALLY_FILLED_RESTING"
+    assert [(t["maker_order_id"], t["price"], t["quantity"]) for t in records[4]["trades"]] == [
+        ("bM", 99, 2)
+    ]
+    assert records[4]["asks"] == [
+        {"price": 99, "quantity": 3},
+        {"price": 100, "quantity": 5},
+    ]
+    assert records[4]["bids"] == []
+    assert records[5]["result"] == "REJECTED"
+    assert records[5]["reason"] == "UNKNOWN_ORDER"
+    assert records[6]["result"] == "REJECTED"
+    assert records[6]["reason"] == "INVALID_SCHEMA"
+    # Structural rejection leaves the book untouched.
+    assert records[6]["asks"] == records[5]["asks"]
+
+
+
