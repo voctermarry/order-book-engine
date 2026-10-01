@@ -243,6 +243,9 @@ def test_sequence_zero_or_negative_is_invalid_event():
     {"event_id": "e1", "symbol": "AAA", "sequence": 1,
      "type": "BOGUS", "order_id": "o1"},                               # unknown type
     {"event_id": "e1", "symbol": "AAA", "sequence": 1,
+     "type": "DAY_END_RECONCILIATION",
+     "expected_trades": [], "expected_accounts": []},                  # query stays baseline-only
+    {"event_id": "e1", "symbol": "AAA", "sequence": 1,
      "type": "ADD", "order_id": "o1", "side": "BUY",
      "order_type": "LIMIT", "quantity": 0, "price": 100},              # illegal value
     {"event_id": "e1", "symbol": "AAA", "sequence": 1,

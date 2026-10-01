@@ -16,6 +16,7 @@ CANCEL = "CANCEL"
 REPLACE = "REPLACE"
 EXECUTION_REPORT = "EXECUTION_REPORT"
 ACCOUNT_REPORT = "ACCOUNT_REPORT"
+DAY_END_RECONCILIATION = "DAY_END_RECONCILIATION"
 BUY = "BUY"
 SELL = "SELL"
 LIMIT = "LIMIT"
@@ -37,9 +38,15 @@ SELF_TRADE_PREVENTED = "SELF_TRADE_PREVENTED"
 CANCELLED = "CANCELLED"
 REJECTED = "REJECTED"
 REPORTED = "REPORTED"
+RECONCILED = "RECONCILED"
+BREAKS_FOUND = "BREAKS_FOUND"
 
 MAKER = "MAKER"
 TAKER = "TAKER"
+
+MISSING_ACTUAL = "MISSING_ACTUAL"
+MISSING_EXPECTED = "MISSING_EXPECTED"
+FIELD_MISMATCH = "FIELD_MISMATCH"
 
 INVALID_JSON = "INVALID_JSON"
 INVALID_SCHEMA = "INVALID_SCHEMA"
@@ -55,6 +62,13 @@ _ALL_KEYS = frozenset(
 _CANCEL_KEYS = frozenset({"event_id", "type", "order_id"})
 _REPORT_KEYS = frozenset({"event_id", "type", "order_id", "benchmark_price"})
 _ACCOUNT_REPORT_KEYS = frozenset({"event_id", "type", "account_id", "mark_price"})
+_RECONCILIATION_KEYS = frozenset(
+    {"event_id", "type", "expected_trades", "expected_accounts"}
+)
+_EXPECTED_TRADE_KEYS = frozenset(
+    {"trade_id", "maker_order_id", "taker_order_id", "price", "quantity"}
+)
+_EXPECTED_ACCOUNT_KEYS = frozenset({"account_id", "net_position", "cash_balance"})
 _REQUIRED_ADD_KEYS = frozenset({"event_id", "type", "order_id", "side", "order_type", "quantity"})
 _REQUIRED_REPLACE_KEYS = frozenset({"event_id", "type", "order_id", "quantity", "price"})
 _ALLOWED_REPLACE_KEYS = _REQUIRED_REPLACE_KEYS | {"display_quantity"}
@@ -67,6 +81,11 @@ def _is_positive_int(value: object) -> bool:
 
 def _is_non_empty_str(value: object) -> bool:
     return isinstance(value, str) and value != ""
+
+
+def _is_int(value: object) -> bool:
+    # Any JSON integer stays exact; booleans are not integers.
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 class Engine:
@@ -143,11 +162,27 @@ class Engine:
     ]:
         """Like :meth:`handle_line_extended`, additionally returning the
         position analysis of an ``ACCOUNT_REPORT`` query (``None`` otherwise)."""
+        event_id, result, reason, trades, stp, analysis, position, _recon = (
+            self.handle_line_reconciliation(line)
+        )
+        return event_id, result, reason, trades, stp, analysis, position
+
+    def handle_line_reconciliation(
+        self, line: str
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+        dict[str, object] | None,
+    ]:
+        """Like :meth:`handle_line_position`, additionally returning the
+        reconciliation report of a ``DAY_END_RECONCILIATION`` query
+        (``None`` otherwise)."""
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            return None, REJECTED, INVALID_JSON, [], None, None, None
-        return self.handle_object_position(obj)
+            return None, REJECTED, INVALID_JSON, [], None, None, None, None
+        return self.handle_object_reconciliation(obj)
 
     def handle_object(
         self, obj: object
@@ -173,18 +208,31 @@ class Engine:
         list[dict[str, object]], dict[str, object] | None,
         dict[str, object] | None, dict[str, object] | None,
     ]:
+        event_id, result, reason, trades, stp, analysis, position, _recon = (
+            self.handle_object_reconciliation(obj)
+        )
+        return event_id, result, reason, trades, stp, analysis, position
+
+    def handle_object_reconciliation(
+        self, obj: object
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+        dict[str, object] | None,
+    ]:
         if not isinstance(obj, dict):
-            return None, REJECTED, INVALID_SCHEMA, [], None, None, None
+            return None, REJECTED, INVALID_SCHEMA, [], None, None, None, None
 
         event_id = obj.get("event_id")
         event_id_out = event_id if isinstance(event_id, str) else None
 
         schema_error = self._schema_error(obj)
         if schema_error is not None:
-            return event_id_out, REJECTED, schema_error, [], None, None, None
+            return event_id_out, REJECTED, schema_error, [], None, None, None, None
 
         if event_id in self._event_ids:
-            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None, None, None
+            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None, None, None, None
         if obj["type"] == REPLACE and "display_quantity" in obj:
             target = self._orders.get(obj["order_id"])
             if (
@@ -194,26 +242,31 @@ class Engine:
             ):
                 # Only an iceberg target may be replaced with a display slice;
                 # like every schema error this consumes no event id.
-                return event_id, REJECTED, INVALID_SCHEMA, [], None, None, None
+                return event_id, REJECTED, INVALID_SCHEMA, [], None, None, None, None
         # The event is well formed, so its id occupies the stream from here,
         # even if a later business rule rejects it.
         self._event_ids.add(event_id)
 
         if obj["type"] == CANCEL:
             event_id, result, reason, trades = self._cancel(event_id, obj["order_id"])
-            return event_id, result, reason, trades, None, None, None
+            return event_id, result, reason, trades, None, None, None, None
         if obj["type"] == REPLACE:
             event_id, result, reason, trades, stp = self._replace(event_id, obj)
-            return event_id, result, reason, trades, stp, None, None
+            return event_id, result, reason, trades, stp, None, None, None
         if obj["type"] == EXECUTION_REPORT:
             event_id, result, reason, trades, stp, analysis = self._execution_report(
                 event_id, obj
             )
-            return event_id, result, reason, trades, stp, analysis, None
+            return event_id, result, reason, trades, stp, analysis, None, None
         if obj["type"] == ACCOUNT_REPORT:
-            return self._account_report(event_id, obj)
+            event_id, result, reason, trades, stp, analysis, position = (
+                self._account_report(event_id, obj)
+            )
+            return event_id, result, reason, trades, stp, analysis, position, None
+        if obj["type"] == DAY_END_RECONCILIATION:
+            return self._day_end_reconciliation(event_id, obj)
         event_id, result, reason, trades, stp = self._add(event_id, obj)
-        return event_id, result, reason, trades, stp, None, None
+        return event_id, result, reason, trades, stp, None, None, None
 
     @staticmethod
     def _schema_error(obj: dict[str, object]) -> str | None:
@@ -243,6 +296,49 @@ class Engine:
                 return INVALID_SCHEMA
             if not _is_positive_int(obj.get("mark_price")):
                 return INVALID_SCHEMA
+            return None
+        if event_type == DAY_END_RECONCILIATION:
+            # A pure read-only query: exactly the four fields, a non-empty
+            # string event id and the two external record arrays. Identifiers
+            # must be unique within their array and booleans are not integers.
+            if keys != _RECONCILIATION_KEYS:
+                return INVALID_SCHEMA
+            if not _is_non_empty_str(obj.get("event_id")):
+                return INVALID_SCHEMA
+            expected_trades = obj.get("expected_trades")
+            expected_accounts = obj.get("expected_accounts")
+            if not isinstance(expected_trades, list):
+                return INVALID_SCHEMA
+            if not isinstance(expected_accounts, list):
+                return INVALID_SCHEMA
+            seen_trade_ids: set[int] = set()
+            for item in expected_trades:
+                if not isinstance(item, dict) or set(item) != _EXPECTED_TRADE_KEYS:
+                    return INVALID_SCHEMA
+                trade_id = item.get("trade_id")
+                if not _is_positive_int(trade_id) or trade_id in seen_trade_ids:
+                    return INVALID_SCHEMA
+                seen_trade_ids.add(trade_id)
+                if not _is_non_empty_str(item.get("maker_order_id")):
+                    return INVALID_SCHEMA
+                if not _is_non_empty_str(item.get("taker_order_id")):
+                    return INVALID_SCHEMA
+                if not _is_positive_int(item.get("price")):
+                    return INVALID_SCHEMA
+                if not _is_positive_int(item.get("quantity")):
+                    return INVALID_SCHEMA
+            seen_account_ids: set[str] = set()
+            for item in expected_accounts:
+                if not isinstance(item, dict) or set(item) != _EXPECTED_ACCOUNT_KEYS:
+                    return INVALID_SCHEMA
+                account_id = item.get("account_id")
+                if not _is_non_empty_str(account_id) or account_id in seen_account_ids:
+                    return INVALID_SCHEMA
+                seen_account_ids.add(account_id)
+                if not _is_int(item.get("net_position")):
+                    return INVALID_SCHEMA
+                if not _is_int(item.get("cash_balance")):
+                    return INVALID_SCHEMA
             return None
         if not keys <= _ALL_KEYS:
             return INVALID_SCHEMA
@@ -846,6 +942,117 @@ class Engine:
             ),
         }
         return event_id, REPORTED, None, [], None, None, analysis
+
+    def _day_end_reconciliation(
+        self, event_id: str, obj: dict[str, object]
+    ) -> tuple[
+        str, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+        dict[str, object] | None,
+    ]:
+        """Compare the cumulative journal against external end-of-day records.
+
+        Purely read-only: the book, order states, queue priorities, trade
+        journal, account set and next trade id are all left untouched. The
+        actual side is rebuilt from the same journal the reports use, so
+        replacements and iceberg replenishment slices contribute under their
+        original order id and inherited account.
+        """
+        actual_trades: dict[int, dict[str, object]] = {}
+        for trade in self._trade_log:
+            actual_trades[trade["trade_id"]] = {
+                "trade_id": trade["trade_id"],
+                "maker_order_id": trade["maker_order_id"],
+                "taker_order_id": trade["taker_order_id"],
+                "price": trade["price"],
+                "quantity": trade["quantity"],
+            }
+
+        # Every account an accepted ADD ever named is part of the actual set,
+        # whether or not it traded; cash is sell notional minus buy notional.
+        actual_accounts: dict[str, dict[str, object]] = {
+            account_id: {
+                "account_id": account_id,
+                "net_position": 0,
+                "cash_balance": 0,
+            }
+            for account_id in self._accounts
+        }
+        for trade in self._trade_log:
+            notional = trade["price"] * trade["quantity"]
+            for order_key in ("maker_order_id", "taker_order_id"):
+                order = self._orders[trade[order_key]]
+                account_id = order.get("account_id")
+                if account_id is None:
+                    continue
+                position = actual_accounts[account_id]
+                if order["side"] == BUY:
+                    position["net_position"] += trade["quantity"]
+                    position["cash_balance"] -= notional
+                else:
+                    position["net_position"] -= trade["quantity"]
+                    position["cash_balance"] += notional
+
+        # The external records are normalized into the same field order the
+        # actual side uses, so equal content compares (and serializes) equal.
+        expected_trades: dict[int, dict[str, object]] = {}
+        for item in obj["expected_trades"]:
+            expected_trades[item["trade_id"]] = {
+                "trade_id": item["trade_id"],
+                "maker_order_id": item["maker_order_id"],
+                "taker_order_id": item["taker_order_id"],
+                "price": item["price"],
+                "quantity": item["quantity"],
+            }
+        expected_accounts: dict[str, dict[str, object]] = {}
+        for item in obj["expected_accounts"]:
+            expected_accounts[item["account_id"]] = {
+                "account_id": item["account_id"],
+                "net_position": item["net_position"],
+                "cash_balance": item["cash_balance"],
+            }
+
+        trade_breaks = self._reconcile_breaks(expected_trades, actual_trades)
+        account_breaks = self._reconcile_breaks(expected_accounts, actual_accounts)
+        result = RECONCILED if not trade_breaks and not account_breaks else BREAKS_FOUND
+        reconciliation: dict[str, object] = {
+            "trade_breaks": trade_breaks,
+            "account_breaks": account_breaks,
+        }
+        return event_id, result, None, [], None, None, None, reconciliation
+
+    @staticmethod
+    def _reconcile_breaks(
+        expected: dict[object, dict[str, object]],
+        actual: dict[object, dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Full outer comparison of two identifier-keyed record sets.
+
+        Breaks are emitted in ascending identifier order; a record present on
+        only one side reports the other side as ``None``.
+        """
+        breaks: list[dict[str, object]] = []
+        for identifier in sorted(expected.keys() | actual.keys()):
+            exp = expected.get(identifier)
+            act = actual.get(identifier)
+            if exp is None:
+                reason = MISSING_EXPECTED
+            elif act is None:
+                reason = MISSING_ACTUAL
+            elif exp != act:
+                reason = FIELD_MISMATCH
+            else:
+                continue
+            breaks.append(
+                {
+                    "identifier": identifier,
+                    "expected": exp,
+                    "actual": act,
+                    "reason": reason,
+                }
+            )
+        return breaks
 
     def snapshot(self) -> tuple[list[dict[str, int]], list[dict[str, int]]]:
         bids = [
