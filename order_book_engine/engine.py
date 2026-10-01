@@ -14,6 +14,7 @@ ADD = "ADD"
 CANCEL = "CANCEL"
 REPLACE = "REPLACE"
 EXECUTION_REPORT = "EXECUTION_REPORT"
+ACCOUNT_REPORT = "ACCOUNT_REPORT"
 BUY = "BUY"
 SELL = "SELL"
 LIMIT = "LIMIT"
@@ -44,6 +45,7 @@ INVALID_SCHEMA = "INVALID_SCHEMA"
 DUPLICATE_EVENT_ID = "DUPLICATE_EVENT_ID"
 DUPLICATE_ORDER_ID = "DUPLICATE_ORDER_ID"
 UNKNOWN_ORDER = "UNKNOWN_ORDER"
+UNKNOWN_ACCOUNT = "UNKNOWN_ACCOUNT"
 
 _ALL_KEYS = frozenset(
     {"event_id", "type", "order_id", "side", "order_type", "quantity", "price",
@@ -51,6 +53,7 @@ _ALL_KEYS = frozenset(
 )
 _CANCEL_KEYS = frozenset({"event_id", "type", "order_id"})
 _REPORT_KEYS = frozenset({"event_id", "type", "order_id", "benchmark_price"})
+_ACCOUNT_REPORT_KEYS = frozenset({"event_id", "type", "account_id", "mark_price"})
 _REQUIRED_ADD_KEYS = frozenset({"event_id", "type", "order_id", "side", "order_type", "quantity"})
 _REQUIRED_REPLACE_KEYS = frozenset({"event_id", "type", "order_id", "quantity", "price"})
 _ALLOWED_REPLACE_KEYS = _REQUIRED_REPLACE_KEYS | {"display_quantity"}
@@ -59,6 +62,10 @@ _ALLOWED_REPLACE_KEYS = _REQUIRED_REPLACE_KEYS | {"display_quantity"}
 def _is_positive_int(value: object) -> bool:
     # ``bool`` is a subclass of ``int`` and must not be accepted.
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _is_non_empty_str(value: object) -> bool:
+    return isinstance(value, str) and value != ""
 
 
 class Engine:
@@ -73,6 +80,8 @@ class Engine:
         self._bid_totals: dict[int, int] = {}
         self._ask_totals: dict[int, int] = {}
         self._next_trade_id = 1
+        # Accounts seen on any accepted ADD, however the orders ended up.
+        self._accounts: set[str] = set()
         # Every trade ever executed, in trade_id order, tagged with the id of
         # the event that produced it. Execution reports are built from this
         # journal; matching output keeps its historical shape.
@@ -104,11 +113,25 @@ class Engine:
     ]:
         """Like :meth:`handle_line_full`, additionally returning the execution
         analysis of an ``EXECUTION_REPORT`` query (``None`` otherwise)."""
+        event_id, result, reason, trades, stp, analysis, _position = (
+            self.handle_line_position(line)
+        )
+        return event_id, result, reason, trades, stp, analysis
+
+    def handle_line_position(
+        self, line: str
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Like :meth:`handle_line_extended`, additionally returning the
+        position analysis of an ``ACCOUNT_REPORT`` query (``None`` otherwise)."""
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            return None, REJECTED, INVALID_JSON, [], None, None
-        return self.handle_object_extended(obj)
+            return None, REJECTED, INVALID_JSON, [], None, None, None
+        return self.handle_object_position(obj)
 
     def handle_object(
         self, obj: object
@@ -122,18 +145,30 @@ class Engine:
         str | None, str, str | None,
         list[dict[str, object]], dict[str, object] | None, dict[str, object] | None,
     ]:
+        event_id, result, reason, trades, stp, analysis, _position = (
+            self.handle_object_position(obj)
+        )
+        return event_id, result, reason, trades, stp, analysis
+
+    def handle_object_position(
+        self, obj: object
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
         if not isinstance(obj, dict):
-            return None, REJECTED, INVALID_SCHEMA, [], None, None
+            return None, REJECTED, INVALID_SCHEMA, [], None, None, None
 
         event_id = obj.get("event_id")
         event_id_out = event_id if isinstance(event_id, str) else None
 
         schema_error = self._schema_error(obj)
         if schema_error is not None:
-            return event_id_out, REJECTED, schema_error, [], None, None
+            return event_id_out, REJECTED, schema_error, [], None, None, None
 
         if event_id in self._event_ids:
-            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None, None
+            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None, None, None
         if obj["type"] == REPLACE and "display_quantity" in obj:
             target = self._orders.get(obj["order_id"])
             if (
@@ -143,21 +178,26 @@ class Engine:
             ):
                 # Only an iceberg target may be replaced with a display slice;
                 # like every schema error this consumes no event id.
-                return event_id, REJECTED, INVALID_SCHEMA, [], None, None
+                return event_id, REJECTED, INVALID_SCHEMA, [], None, None, None
         # The event is well formed, so its id occupies the stream from here,
         # even if a later business rule rejects it.
         self._event_ids.add(event_id)
 
         if obj["type"] == CANCEL:
             event_id, result, reason, trades = self._cancel(event_id, obj["order_id"])
-            return event_id, result, reason, trades, None, None
+            return event_id, result, reason, trades, None, None, None
         if obj["type"] == REPLACE:
             event_id, result, reason, trades, stp = self._replace(event_id, obj)
-            return event_id, result, reason, trades, stp, None
+            return event_id, result, reason, trades, stp, None, None
         if obj["type"] == EXECUTION_REPORT:
-            return self._execution_report(event_id, obj)
+            event_id, result, reason, trades, stp, analysis = self._execution_report(
+                event_id, obj
+            )
+            return event_id, result, reason, trades, stp, analysis, None
+        if obj["type"] == ACCOUNT_REPORT:
+            return self._account_report(event_id, obj)
         event_id, result, reason, trades, stp = self._add(event_id, obj)
-        return event_id, result, reason, trades, stp, None
+        return event_id, result, reason, trades, stp, None, None
 
     @staticmethod
     def _schema_error(obj: dict[str, object]) -> str | None:
@@ -173,6 +213,19 @@ class Engine:
             if not isinstance(obj.get("order_id"), str):
                 return INVALID_SCHEMA
             if not _is_positive_int(obj.get("benchmark_price")):
+                return INVALID_SCHEMA
+            return None
+        if event_type == ACCOUNT_REPORT:
+            # A pure query: exactly the four fields, non-empty string
+            # identifiers and a positive integer mark (booleans are not
+            # integers).
+            if keys != _ACCOUNT_REPORT_KEYS:
+                return INVALID_SCHEMA
+            if not _is_non_empty_str(obj.get("event_id")):
+                return INVALID_SCHEMA
+            if not _is_non_empty_str(obj.get("account_id")):
+                return INVALID_SCHEMA
+            if not _is_positive_int(obj.get("mark_price")):
                 return INVALID_SCHEMA
             return None
         if not keys <= _ALL_KEYS:
@@ -313,6 +366,10 @@ class Engine:
             obj["display_quantity"] if is_iceberg else None
         )
         account_id: str | None = obj.get("account_id")
+        if account_id is not None:
+            # Any accepted ADD makes its account known, regardless of how the
+            # order itself ends up.
+            self._accounts.add(account_id)
 
         # FOK must either match the whole quantity against the pre-event book
         # or do nothing at all: no trades, no book change, no trade ids spent.
@@ -702,6 +759,77 @@ class Engine:
             "trade_attribution": attribution,
         }
         return event_id, REPORTED, None, [], None, analysis
+
+    def _account_report(
+        self, event_id: str, obj: dict[str, object]
+    ) -> tuple[
+        str, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Answer a cumulative account query without touching any state.
+
+        Every trade is attributed to an account through the order it was
+        resting or arriving as: replacements keep the order id and its
+        account, and iceberg replenishment slices trade under the same maker
+        id, so the journal lookup alone gathers the full history. Orders
+        without an ``account_id`` never contribute.
+        """
+        account_id: str = obj["account_id"]
+        if account_id not in self._accounts:
+            return event_id, REJECTED, UNKNOWN_ACCOUNT, [], None, None, None
+
+        buy_quantity = 0
+        sell_quantity = 0
+        buy_notional = 0
+        sell_notional = 0
+        for trade in self._trade_log:
+            for order_key in ("maker_order_id", "taker_order_id"):
+                order = self._orders[trade[order_key]]
+                if order.get("account_id") != account_id:
+                    continue
+                notional = trade["price"] * trade["quantity"]
+                if order["side"] == BUY:
+                    buy_quantity += trade["quantity"]
+                    buy_notional += notional
+                else:
+                    sell_quantity += trade["quantity"]
+                    sell_notional += notional
+
+        net_position = buy_quantity - sell_quantity
+        if buy_quantity:
+            buy_vwap: dict[str, int] | None = {
+                "numerator": buy_notional,
+                "denominator": buy_quantity,
+            }
+        else:
+            buy_vwap = None
+        if sell_quantity:
+            sell_vwap: dict[str, int] | None = {
+                "numerator": sell_notional,
+                "denominator": sell_quantity,
+            }
+        else:
+            sell_vwap = None
+
+        mark_price: int = obj["mark_price"]
+        analysis: dict[str, object] = {
+            "account_id": account_id,
+            "mark_price": mark_price,
+            "buy_quantity": buy_quantity,
+            "sell_quantity": sell_quantity,
+            "net_position": net_position,
+            "buy_notional": buy_notional,
+            "sell_notional": sell_notional,
+            "buy_vwap": buy_vwap,
+            "sell_vwap": sell_vwap,
+            "turnover_notional": buy_notional + sell_notional,
+            "risk_exposure": abs(net_position) * mark_price,
+            "mark_to_market_pnl": (
+                sell_notional - buy_notional + net_position * mark_price
+            ),
+        }
+        return event_id, REPORTED, None, [], None, None, analysis
 
     def snapshot(self) -> tuple[list[dict[str, int]], list[dict[str, int]]]:
         bids = [

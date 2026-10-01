@@ -1962,3 +1962,277 @@ def test_replay_execution_report_shape_and_byte_determinism():
         < report_line.index('"execution_analysis"')
         < report_line.index('"trades"')
     )
+
+
+# --------------------------------------------------------------------------
+# ACCOUNT_REPORT queries
+# --------------------------------------------------------------------------
+
+
+def account_report(event_id, account_id, mark_price):
+    return json.dumps(
+        {
+            "event_id": event_id,
+            "type": "ACCOUNT_REPORT",
+            "account_id": account_id,
+            "mark_price": mark_price,
+        }
+    )
+
+
+def position_query(engine, line):
+    return engine.handle_line_position(line)
+
+
+def test_account_report_taker_and_maker_views_of_one_trade():
+    engine, _ = book_after(
+        [add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="acct-s")]
+    )
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="acct-b"))
+
+    eid, result, reason, trades, stp, analysis, position = position_query(
+        engine, account_report("e3", "acct-b", 110)
+    )
+    assert (eid, result, reason, trades, stp, analysis) == (
+        "e3", "REPORTED", None, [], None, None,
+    )
+    assert position == {
+        "account_id": "acct-b",
+        "mark_price": 110,
+        "buy_quantity": 3,
+        "sell_quantity": 0,
+        "net_position": 3,
+        "buy_notional": 300,
+        "sell_notional": 0,
+        "buy_vwap": {"numerator": 300, "denominator": 3},
+        "sell_vwap": None,
+        "turnover_notional": 300,
+        "risk_exposure": 330,
+        "mark_to_market_pnl": 0 - 300 + 3 * 110,
+    }
+
+    # The maker side of the same trade, still resting with its leftover.
+    *_, position = position_query(engine, account_report("e4", "acct-s", 90))
+    assert position["buy_quantity"] == 0
+    assert position["sell_quantity"] == 3
+    assert position["net_position"] == -3
+    assert position["buy_vwap"] is None
+    assert position["sell_vwap"] == {"numerator": 300, "denominator": 3}
+    assert position["turnover_notional"] == 300
+    assert position["risk_exposure"] == 270
+    assert position["mark_to_market_pnl"] == 300 - 0 + (-3) * 90
+
+
+def test_account_report_aggregates_buys_and_sells_with_exact_vwaps():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 4, 100, account_id="x"),
+            add("e2", "s2", "SELL", "LIMIT", 4, 101, account_id="y"),
+        ]
+    )
+    # acct buys 4@100 and 4@101 as taker, then sells 3@102 as maker.
+    engine.handle_line(add("e3", "b1", "BUY", "LIMIT", 8, 101, account_id="acct"))
+    engine.handle_line(add("e4", "s3", "SELL", "LIMIT", 3, 102, account_id="acct"))
+    engine.handle_line(add("e5", "b2", "BUY", "LIMIT", 3, 102, account_id="w"))
+
+    *_, position = position_query(engine, account_report("e6", "acct", 100))
+    assert position["buy_quantity"] == 8
+    assert position["sell_quantity"] == 3
+    assert position["net_position"] == 5
+    assert position["buy_notional"] == 4 * 100 + 4 * 101
+    assert position["sell_notional"] == 3 * 102
+    assert position["buy_vwap"] == {"numerator": 804, "denominator": 8}
+    assert position["sell_vwap"] == {"numerator": 306, "denominator": 3}
+    assert position["turnover_notional"] == 804 + 306
+    assert position["risk_exposure"] == 500
+    assert position["mark_to_market_pnl"] == 306 - 804 + 5 * 100
+
+
+def test_account_report_aggregates_across_replace_and_iceberg():
+    engine, _ = book_after(
+        [add("e1", "b1", "BUY", "LIMIT", 5, 100, account_id="acct")]
+    )
+    engine.handle_line(add("e2", "s1", "SELL", "LIMIT", 2, 100))   # b1 makes 2@100
+    assert engine.handle_line(replace("e3", "b1", 4, 101))[1] == "REPLACED"
+    engine.handle_line(add("e4", "s2", "SELL", "LIMIT", 4, 101))   # b1 makes 4@101
+
+    # An iceberg of the same account trades slice by slice under one maker id.
+    engine.handle_line(iceberg("e5", "i1", "SELL", 5, 102, 2, account_id="acct"))
+    engine.handle_line(add("e6", "b2", "BUY", "LIMIT", 3, 102))    # i1 makes 2+1@102
+
+    *_, position = position_query(engine, account_report("e7", "acct", 100))
+    assert position["buy_quantity"] == 6
+    assert position["sell_quantity"] == 3
+    assert position["net_position"] == 3
+    assert position["buy_notional"] == 2 * 100 + 4 * 101
+    assert position["sell_notional"] == 3 * 102
+    assert position["turnover_notional"] == 604 + 306
+
+
+def test_account_report_ignores_orders_without_account():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 5, 100)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 2, 100, account_id="acct"))
+    # The anonymous maker's half of the trade belongs to no account.
+    *_, position = position_query(engine, account_report("e3", "acct", 100))
+    assert position["buy_quantity"] == 2
+    assert position["sell_quantity"] == 0
+    assert position["turnover_notional"] == 200
+
+
+def test_account_report_known_account_survives_order_outcome():
+    # The only order of the account is cancelled; the account stays known.
+    engine, _ = book_after(
+        [add("e1", "b1", "BUY", "LIMIT", 3, 100, account_id="acct")]
+    )
+    engine.handle_line(cancel("e2", "b1"))
+    eid, result, *_, position = position_query(engine, account_report("e3", "acct", 100))
+    assert (eid, result) == ("e3", "REPORTED")
+    assert position["net_position"] == 0
+    assert position["buy_vwap"] is None
+    assert position["sell_vwap"] is None
+    assert position["turnover_notional"] == 0
+    assert position["risk_exposure"] == 0
+    assert position["mark_to_market_pnl"] == 0
+
+    # An account whose only ADD was rejected is not known.
+    engine, _ = book_after([add("e1", "o1", "BUY", "LIMIT", 1, 100, account_id="a")])
+    assert engine.handle_line(
+        add("e2", "o1", "SELL", "LIMIT", 1, 100, account_id="b")
+    )[1:3] == ("REJECTED", "DUPLICATE_ORDER_ID")
+    assert position_query(engine, account_report("e3", "b", 100))[1:3] == (
+        "REJECTED", "UNKNOWN_ACCOUNT",
+    )
+
+
+def test_account_report_unknown_account_occupies_event_id():
+    engine, _ = book_after([add("e1", "o1", "BUY", "LIMIT", 1, 100, account_id="a")])
+    line = account_report("e2", "missing", 100)
+    assert position_query(engine, line)[1:3] == ("REJECTED", "UNKNOWN_ACCOUNT")
+    assert position_query(engine, line)[1:3] == ("REJECTED", "DUPLICATE_EVENT_ID")
+    # A well-formed report on a real account keeps working afterwards.
+    assert position_query(engine, account_report("e3", "a", 100))[1] == "REPORTED"
+
+
+def test_account_report_schema_rejections_consume_no_event_id():
+    engine, _ = book_after([add("e0", "o1", "BUY", "LIMIT", 5, 100, account_id="a")])
+    base = {"event_id": "eR", "type": "ACCOUNT_REPORT", "account_id": "a",
+            "mark_price": 100}
+    payloads = [
+        {k: v for k, v in base.items() if k != "account_id"},      # missing account_id
+        {k: v for k, v in base.items() if k != "mark_price"},      # missing mark_price
+        {k: v for k, v in base.items() if k != "event_id"},        # missing event_id
+        {**base, "order_id": "o1"},                                # extra field
+        {**base, "benchmark_price": 100},                          # extra field
+        {**base, "event_id": ""},                                  # empty event id
+        {**base, "event_id": 7},                                   # non-string event id
+        {**base, "account_id": ""},                                # empty account id
+        {**base, "account_id": 7},                                 # non-string account id
+        {**base, "account_id": None},                              # null account id
+        {**base, "mark_price": True},                              # bool mark
+        {**base, "mark_price": 0},                                 # non-positive
+        {**base, "mark_price": -5},                                # negative
+        {**base, "mark_price": 1.5},                               # float
+        {**base, "mark_price": "100"},                             # string
+        {**base, "mark_price": None},                              # null
+    ]
+    for payload in payloads:
+        assert position_query(engine, json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), payload
+        # Structural errors never occupy the event id.
+        assert position_query(engine, json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), payload
+
+    # The book is untouched and the event id is still free.
+    assert engine.snapshot() == ([{"price": 100, "quantity": 5}], [])
+    assert position_query(engine, json.dumps(base))[1] == "REPORTED"
+
+
+def test_account_report_duplicate_event_id():
+    engine, _ = book_after([add("e1", "o1", "BUY", "LIMIT", 1, 100, account_id="a")])
+    line = account_report("e2", "a", 100)
+    assert position_query(engine, line)[1] == "REPORTED"
+    assert position_query(engine, line)[1:3] == ("REJECTED", "DUPLICATE_EVENT_ID")
+
+
+def test_account_report_mark_price_field_is_report_only():
+    # mark_price remains an unknown field for every other event type.
+    engine = Engine()
+    assert engine.handle_line(
+        add("e1", "o1", "BUY", "LIMIT", 1, 100, mark_price=100)
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+    assert engine.handle_line(
+        json.dumps({"event_id": "e2", "type": "CANCEL", "order_id": "o1",
+                    "mark_price": 100})
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+    assert engine.handle_line(
+        json.dumps({"event_id": "e3", "type": "REPLACE", "order_id": "o1",
+                    "quantity": 1, "price": 100, "mark_price": 100})
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+    # account_id is likewise rejected on the order-level query.
+    assert engine.handle_line(
+        json.dumps({"event_id": "e4", "type": "EXECUTION_REPORT", "order_id": "o1",
+                    "benchmark_price": 100, "account_id": "a"})
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+
+
+def test_account_report_does_not_change_state_or_trade_ids():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100, account_id="a"),
+            add("e2", "s2", "SELL", "LIMIT", 2, 100),
+        ]
+    )
+    before = engine.snapshot()
+    assert position_query(engine, account_report("e3", "a", 100))[1] == "REPORTED"
+    assert engine.snapshot() == before
+
+    # The next trade still gets the id it would have had without the query.
+    _, _, _, trades = engine.handle_line(add("e4", "b1", "BUY", "LIMIT", 2, 100))
+    assert [t["trade_id"] for t in trades] == [1]
+    assert [t["maker_order_id"] for t in trades] == ["s1"]
+
+
+def test_replay_account_report_shape_and_byte_determinism():
+    stream = "\n".join(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 5, 100, account_id="acct-s"),
+            add("e2", "b1", "BUY", "LIMIT", 3, 100, account_id="acct-b"),
+            account_report("e3", "acct-b", 101),
+            account_report("e4", "gone", 100),
+            account_report("e3", "acct-b", 101),
+        ]
+    ) + "\n"
+    code, out1, err = run_replay(stream)
+    assert code == 0
+    assert err == ""
+    _, out2, _ = run_replay(stream)
+    assert out2 == out1
+
+    lines = out1.splitlines()
+    records = [json.loads(line) for line in lines]
+    assert [r["result"] for r in records] == [
+        "RESTING", "FILLED", "REPORTED", "REJECTED", "REJECTED",
+    ]
+    # Only the report carries the analysis; every record keeps trades/bids/asks.
+    assert ["position_analysis" in r for r in records] == [
+        False, False, True, False, False,
+    ]
+    assert "execution_analysis" not in records[2]
+    position = records[2]["position_analysis"]
+    assert position["net_position"] == 3
+    assert position["mark_to_market_pnl"] == 3 * 101 - 300
+    assert records[2]["trades"] == []
+    # The query echoes the book without changing it.
+    assert records[2]["asks"] == records[1]["asks"] == [{"price": 100, "quantity": 2}]
+    assert records[3]["reason"] == "UNKNOWN_ACCOUNT"
+    assert "position_analysis" not in records[3]
+    assert records[4]["reason"] == "DUPLICATE_EVENT_ID"
+    # The analysis is serialized after the result and before the trades.
+    report_line = lines[2]
+    assert (
+        report_line.index('"result"')
+        < report_line.index('"position_analysis"')
+        < report_line.index('"trades"')
+    )
