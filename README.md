@@ -108,6 +108,30 @@ EXECUTION_REPORT：
 - `slippage_notional`：买单为 `executed_notional − benchmark_price × filled_quantity`，卖单取相反数；负值表示相对基准改善。
 - `trade_attribution`：按 `trade_id` 升序的成交归因，每项含 `trade_id`、`role`（`MAKER` 或 `TAKER`）、`counterparty_order_id`（对手订单）、`event_id`（产生该成交的事件）、`price`、`quantity`。maker 与 taker 成交均归集到本订单；REPLACE 前后与 ICEBERG 补片的成交都计入原 `order_id`。
 
+ACCOUNT_REPORT：
+
+```json
+{"event_id": "e5", "type": "ACCOUNT_REPORT", "account_id": "a1", "mark_price": 100}
+```
+
+按 `account_id` 查询该账户的累计持仓、资金结果与市值风险，是相对 `mark_price` 的只读分析，不撮合、不改变订单簿、队列顺序或下一个成交编号：
+
+- `event_id`：全流唯一的非空字符串。
+- `account_id`：非空字符串；账户只要此前存在一笔**已接受**且带相同 `account_id` 的 ADD 即视为已知（订单此后在簿、已成交、已撤销、被自成交防护取消等状态均不影响认定）；账户未知时占用 `event_id` 并返回 `UNKNOWN_ACCOUNT`。
+- `mark_price`：正整数盯市价格（布尔值不算整数）。
+- 仅接受上述四个字段；字段缺失、多出、两个标识不为非空字符串或 `mark_price` 类型不符时按 `INVALID_SCHEMA` 拒绝，不占用 `event_id`；重复事件返回 `DUPLICATE_EVENT_ID`。`mark_price` 对其他任何事件类型都是未知字段。
+
+统计该账户作为 maker 或 taker 的全部成交：成交腿的订单带有相同 `account_id` 即计入（REPLACE 继承目标账户、ICEBERG 补片沿用原订单账户）；未带 `account_id` 的订单不计入任何账户。查询成功时 `result` 为 `REPORTED`，`trades` 为空，`bids`/`asks` 为当前盘口，并在 `result` 之后附加 `position_analysis`：
+
+- `account_id`、`mark_price`：回显查询参数。
+- `buy_quantity`、`sell_quantity`：累计买入、卖出数量。
+- `net_position`：净持仓，等于 `buy_quantity − sell_quantity`。
+- `buy_notional`、`sell_notional`：按成交价乘数量累加的买入、卖出成交额。
+- `buy_average_price`、`sell_average_price`：对应数量为零时为 `null`，否则为 `{"numerator": 成交额, "denominator": 数量}` 的精确分数。
+- `turnover_notional`：周转成交额，等于 `buy_notional + sell_notional`。
+- `risk_exposure`：风险敞口，等于 `abs(net_position) × mark_price`。
+- `mark_to_market_pnl`：盯市损益，等于 `sell_notional − buy_notional + net_position × mark_price`。
+
 ### 撮合规则
 
 - 买单匹配最低卖价，卖单匹配最高买价；同价位先到者优先（价格时间优先）。
@@ -143,14 +167,15 @@ EXECUTION_REPORT：
   - 市价单：与 IOC 相同
   - 撤单成功：`CANCELLED`
   - 替换成功：`REPLACED`、`PARTIALLY_FILLED_RESTING`、`FILLED`、`SELF_TRADE_PREVENTED`、`PARTIALLY_FILLED_SELF_TRADE_PREVENTED`
-  - 执行查询成功：`REPORTED`（附加 `execution_analysis`）
+  - 执行查询成功：`REPORTED`（EXECUTION_REPORT 附加 `execution_analysis`，ACCOUNT_REPORT 附加 `position_analysis`）
   - 拒绝：`REJECTED`（附加 `reason`）
 - `self_trade_prevention`：仅在两种自成交防护结果下出现，序列化于 `result`/`reason` 之后、`trades` 之前，含 `maker_order_id`（触发的被动单）、`taker_order_id`（被取消的主动单）与 `cancelled_quantity`（取消量，等于触发时主动单的剩余量；FOK 预检触发时为原始委托量）。其他结果不得包含该字段。
-- `execution_analysis`：仅在 `REPORTED` 结果下出现，序列化于 `result` 之后、`trades` 之前，字段见上文 EXECUTION_REPORT 一节。其他结果不得包含该字段。
+- `execution_analysis`：仅在 EXECUTION_REPORT 的 `REPORTED` 结果下出现，序列化于 `result` 之后、`trades` 之前，字段见上文 EXECUTION_REPORT 一节。其他结果不得包含该字段。
+- `position_analysis`：仅在 ACCOUNT_REPORT 的 `REPORTED` 结果下出现，序列化于 `result` 之后、`trades` 之前，字段见上文 ACCOUNT_REPORT 一节。其他结果不得包含该字段。
 - `trades`：按发生顺序排列；每笔含 `maker_order_id`、`taker_order_id`、`price`、`quantity` 与 `trade_id`。
 - `bids` 按价格降序、`asks` 按价格升序，每档含整数 `price` 与汇总 `quantity`。
 
-拒绝原因：`INVALID_JSON`、`INVALID_SCHEMA`（非对象、缺字段、字段类型或枚举错误、未知字段）、`DUPLICATE_EVENT_ID`、`DUPLICATE_ORDER_ID`、`UNKNOWN_ORDER`。拒绝对象带空 `trades` 和拒绝前盘口，不改变订单簿、成交编号或后续优先级。
+拒绝原因：`INVALID_JSON`、`INVALID_SCHEMA`（非对象、缺字段、字段类型或枚举错误、未知字段）、`DUPLICATE_EVENT_ID`、`DUPLICATE_ORDER_ID`、`UNKNOWN_ORDER`、`UNKNOWN_ACCOUNT`。拒绝对象带空 `trades` 和拒绝前盘口，不改变订单簿、成交编号或后续优先级。
 
 ## 现有公开接口
 

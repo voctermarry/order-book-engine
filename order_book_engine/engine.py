@@ -14,6 +14,7 @@ ADD = "ADD"
 CANCEL = "CANCEL"
 REPLACE = "REPLACE"
 EXECUTION_REPORT = "EXECUTION_REPORT"
+ACCOUNT_REPORT = "ACCOUNT_REPORT"
 BUY = "BUY"
 SELL = "SELL"
 LIMIT = "LIMIT"
@@ -44,6 +45,7 @@ INVALID_SCHEMA = "INVALID_SCHEMA"
 DUPLICATE_EVENT_ID = "DUPLICATE_EVENT_ID"
 DUPLICATE_ORDER_ID = "DUPLICATE_ORDER_ID"
 UNKNOWN_ORDER = "UNKNOWN_ORDER"
+UNKNOWN_ACCOUNT = "UNKNOWN_ACCOUNT"
 
 _ALL_KEYS = frozenset(
     {"event_id", "type", "order_id", "side", "order_type", "quantity", "price",
@@ -51,6 +53,7 @@ _ALL_KEYS = frozenset(
 )
 _CANCEL_KEYS = frozenset({"event_id", "type", "order_id"})
 _REPORT_KEYS = frozenset({"event_id", "type", "order_id", "benchmark_price"})
+_ACCOUNT_REPORT_KEYS = frozenset({"event_id", "type", "account_id", "mark_price"})
 _REQUIRED_ADD_KEYS = frozenset({"event_id", "type", "order_id", "side", "order_type", "quantity"})
 _REQUIRED_REPLACE_KEYS = frozenset({"event_id", "type", "order_id", "quantity", "price"})
 _ALLOWED_REPLACE_KEYS = _REQUIRED_REPLACE_KEYS | {"display_quantity"}
@@ -67,6 +70,9 @@ class Engine:
     def __init__(self) -> None:
         self._event_ids: set[str] = set()
         self._order_ids: set[str] = set()
+        # Accounts are known once an accepted ADD carried the tag; nothing ever
+        # removes them, regardless of later order state.
+        self._accounts: set[str] = set()
         self._orders: dict[str, dict[str, object]] = {}
         self._bids: dict[int, deque[str]] = {}
         self._asks: dict[int, deque[str]] = {}
@@ -85,7 +91,9 @@ class Engine:
         the event id when it can be obtained as a string, otherwise ``None``,
         and ``reason`` is set only for rejected events.
         """
-        event_id, result, reason, trades, _stp = self.handle_line_full(line)
+        event_id, result, reason, trades, _stp, _execution, _position = (
+            self.handle_line_with_analyses(line)
+        )
         return event_id, result, reason, trades
 
     def handle_line_full(
@@ -93,7 +101,9 @@ class Engine:
     ) -> tuple[str | None, str, str | None, list[dict[str, object]], dict[str, object] | None]:
         """Like :meth:`handle_line`, additionally returning the self-trade
         prevention descriptor (``None`` for every other result)."""
-        event_id, result, reason, trades, stp, _analysis = self.handle_line_extended(line)
+        event_id, result, reason, trades, stp, _execution, _position = (
+            self.handle_line_with_analyses(line)
+        )
         return event_id, result, reason, trades, stp
 
     def handle_line_extended(
@@ -104,16 +114,33 @@ class Engine:
     ]:
         """Like :meth:`handle_line_full`, additionally returning the execution
         analysis of an ``EXECUTION_REPORT`` query (``None`` otherwise)."""
+        event_id, result, reason, trades, stp, analysis, _position = (
+            self.handle_line_with_analyses(line)
+        )
+        return event_id, result, reason, trades, stp, analysis
+
+    def handle_line_with_analyses(
+        self, line: str
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Like :meth:`handle_line_extended`, additionally returning the
+        position analysis of an ``ACCOUNT_REPORT`` query (the last element,
+        ``None`` for every other event)."""
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            return None, REJECTED, INVALID_JSON, [], None, None
-        return self.handle_object_extended(obj)
+            return None, REJECTED, INVALID_JSON, [], None, None, None
+        return self.handle_object_with_analyses(obj)
 
     def handle_object(
         self, obj: object
     ) -> tuple[str | None, str, str | None, list[dict[str, object]], dict[str, object] | None]:
-        event_id, result, reason, trades, stp, _analysis = self.handle_object_extended(obj)
+        event_id, result, reason, trades, stp, _execution, _position = (
+            self.handle_object_with_analyses(obj)
+        )
         return event_id, result, reason, trades, stp
 
     def handle_object_extended(
@@ -122,18 +149,31 @@ class Engine:
         str | None, str, str | None,
         list[dict[str, object]], dict[str, object] | None, dict[str, object] | None,
     ]:
+        event_id, result, reason, trades, stp, analysis, _position = (
+            self.handle_object_with_analyses(obj)
+        )
+        return event_id, result, reason, trades, stp, analysis
+
+    def handle_object_with_analyses(
+        self, obj: object
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Object form of :meth:`handle_line_with_analyses`."""
         if not isinstance(obj, dict):
-            return None, REJECTED, INVALID_SCHEMA, [], None, None
+            return None, REJECTED, INVALID_SCHEMA, [], None, None, None
 
         event_id = obj.get("event_id")
         event_id_out = event_id if isinstance(event_id, str) else None
 
         schema_error = self._schema_error(obj)
         if schema_error is not None:
-            return event_id_out, REJECTED, schema_error, [], None, None
+            return event_id_out, REJECTED, schema_error, [], None, None, None
 
         if event_id in self._event_ids:
-            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None, None
+            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None, None, None
         if obj["type"] == REPLACE and "display_quantity" in obj:
             target = self._orders.get(obj["order_id"])
             if (
@@ -143,21 +183,26 @@ class Engine:
             ):
                 # Only an iceberg target may be replaced with a display slice;
                 # like every schema error this consumes no event id.
-                return event_id, REJECTED, INVALID_SCHEMA, [], None, None
+                return event_id, REJECTED, INVALID_SCHEMA, [], None, None, None
         # The event is well formed, so its id occupies the stream from here,
         # even if a later business rule rejects it.
         self._event_ids.add(event_id)
 
         if obj["type"] == CANCEL:
             event_id, result, reason, trades = self._cancel(event_id, obj["order_id"])
-            return event_id, result, reason, trades, None, None
+            return event_id, result, reason, trades, None, None, None
         if obj["type"] == REPLACE:
             event_id, result, reason, trades, stp = self._replace(event_id, obj)
-            return event_id, result, reason, trades, stp, None
+            return event_id, result, reason, trades, stp, None, None
         if obj["type"] == EXECUTION_REPORT:
-            return self._execution_report(event_id, obj)
+            event_id, result, reason, trades, stp, analysis = self._execution_report(
+                event_id, obj
+            )
+            return event_id, result, reason, trades, stp, analysis, None
+        if obj["type"] == ACCOUNT_REPORT:
+            return self._account_report(event_id, obj)
         event_id, result, reason, trades, stp = self._add(event_id, obj)
-        return event_id, result, reason, trades, stp, None
+        return event_id, result, reason, trades, stp, None, None
 
     @staticmethod
     def _schema_error(obj: dict[str, object]) -> str | None:
@@ -173,6 +218,21 @@ class Engine:
             if not isinstance(obj.get("order_id"), str):
                 return INVALID_SCHEMA
             if not _is_positive_int(obj.get("benchmark_price")):
+                return INVALID_SCHEMA
+            return None
+        if event_type == ACCOUNT_REPORT:
+            # A pure account query: exactly the four fields, two non-empty
+            # string identifiers and a positive integer mark (booleans are not
+            # integers). Both identifiers must be non-empty here.
+            if keys != _ACCOUNT_REPORT_KEYS:
+                return INVALID_SCHEMA
+            event_id_value = obj.get("event_id")
+            if not (isinstance(event_id_value, str) and event_id_value != ""):
+                return INVALID_SCHEMA
+            account_id = obj.get("account_id")
+            if not (isinstance(account_id, str) and account_id != ""):
+                return INVALID_SCHEMA
+            if not _is_positive_int(obj.get("mark_price")):
                 return INVALID_SCHEMA
             return None
         if not keys <= _ALL_KEYS:
@@ -297,6 +357,12 @@ class Engine:
             return event_id, REJECTED, DUPLICATE_ORDER_ID, [], None
         self._order_ids.add(order_id)
 
+        account_id: str | None = obj.get("account_id")
+        if account_id is not None:
+            # From acceptance on the account is known forever; the order's
+            # later state (filled, cancelled, replaced) never revokes it.
+            self._accounts.add(account_id)
+
         side: str = obj["side"]
         order_type: str = obj["order_type"]
         quantity: int = obj["quantity"]
@@ -312,7 +378,6 @@ class Engine:
         display_quantity: int | None = (
             obj["display_quantity"] if is_iceberg else None
         )
-        account_id: str | None = obj.get("account_id")
 
         # FOK must either match the whole quantity against the pre-event book
         # or do nothing at all: no trades, no book change, no trade ids spent.
@@ -702,6 +767,76 @@ class Engine:
             "trade_attribution": attribution,
         }
         return event_id, REPORTED, None, [], None, analysis
+
+    def _account_report(
+        self, event_id: str, obj: dict[str, object]
+    ) -> tuple[
+        str, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Answer a cumulative position/risk query without touching any state.
+
+        Every trade is attributed to its maker or taker order's account.
+        Replacements trade under the inherited account and iceberg slices under
+        the same maker id, so the order records resolve the full history;
+        orders without an ``account_id`` never contribute. Self-trade
+        prevention guarantees a single trade never carries one account on both
+        legs.
+        """
+        account_id: str = obj["account_id"]
+        if account_id not in self._accounts:
+            return event_id, REJECTED, UNKNOWN_ACCOUNT, [], None, None, None
+
+        buy_quantity = 0
+        sell_quantity = 0
+        buy_notional = 0
+        sell_notional = 0
+        for trade in self._trade_log:
+            maker = self._orders.get(trade["maker_order_id"])
+            if maker is not None and maker.get("account_id") == account_id:
+                side = maker["side"]
+            else:
+                taker = self._orders.get(trade["taker_order_id"])
+                if taker is None or taker.get("account_id") != account_id:
+                    continue
+                side = taker["side"]
+            notional = trade["price"] * trade["quantity"]
+            if side == BUY:
+                buy_quantity += trade["quantity"]
+                buy_notional += notional
+            else:
+                sell_quantity += trade["quantity"]
+                sell_notional += notional
+
+        net_position = buy_quantity - sell_quantity
+        mark_price: int = obj["mark_price"]
+        buy_average = (
+            {"numerator": buy_notional, "denominator": buy_quantity}
+            if buy_quantity else None
+        )
+        sell_average = (
+            {"numerator": sell_notional, "denominator": sell_quantity}
+            if sell_quantity else None
+        )
+
+        analysis: dict[str, object] = {
+            "account_id": account_id,
+            "mark_price": mark_price,
+            "buy_quantity": buy_quantity,
+            "sell_quantity": sell_quantity,
+            "net_position": net_position,
+            "buy_notional": buy_notional,
+            "sell_notional": sell_notional,
+            "buy_average_price": buy_average,
+            "sell_average_price": sell_average,
+            "turnover_notional": buy_notional + sell_notional,
+            "risk_exposure": abs(net_position) * mark_price,
+            "mark_to_market_pnl": (
+                sell_notional - buy_notional + net_position * mark_price
+            ),
+        }
+        return event_id, REPORTED, None, [], None, None, analysis
 
     def snapshot(self) -> tuple[list[dict[str, int]], list[dict[str, int]]]:
         bids = [
