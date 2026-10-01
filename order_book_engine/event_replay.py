@@ -8,9 +8,12 @@ matching rules, priorities, rejection semantics or trade record shapes:
   order events for one or several securities. Every security keeps its own
   sequence counter and its own book; events are applied strictly in input
   order, so identical timestamps never reorder anything. The stream covers
-  the baseline ADD/CANCEL/REPLACE behaviours and resumable TWAP parent orders
-  (TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT); plans never read a wall
-  clock and are advanced solely by TWAP_SLICE events.
+  the baseline ADD/CANCEL/REPLACE behaviours and resumable TWAP/VWAP parent
+  orders (TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
+  VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT); plans never read a wall
+  clock and are advanced solely by their SLICE events. TWAP slices divide
+  the total evenly; VWAP slices follow a caller-supplied volume-weight
+  curve.
 * Each event is committed individually: a later failure never rolls back an
   earlier success, and a failed event leaves no order, trade, counter or book
   change behind.
@@ -80,6 +83,17 @@ TWAP_SLICE = "TWAP_SLICE"
 TWAP_CANCEL = "TWAP_CANCEL"
 TWAP_REPORT = "TWAP_REPORT"
 
+# VWAP event types.
+VWAP_START = "VWAP_START"
+VWAP_SLICE = "VWAP_SLICE"
+VWAP_CANCEL = "VWAP_CANCEL"
+VWAP_REPORT = "VWAP_REPORT"
+
+# Plan algorithm labels: TWAP plans keep the historical summary shape, VWAP
+# plans additionally report their algorithm and per-slice schedule.
+ALGORITHM_TWAP = "TWAP"
+ALGORITHM_VWAP = "VWAP"
+
 # TWAP plan lifecycle statuses.
 PLAN_ACTIVE = "ACTIVE"
 PLAN_COMPLETED = "COMPLETED"
@@ -90,11 +104,13 @@ SNAPSHOT_CORRUPT = "SNAPSHOT_CORRUPT"
 SNAPSHOT_VERSION_UNSUPPORTED = "SNAPSHOT_VERSION_UNSUPPORTED"
 CONFIG_MISMATCH = "CONFIG_MISMATCH"
 
-#: Event types this replay layer accepts. The TWAP parent-order commands join
-#: the baseline mutating behaviours; the baseline read-only reports stay
+#: Event types this replay layer accepts. The TWAP/VWAP parent-order commands
+#: join the baseline mutating behaviours; the baseline read-only reports stay
 #: exclusive to the JSON Lines entry point.
 SUPPORTED_TYPES = frozenset(
-    {ADD, CANCEL, REPLACE, TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT}
+    {ADD, CANCEL, REPLACE,
+     TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
+     VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT}
 )
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
@@ -112,6 +128,42 @@ _TWAP_START_REQUIRED = frozenset(
 )
 _TWAP_PLAN_REF_KEYS = frozenset({"event_id", "type", "plan_id"})
 _TWAP_TYPES = frozenset({TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT})
+_VWAP_START_KEYS = frozenset(
+    {"event_id", "type", "plan_id", "side", "total_quantity", "volume_weights",
+     "order_type", "benchmark_price", "price", "account_id"}
+)
+_VWAP_START_REQUIRED = frozenset(
+    {"event_id", "type", "plan_id", "side", "total_quantity", "volume_weights",
+     "order_type", "benchmark_price"}
+)
+_VWAP_TYPES = frozenset({VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT})
+#: Every parent-order command type, across algorithms.
+_PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES
+
+
+def _allocate_slices(total_quantity: int, weights: list[int]) -> list[int]:
+    """Split ``total_quantity`` across buckets proportionally to ``weights``.
+
+    Every bucket receives one unit up front; the remaining units are
+    distributed in proportion to the weights by integer quotient, and the
+    units left over by that truncation go one each to the buckets with the
+    largest division remainder, earlier buckets first on ties. The result
+    always sums to exactly ``total_quantity``.
+    """
+    count = len(weights)
+    remainder = total_quantity - count
+    total_weight = sum(weights)
+    quantities: list[int] = []
+    residuals: list[int] = []
+    for weight in weights:
+        quotient, residual = divmod(remainder * weight, total_weight)
+        quantities.append(1 + quotient)
+        residuals.append(residual)
+    leftover = remainder - (sum(quantities) - count)
+    by_residual = sorted(range(count), key=lambda i: (-residuals[i], i))
+    for index in by_residual[:leftover]:
+        quantities[index] += 1
+    return quantities
 
 
 def _twap_schema_error(payload: dict[str, object]) -> str | None:
@@ -157,6 +209,62 @@ def _twap_schema_error(payload: dict[str, object]) -> str | None:
             return INVALID_EVENT
         return None
     # TWAP_SLICE / TWAP_CANCEL / TWAP_REPORT are pure plan references.
+    if set(payload) != _TWAP_PLAN_REF_KEYS:
+        return INVALID_EVENT
+    if not _is_non_empty_str(payload.get("plan_id")):
+        return INVALID_EVENT
+    return None
+
+
+def _vwap_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a VWAP command payload.
+
+    Follows the TWAP contract exactly: any field problem (missing or extra
+    field, wrong type, a non-positive integer where a positive one is
+    required, an empty identifier, an empty or non-positive weight, a LIMIT
+    without a positive price or a MARKET carrying one, ...) is an
+    ``INVALID_EVENT`` and consumes neither the event id nor the sequence.
+    """
+    event_type = payload["type"]
+    if event_type == VWAP_START:
+        keys = set(payload)
+        if not keys >= _VWAP_START_REQUIRED or not keys <= _VWAP_START_KEYS:
+            return INVALID_EVENT
+        if not _is_non_empty_str(payload.get("plan_id")):
+            return INVALID_EVENT
+        if payload.get("side") not in (BUY, SELL):
+            return INVALID_EVENT
+        order_type = payload.get("order_type")
+        if order_type not in (LIMIT, MARKET):
+            return INVALID_EVENT
+        total_quantity = payload.get("total_quantity")
+        volume_weights = payload.get("volume_weights")
+        benchmark_price = payload.get("benchmark_price")
+        if not _is_positive_int(total_quantity):
+            return INVALID_EVENT
+        if not (
+            isinstance(volume_weights, list)
+            and len(volume_weights) > 0
+            and all(_is_positive_int(weight) for weight in volume_weights)
+        ):
+            return INVALID_EVENT
+        # Every bucket receives one unit up front, so the total must cover
+        # the bucket count.
+        if total_quantity < len(volume_weights):
+            return INVALID_EVENT
+        if not _is_positive_int(benchmark_price):
+            return INVALID_EVENT
+        if order_type == LIMIT:
+            if not _is_positive_int(payload.get("price")):
+                return INVALID_EVENT
+        elif "price" in payload and payload["price"] is not None:
+            # MARKET plans must not carry a non-null price; omission or an
+            # explicit null is accepted.
+            return INVALID_EVENT
+        if "account_id" in payload and not _is_non_empty_str(payload.get("account_id")):
+            return INVALID_EVENT
+        return None
+    # VWAP_SLICE / VWAP_CANCEL / VWAP_REPORT are pure plan references.
     if set(payload) != _TWAP_PLAN_REF_KEYS:
         return INVALID_EVENT
     if not _is_non_empty_str(payload.get("plan_id")):
@@ -229,19 +337,23 @@ class SnapshotError(ValueError):
 
 
 class ExecutionPlan:
-    """Mutable state of one resumable TWAP parent order on one security.
+    """Mutable state of one resumable TWAP or VWAP parent order on one security.
 
     All cumulative analytics (filled quantity, notional, cancelled quantity)
     are maintained incrementally, so a snapshot carries exactly the state a
     continued or resumed slice needs. Slice quantities are fixed at creation:
-    the total is divided evenly across ``slice_count`` slices and the division
-    remainder is spread as one extra unit over the earliest slices.
+    a TWAP plan divides the total evenly across ``slice_count`` slices and
+    spreads the division remainder as one extra unit over the earliest
+    slices, while a VWAP plan allocates one unit per bucket up front and
+    distributes the rest proportionally to its volume weights (see
+    :func:`_allocate_slices`).
     """
 
     __slots__ = (
         "plan_id", "side", "order_type", "benchmark_price", "price",
-        "account_id", "slice_quantities", "released", "released_quantity",
-        "filled_quantity", "cancelled_quantity", "notional", "status",
+        "account_id", "algorithm", "volume_weights", "slice_quantities",
+        "released", "released_quantity", "filled_quantity",
+        "cancelled_quantity", "notional", "status",
     )
 
     def __init__(
@@ -254,6 +366,9 @@ class ExecutionPlan:
         benchmark_price: int,
         price: int | None,
         account_id: str | None,
+        *,
+        algorithm: str = ALGORITHM_TWAP,
+        volume_weights: list[int] | None = None,
     ) -> None:
         self.plan_id = plan_id
         self.side = side
@@ -261,11 +376,18 @@ class ExecutionPlan:
         self.benchmark_price = benchmark_price
         self.price = price
         self.account_id = account_id
-        base, extra = divmod(total_quantity, slice_count)
-        self.slice_quantities: list[int] = [
-            base + (1 if index < extra else 0)
-            for index in range(slice_count)
-        ]
+        self.algorithm = algorithm
+        self.volume_weights = list(volume_weights) if volume_weights is not None else None
+        if algorithm == ALGORITHM_VWAP:
+            self.slice_quantities: list[int] = _allocate_slices(
+                total_quantity, self.volume_weights
+            )
+        else:
+            base, extra = divmod(total_quantity, slice_count)
+            self.slice_quantities = [
+                base + (1 if index < extra else 0)
+                for index in range(slice_count)
+            ]
         # Number of slices already released; also the index of the next one.
         self.released = 0
         self.released_quantity = 0
@@ -304,8 +426,10 @@ class ExecutionPlan:
         *,
         slice_number: int | None = None,
         child_order_id: str | None = None,
+        target_weight: int | None = None,
+        scheduled_quantity: int | None = None,
     ) -> dict[str, object]:
-        """Build the ``execution_plan`` object echoed by TWAP responses."""
+        """Build the ``execution_plan`` object echoed by plan responses."""
         vwap = (
             {"numerator": self.notional, "denominator": self.filled_quantity}
             if self.filled_quantity
@@ -325,10 +449,16 @@ class ExecutionPlan:
             "vwap": vwap,
             "slippage_notional": slippage,
         }
+        if self.algorithm == ALGORITHM_VWAP:
+            plan["algorithm"] = ALGORITHM_VWAP
         if slice_number is not None:
             plan["slice_number"] = slice_number
         if child_order_id is not None:
             plan["child_order_id"] = child_order_id
+        if target_weight is not None:
+            plan["target_weight"] = target_weight
+        if scheduled_quantity is not None:
+            plan["scheduled_quantity"] = scheduled_quantity
         return plan
 
     def to_json(self) -> dict[str, object]:
@@ -348,6 +478,11 @@ class ExecutionPlan:
             "notional": self.notional,
             "status": self.status,
         }
+        if self.algorithm == ALGORITHM_VWAP:
+            # TWAP records keep their historical shape; VWAP records add the
+            # algorithm label and the schedule the allocation derives from.
+            data["algorithm"] = ALGORITHM_VWAP
+            data["volume_weights"] = list(self.volume_weights)
         return data
 
 
@@ -526,6 +661,8 @@ class EventReplayer:
             return reject_envelope()
         if event_type in _TWAP_TYPES:
             schema_error = _twap_schema_error(payload)
+        elif event_type in _VWAP_TYPES:
+            schema_error = _vwap_schema_error(payload)
         else:
             schema_error = Engine._schema_error(payload)
         if schema_error is not None:
@@ -604,8 +741,8 @@ class EventReplayer:
                 "asks": asks,
             }
 
-        if event_type in _TWAP_TYPES:
-            out = self._dispatch_twap(
+        if event_type in _PLAN_TYPES:
+            out = self._dispatch_plan(
                 event, payload, event_type, state, symbol, sequence, content
             )
             return out
@@ -661,13 +798,16 @@ class EventReplayer:
             return _BASELINE_KEYS
         if inline_type == TWAP_START:
             return _TWAP_START_KEYS
-        if inline_type in (TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT):
+        if inline_type == VWAP_START:
+            return _VWAP_START_KEYS
+        if inline_type in (TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
+                           VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT):
             return _TWAP_PLAN_REF_KEYS
         return None
 
-    # -- TWAP handling ------------------------------------------------------
+    # -- parent-order plan handling ------------------------------------------
 
-    def _dispatch_twap(
+    def _dispatch_plan(
         self,
         event: dict[str, object],
         payload: dict[str, object],
@@ -677,7 +817,7 @@ class EventReplayer:
         sequence: int,
         content: str,
     ) -> dict[str, object]:
-        """Dispatch a structurally valid, in-sequence TWAP command.
+        """Dispatch a structurally valid, in-sequence parent-order command.
 
         Every branch commits the well-formed event id and advances the symbol
         sequence, including business rejections: this matches the baseline
@@ -691,15 +831,17 @@ class EventReplayer:
 
         if event_type == TWAP_START:
             result_out = self._twap_start(payload, state)
-        elif event_type == TWAP_SLICE:
-            result_out = self._twap_slice(payload, state)
-        elif event_type == TWAP_CANCEL:
-            result_out = self._twap_cancel(payload, state)
+        elif event_type == VWAP_START:
+            result_out = self._vwap_start(payload, state)
+        elif event_type in (TWAP_SLICE, VWAP_SLICE):
+            result_out = self._plan_slice(payload, state)
+        elif event_type in (TWAP_CANCEL, VWAP_CANCEL):
+            result_out = self._plan_cancel(payload, state)
         else:
-            result_out = self._twap_report(payload, state)
+            result_out = self._plan_report(payload, state)
 
-        # The structurally valid TWAP command occupies its event id and the
-        # symbol sequence whatever its business outcome.
+        # The structurally valid command occupies its event id and the symbol
+        # sequence whatever its business outcome.
         state.last_sequence = sequence
         state.seen[event_id] = content
         self._events[event_id] = (symbol, content)
@@ -708,19 +850,16 @@ class EventReplayer:
         # the same level-diff routine the baseline path uses, so drained
         # levels and iceberg replenishment are reported identically.
         book_changes = self._book_changes(state.engine, before_bids, before_asks)
-        return self._twap_response(
+        return self._plan_response(
             event_id, symbol, sequence, state, result_out, book_changes
         )
 
     def _twap_start(
         self, payload: dict[str, object], state: _SymbolState
     ) -> tuple[str, str | None, ExecutionPlan | None, None]:
-        """Create the plan and reserve its derived ids; no matching occurs."""
-        plan_id: str = payload["plan_id"]
-        if plan_id in state.plans:
-            return REJECTED, DUPLICATE_EXECUTION_PLAN, None, None
+        """Create the TWAP plan; no matching occurs."""
         plan = ExecutionPlan(
-            plan_id=plan_id,
+            plan_id=payload["plan_id"],
             side=payload["side"],
             order_type=payload["order_type"],
             total_quantity=payload["total_quantity"],
@@ -729,9 +868,42 @@ class EventReplayer:
             price=payload.get("price") if payload["order_type"] == LIMIT else None,
             account_id=payload.get("account_id"),
         )
-        # Every derived id is reserved up front; a clash with an existing order
-        # or another plan's derived id rejects the start before anything is
-        # registered, so the event leaves no plan or reservation behind.
+        return self._register_plan(state, plan)
+
+    def _vwap_start(
+        self, payload: dict[str, object], state: _SymbolState
+    ) -> tuple[str, str | None, ExecutionPlan | None, None]:
+        """Create the VWAP plan; no matching occurs."""
+        weights: list[int] = payload["volume_weights"]
+        plan = ExecutionPlan(
+            plan_id=payload["plan_id"],
+            side=payload["side"],
+            order_type=payload["order_type"],
+            total_quantity=payload["total_quantity"],
+            slice_count=len(weights),
+            benchmark_price=payload["benchmark_price"],
+            price=payload.get("price") if payload["order_type"] == LIMIT else None,
+            account_id=payload.get("account_id"),
+            algorithm=ALGORITHM_VWAP,
+            volume_weights=weights,
+        )
+        return self._register_plan(state, plan)
+
+    @staticmethod
+    def _register_plan(
+        state: _SymbolState, plan: ExecutionPlan
+    ) -> tuple[str, str | None, ExecutionPlan | None, None]:
+        """Register a new plan and reserve its derived ids.
+
+        TWAP and VWAP plans share the per-symbol ``plan_id`` namespace, so a
+        duplicate id rejects whatever algorithm started the existing plan.
+        Every derived id is reserved up front; a clash with an existing order
+        or another plan's derived id rejects the start before anything is
+        registered, so the event leaves no plan or reservation behind.
+        """
+        plan_id = plan.plan_id
+        if plan_id in state.plans:
+            return REJECTED, DUPLICATE_EXECUTION_PLAN, None, None
         for child_id in plan.child_ids():
             if state.engine.has_order_id(child_id) or child_id in state.plan_index:
                 return REJECTED, DUPLICATE_ORDER_ID, None, None
@@ -741,7 +913,7 @@ class EventReplayer:
         state.plans[plan_id] = plan
         return ACCEPTED, None, plan, None
 
-    def _twap_slice(
+    def _plan_slice(
         self, payload: dict[str, object], state: _SymbolState
     ) -> tuple[str, str | None, ExecutionPlan | None, dict[str, object] | None]:
         """Release the next slice as an IOC child order against current book."""
@@ -777,7 +949,7 @@ class EventReplayer:
         # A correctly synthesized child can only fail on a programming error;
         # fail loudly rather than corrupt the plan counters.
         if reason is not None:  # pragma: no cover - defensive
-            raise RuntimeError(f"TWAP slice child order rejected: {reason}")
+            raise RuntimeError(f"plan slice child order rejected: {reason}")
 
         traded_quantity = sum(trade["quantity"] for trade in trades)
         plan.released += 1
@@ -793,9 +965,13 @@ class EventReplayer:
             "engine_result": engine_result,
             "trades": trades,
         }
+        if plan.algorithm == ALGORITHM_VWAP:
+            # A successful VWAP slice also reports its scheduled bucket.
+            slice_info["target_weight"] = plan.volume_weights[slice_number - 1]
+            slice_info["scheduled_quantity"] = quantity
         return ACCEPTED, None, plan, slice_info
 
-    def _twap_cancel(
+    def _plan_cancel(
         self, payload: dict[str, object], state: _SymbolState
     ) -> tuple[str, str | None, ExecutionPlan | None, None]:
         """Count the unreleased quantity as cancelled and close the plan.
@@ -815,7 +991,7 @@ class EventReplayer:
         plan.status = PLAN_CANCELLED
         return ACCEPTED, None, plan, None
 
-    def _twap_report(
+    def _plan_report(
         self, payload: dict[str, object], state: _SymbolState
     ) -> tuple[str, str | None, ExecutionPlan | None, None]:
         """Read-only cumulative plan summary; closed plans stay queryable."""
@@ -826,7 +1002,7 @@ class EventReplayer:
         return ACCEPTED, None, plan, None
 
     @staticmethod
-    def _twap_response(
+    def _plan_response(
         event_id: str,
         symbol: str,
         sequence: int,
@@ -834,7 +1010,7 @@ class EventReplayer:
         result_out: tuple[str, str | None, ExecutionPlan | None, dict[str, object] | None],
         book_changes: dict[str, list[dict[str, int]]],
     ) -> dict[str, object]:
-        """Assemble the TWAP command result, including book and plan summary."""
+        """Assemble the plan command result, including book and plan summary."""
         status, code, plan, slice_info = result_out
         bids, asks = state.engine.snapshot()
         if status == ACCEPTED:
@@ -843,11 +1019,14 @@ class EventReplayer:
                 trades: list[dict[str, object]] = []
                 result: str | None = None
                 slice_number = child_order_id = None
+                target_weight = scheduled_quantity = None
             else:
                 trades = slice_info["trades"]
                 result = slice_info["engine_result"]
                 slice_number = slice_info["slice_number"]
                 child_order_id = slice_info["child_order_id"]
+                target_weight = slice_info.get("target_weight")
+                scheduled_quantity = slice_info.get("scheduled_quantity")
             out: dict[str, object] = {
                 "event_id": event_id,
                 "symbol": symbol,
@@ -861,7 +1040,10 @@ class EventReplayer:
             if result is not None:
                 out["result"] = result
             out["execution_plan"] = plan.summary(
-                slice_number=slice_number, child_order_id=child_order_id
+                slice_number=slice_number,
+                child_order_id=child_order_id,
+                target_weight=target_weight,
+                scheduled_quantity=scheduled_quantity,
             ) if plan is not None else None
             return out
         # Business rejection: the book is untouched by the command itself.
@@ -994,6 +1176,30 @@ def _parse_plan_entry(entry: dict[str, object]) -> "ExecutionPlan":
     slice_count = len(slice_quantities)
     _require(0 <= released <= slice_count, f"plan {plan_id} released slice index out of range")
     total_quantity = sum(slice_quantities)
+    algorithm = entry.get("algorithm", ALGORITHM_TWAP)
+    volume_weights: list[int] | None = None
+    if algorithm == ALGORITHM_VWAP:
+        raw_weights = entry.get("volume_weights")
+        _require(
+            isinstance(raw_weights, list) and len(raw_weights) == slice_count,
+            f"plan {plan_id} volume_weights must be a list matching its slices",
+        )
+        volume_weights = []
+        for value in raw_weights:
+            _require(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0,
+                f"plan {plan_id} volume weights must be positive integers",
+            )
+            volume_weights.append(value)
+        _require(
+            slice_quantities == _allocate_slices(total_quantity, volume_weights),
+            f"plan {plan_id} slice quantities disagree with its volume weights",
+        )
+    else:
+        _require(
+            algorithm == ALGORITHM_TWAP,
+            f"plan {plan_id} has an unknown algorithm",
+        )
     _require(
         released_quantity == sum(slice_quantities[:released]),
         f"plan {plan_id} released_quantity does not match its slices",
@@ -1022,6 +1228,8 @@ def _parse_plan_entry(entry: dict[str, object]) -> "ExecutionPlan":
     plan.benchmark_price = benchmark_price
     plan.price = price
     plan.account_id = account_id
+    plan.algorithm = algorithm
+    plan.volume_weights = volume_weights
     plan.slice_quantities = slice_quantities
     plan.released = released
     plan.released_quantity = released_quantity
@@ -1049,6 +1257,7 @@ _PLAN_KEYS = frozenset(
      "slice_quantities", "released", "released_quantity", "filled_quantity",
      "cancelled_quantity", "notional", "status"}
 )
+_VWAP_PLAN_KEYS = _PLAN_KEYS | {"algorithm", "volume_weights"}
 _ENVELOPE_KEYS_SNAPSHOT = frozenset(
     {"format_version", "engine_version", "config", "config_digest",
      "content", "content_digest"}
@@ -1078,20 +1287,20 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
         _require(event_id not in seen, "duplicate event id in symbol event log")
         seen[event_id] = content
 
-    # Partition the accepted events into baseline engine events and TWAP
-    # command events: the engine journal only knows the former plus the child
-    # orders synthesized for released slices, while every TWAP command id lives
-    # solely in the replay log.
+    # Partition the accepted events into baseline engine events and
+    # parent-order command events: the engine journal only knows the former
+    # plus the child orders synthesized for released slices, while every
+    # TWAP/VWAP command id lives solely in the replay log.
     baseline_event_ids: set[str] = set()
-    twap_event_ids: set[str] = set()
+    plan_event_ids: set[str] = set()
     for event_id, content in seen.items():
         try:
             stored_type = json.loads(content).get("type")
         except (ValueError, AttributeError):
             _require(False, f"event log content for {event_id} is not a JSON object")
             stored_type = None
-        if stored_type in _TWAP_TYPES:
-            twap_event_ids.add(event_id)
+        if stored_type in _PLAN_TYPES:
+            plan_event_ids.add(event_id)
         else:
             baseline_event_ids.add(event_id)
 
@@ -1103,7 +1312,10 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
     reserved_child_ids: set[str] = set()
     for entry in plans_raw:
         _require(isinstance(entry, dict), "plan entry must be an object")
-        _require(set(entry) == _PLAN_KEYS, "plan entry has unknown fields")
+        _require(
+            set(entry) == _PLAN_KEYS or set(entry) == _VWAP_PLAN_KEYS,
+            "plan entry has unknown fields",
+        )
         plan = _parse_plan_entry(entry)
         plan_id = plan.plan_id
         _require(plan_id not in plans, f"duplicate execution plan id {plan_id}")
@@ -1274,8 +1486,8 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
         _require(orders[order_id]["side"] == "SELL", f"{order_id} rests on the wrong side")
 
     # The id sets mirror exactly what the baseline engine would hold. The
-    # engine only knows baseline events and synthesized child orders; TWAP
-    # command ids live solely in the replay layer's event log.
+    # engine only knows baseline events and synthesized child orders;
+    # TWAP/VWAP command ids live solely in the replay layer's event log.
     _require(set(order_ids) == set(orders), "order_ids and order records disagree")
     _require(
         set(event_ids) == (baseline_event_ids - set(plan_index)) | released_child_ids,
@@ -1587,8 +1799,9 @@ def replay_events(
         strictly increasing per symbol) and a payload — either inline
         (``"type"`` plus the fields of that event kind) or nested under an
         ``"event"`` object that repeats ``event_id`` and ``type``. Supported
-        kinds are the baseline ADD/CANCEL/REPLACE events and the TWAP
-        TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT commands.
+        kinds are the baseline ADD/CANCEL/REPLACE events and the TWAP/VWAP
+        TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
+        VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
         a resumed run must pass the same configuration the snapshot carries.

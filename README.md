@@ -213,7 +213,7 @@ DAY_END_RECONCILIATION：
 
 ## 多证券有序事件回放
 
-在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，以及可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 仍只属于基线 JSON Lines 入口）。TWAP 计划不读取墙钟，只由 `TWAP_SLICE` 事件推进。
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，以及可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
 
 ### 命令行
 
@@ -238,7 +238,7 @@ response = replay_events(events, config=None, snapshot=None, snapshot_after="las
 - `event_id`：非空字符串，**全流唯一**（跨所有证券）。
 - `symbol`：非空字符串，证券代码；不同证券分别维护序列与簿状态。
 - `sequence`：正整数（布尔值不算整数）；同一证券严格按 `sequence` 递增处理，期望序列为该证券上一成功事件序列加 1。输入顺序即处理顺序，`timestamp`（可选，非负整数或非空字符串）相同或乱序都不得改变输入顺序。
-- 基线订单字段或 TWAP 命令字段可**内联**携带（`type` + 对应字段），也可放在嵌套的 `event` 对象中（该对象必须重复相同的 `event_id` 与 `type`）。内联形式只允许信封字段与该 `type` 自身的字段；嵌套形式只允许信封字段加 `event`，任何未知字段按 `INVALID_EVENT` 拒绝。
+- 基线订单字段或 TWAP/VWAP 命令字段可**内联**携带（`type` + 对应字段），也可放在嵌套的 `event` 对象中（该对象必须重复相同的 `event_id` 与 `type`）。内联形式只允许信封字段与该 `type` 自身的字段；嵌套形式只允许信封字段加 `event`，任何未知字段按 `INVALID_EVENT` 拒绝。
 
 ### 逐事件结果
 
@@ -251,7 +251,7 @@ response = replay_events(events, config=None, snapshot=None, snapshot_after="las
 - `trades`：该事件产生的成交，按发生顺序排列，字段与基线完全一致（`trade_id` 在**各证券内**从 1 连续递增）。
 - `book_changes`：本次盘口变更，`bids` 降序、`asks` 升序；仅列出数量发生变化的档位，被移除的档位以 `"quantity": 0` 表示。
 - `bids`/`asks`：该事件处理后的该证券完整盘口（已知证券的拒绝事件回显未变化盘口；未知证券的预分发拒绝为空盘口且不创建证券）。
-- `execution_plan`：仅 TWAP 命令的结果出现，字段见下文 TWAP 母单一节。
+- `execution_plan`：仅 TWAP/VWAP 命令的结果出现，字段见下文 TWAP 母单与 VWAP 母单两节。
 
 ### TWAP 母单
 
@@ -306,6 +306,35 @@ TWAP_CANCEL 与 TWAP_REPORT 均只携带 `event_id`、`type`、`plan_id`：
 - 业务拒绝（未知/已关闭/重复计划、派生标识冲突）都占用该 `event_id` 并推进该证券序列，但不改变计划或盘口状态；结构非法（`INVALID_EVENT`）不占用。
 - 计划进度、保留标识与累计分析（成交量、成交额、取消量、片量列表）全部进入快照；恢复后继续执行与不中断回放逐字节一致。
 
+### VWAP 母单
+
+VWAP 母单与 TWAP 母单同属**单个证券**的可恢复计划，共用同一 `plan_id` 命名空间、派生标识方案（`plan_id#1 … plan_id#N` 启动即保留）、生命周期（`ACTIVE`/`COMPLETED`/`CANCELLED`）、拒绝码与幂等/序列语义；差别仅在分片方式：VWAP 按调用方给出的成交量曲线分片，同样不读取墙钟，只由 `VWAP_SLICE` 事件释放子单。
+
+VWAP_START：
+
+```json
+{"event_id": "e2", "symbol": "AAA", "sequence": 2, "type": "VWAP_START",
+ "plan_id": "p1", "side": "BUY", "total_quantity": 10, "volume_weights": [1, 2, 3],
+ "order_type": "LIMIT", "benchmark_price": 99, "price": 100, "account_id": "acct-1"}
+```
+
+- `plan_id`、`side`、`order_type`、`benchmark_price`、`price`、`account_id` 的规则与 TWAP_START 完全一致。
+- `total_quantity`：正整数（布尔值不算整数），且不得小于权重个数（每桶先分一单位）。
+- `volume_weights`：非空的正整数数组，每个元素是一个桶的目标权重；桶数即片数。
+- 字段缺失、多出、类型错误、空标识、空权重数组、非正权重、LIMIT/MARKET 价格规则违反、总量小于桶数等均按 `INVALID_EVENT` 拒绝，不占用 `event_id` 与序列。
+- 启动**不撮合**。分片算法：每桶先分一单位；余量按权重比例取整数商分配；取整剩下的单位按除法余数**降序**每桶补一单位，余数相同则较早桶优先。各片数量之和恒等于 `total_quantity`（如总量 10、权重 `[1, 2, 3]` 分为 2、3、5）。
+- 重复 `plan_id`（无论已有计划是 TWAP 还是 VWAP）返回 `DUPLICATE_EXECUTION_PLAN`；派生标识与既有订单或其他计划的保留标识冲突时返回 `DUPLICATE_ORDER_ID`。二者都占用 `event_id` 并推进序列，但不建立计划、不保留任何标识。
+
+VWAP_SLICE / VWAP_CANCEL / VWAP_REPORT 只携带 `event_id`、`type`、`plan_id`，语义与对应 TWAP 命令一致：
+
+- `VWAP_SLICE` 按序释放下一桶：LIMIT 计划生成同价 `IOC` 子单，MARKET 计划生成市价子单，沿用现有撮合、冰山补片与自成交防护规则。未知计划返回 `UNKNOWN_EXECUTION_PLAN`；已关闭计划返回 `EXECUTION_PLAN_CLOSED`。
+- `VWAP_CANCEL` 将未释放片量计入 `cancelled_quantity` 并把计划置为 `CANCELLED`，不改变盘口、成交编号或历史成交。
+- `VWAP_REPORT` 只读返回同一累计汇总；关闭后的计划仍可查询；全部片释放后计划为 `COMPLETED`。
+
+VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`status`、`released_quantity`、`filled_quantity`、`cancelled_quantity`、`remaining_slices`、`executed_notional`、`vwap`、`slippage_notional`），并额外给出 `algorithm: "VWAP"`；`VWAP_SLICE` 成功结果再额外含 `slice_number`、`child_order_id`、`target_weight`（本桶权重）与 `scheduled_quantity`（本桶计划片量）。
+
+计划完整状态（算法、权重曲线、各片数量、进度与累计分析）进入快照；快照格式版本保持 `event-replay/2`，恢复后继续执行与不中断回放逐字节一致。
+
 ### 提交语义与错误码
 
 - 逐事件提交：先前成功事件不会因后续失败回滚；失败事件不留下订单、成交、计数器或盘口变更。
@@ -315,7 +344,7 @@ TWAP_CANCEL 与 TWAP_REPORT 均只携带 `event_id`、`type`、`plan_id`：
 - `EVENT_ID_CONFLICT`：已见 `eventId` 但规范化内容不一致（或用于另一证券）；不再次撮合、不占用序列。
 - `DUPLICATE`：已见 `eventId` 且规范化内容（键排序后的紧凑 JSON）完全一致；不再次撮合、无成交无盘口变更。重试投递携带旧序列时仍识别为重复。
 - 撤单/改单不存在或已终结订单，继续沿用基线拒绝码（如 `UNKNOWN_ORDER`、`DUPLICATE_ORDER_ID`）；这类有效事件与基线一样占用其 `event_id` 并推进该证券序列。
-- TWAP 业务拒绝码：`UNKNOWN_EXECUTION_PLAN`（未知计划）、`EXECUTION_PLAN_CLOSED`（对已关闭计划切片或取消）、`DUPLICATE_EXECUTION_PLAN`（同证券重复 `plan_id`）；派生标识冲突沿用 `DUPLICATE_ORDER_ID`。这些有效命令同样占用 `event_id` 并推进序列，但不改变计划或盘口状态。
+- TWAP/VWAP 业务拒绝码：`UNKNOWN_EXECUTION_PLAN`（未知计划）、`EXECUTION_PLAN_CLOSED`（对已关闭计划切片或取消）、`DUPLICATE_EXECUTION_PLAN`（同证券重复 `plan_id`，TWAP 与 VWAP 共用命名空间）；派生标识冲突沿用 `DUPLICATE_ORDER_ID`。这些有效命令同样占用 `event_id` 并推进序列，但不改变计划或盘口状态。
 - 相同初始状态、配置和事件流产生字段顺序稳定、数值表示一致、可逐字节比较的 JSON（规范化序列化：键排序、紧凑分隔、整数不丢精度、无浮点）。
 
 ### 快照与恢复
@@ -326,7 +355,7 @@ TWAP_CANCEL 与 TWAP_REPORT 均只携带 `event_id`、`type`、`plan_id`：
 
 - `format_version`：格式版本（当前 `event-replay/2`；较 `event-replay/1` 在每证券状态中增加 `plans`、在引擎状态中增加 `reserved_order_ids`）。
 - `engine_version`、`config`（撮合配置摘要）与 `config_digest`（配置的 SHA-256）。
-- `content`：各证券完整状态——价格时间队列顺序（含每档订单 id 队列）、订单剩余量、冰山当前公开量 `visible` 与补量所需 `display_quantity`、各证券最后序列 `last_sequence`、已接受事件日志、TWAP 计划列表 `plans`（计划参数、各片数量、已释放片数与已释放量、成交量、取消量、成交额、生命周期状态）、引擎保留的未释放派生标识 `reserved_order_ids`、累计成交 `trade_log`、生成后续成交标识所需的 `next_trade_id`、账户集合。
+- `content`：各证券完整状态——价格时间队列顺序（含每档订单 id 队列）、订单剩余量、冰山当前公开量 `visible` 与补量所需 `display_quantity`、各证券最后序列 `last_sequence`、已接受事件日志、TWAP/VWAP 计划列表 `plans`（计划参数——VWAP 计划另含 `algorithm` 与 `volume_weights`——各片数量、已释放片数与已释放量、成交量、取消量、成交额、生命周期状态）、引擎保留的未释放派生标识 `reserved_order_ids`、累计成交 `trade_log`、生成后续成交标识所需的 `next_trade_id`、账户集合。
 - `content_digest`：基于规范化内容（连同版本与配置）计算的 SHA-256。
 
 恢复（`restore_replayer(snapshot, config=None)` 或在 `replay_events` 中传 `snapshot=`）先验证版本、配置与摘要，再做结构与内部一致性交叉校验，全部通过后才采纳状态：
