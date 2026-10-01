@@ -4,6 +4,8 @@ __version__ = "0.1.0"
 
 from .event_replay import (
     ACCEPTED,
+    ALGORITHM_TWAP,
+    ALGORITHM_VWAP,
     CONFIG_MISMATCH,
     DUPLICATE,
     DUPLICATE_EXECUTION_PLAN,
@@ -26,6 +28,10 @@ from .event_replay import (
     TWAP_SLICE,
     TWAP_START,
     UNKNOWN_EXECUTION_PLAN,
+    VWAP_CANCEL,
+    VWAP_REPORT,
+    VWAP_SLICE,
+    VWAP_START,
     canonical_json,
     export_snapshot,
     replay_events,
@@ -34,6 +40,8 @@ from .event_replay import (
 
 __all__ = [
     "ACCEPTED",
+    "ALGORITHM_TWAP",
+    "ALGORITHM_VWAP",
     "CONFIG_MISMATCH",
     "DUPLICATE",
     "DUPLICATE_EXECUTION_PLAN",
@@ -56,6 +64,10 @@ __all__ = [
     "TWAP_SLICE",
     "TWAP_START",
     "UNKNOWN_EXECUTION_PLAN",
+    "VWAP_CANCEL",
+    "VWAP_REPORT",
+    "VWAP_SLICE",
+    "VWAP_START",
     "canonical_json",
     "export_snapshot",
     "replay_events",
