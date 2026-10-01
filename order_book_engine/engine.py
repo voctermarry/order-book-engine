@@ -7,6 +7,7 @@ Rejected events never mutate engine state.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections import deque
 
@@ -71,21 +72,36 @@ def _is_non_empty_str(value: object) -> bool:
 class Engine:
     """Stateful replay engine processing events in arrival order."""
 
-    def __init__(self) -> None:
-        self._event_ids: set[str] = set()
-        self._order_ids: set[str] = set()
-        self._orders: dict[str, dict[str, object]] = {}
-        self._bids: dict[int, deque[str]] = {}
-        self._asks: dict[int, deque[str]] = {}
-        self._bid_totals: dict[int, int] = {}
-        self._ask_totals: dict[int, int] = {}
+    def __init__(self, _state: dict[str, object] | None = None) -> None:
+        if _state is not None:
+            # Internal fast path used when restoring an authoritative snapshot:
+            # the state dict is owned by the caller's snapshot machinery, not by
+            # user input, so it can be adopted verbatim without copying.
+            self._event_ids: set[str] = _state["event_ids"]
+            self._order_ids: set[str] = _state["order_ids"]
+            self._orders: dict[str, dict[str, object]] = _state["orders"]
+            self._bids: dict[int, deque[str]] = _state["bids"]
+            self._asks: dict[int, deque[str]] = _state["asks"]
+            self._bid_totals: dict[int, int] = _state["bid_totals"]
+            self._ask_totals: dict[int, int] = _state["ask_totals"]
+            self._next_trade_id: int = _state["next_trade_id"]
+            self._accounts: set[str] = _state["accounts"]
+            self._trade_log: list[dict[str, object]] = _state["trade_log"]
+            return
+        self._event_ids = set()
+        self._order_ids = set()
+        self._orders = {}
+        self._bids = {}
+        self._asks = {}
+        self._bid_totals = {}
+        self._ask_totals = {}
         self._next_trade_id = 1
         # Accounts seen on any accepted ADD, however the orders ended up.
-        self._accounts: set[str] = set()
+        self._accounts = set()
         # Every trade ever executed, in trade_id order, tagged with the id of
         # the event that produced it. Execution reports are built from this
         # journal; matching output keeps its historical shape.
-        self._trade_log: list[dict[str, object]] = []
+        self._trade_log = []
 
     def handle_line(self, line: str) -> tuple[str | None, str, str | None, list[dict[str, object]]]:
         """Process one input line (without line terminator).
@@ -841,3 +857,42 @@ class Engine:
             for price in sorted(self._ask_totals)
         ]
         return bids, asks
+
+    def level_totals(self) -> tuple[dict[int, int], dict[int, int]]:
+        """Raw visible-quantity aggregates keyed by price (bid, then ask)."""
+        return self._bid_totals, self._ask_totals
+
+    def dump_state(self) -> dict[str, object]:
+        """Export the complete mutable engine state for an authoritative owner.
+
+        Containers are deep-copied so later processing cannot mutate the export.
+        The state includes enough to preserve price-time queue priority, order
+        remainders, iceberg slice/reserve bookkeeping, spent event/order ids,
+        the cumulative trade journal and the next trade id counter.
+        """
+        return {
+            "event_ids": set(self._event_ids),
+            "order_ids": set(self._order_ids),
+            "orders": copy.deepcopy(self._orders),
+            "bids": {p: deque(q) for p, q in self._bids.items()},
+            "asks": {p: deque(q) for p, q in self._asks.items()},
+            "bid_totals": dict(self._bid_totals),
+            "ask_totals": dict(self._ask_totals),
+            "next_trade_id": self._next_trade_id,
+            "accounts": set(self._accounts),
+            "trade_log": copy.deepcopy(self._trade_log),
+        }
+
+    def load_state(self, state: dict[str, object]) -> Engine:
+        """Replace this engine's whole state from an authoritative export."""
+        self._event_ids = set(state["event_ids"])
+        self._order_ids = set(state["order_ids"])
+        self._orders = copy.deepcopy(state["orders"])
+        self._bids = {p: deque(q) for p, q in state["bids"].items()}
+        self._asks = {p: deque(q) for p, q in state["asks"].items()}
+        self._bid_totals = dict(state["bid_totals"])
+        self._ask_totals = dict(state["ask_totals"])
+        self._next_trade_id = state["next_trade_id"]
+        self._accounts = set(state["accounts"])
+        self._trade_log = copy.deepcopy(state["trade_log"])
+        return self

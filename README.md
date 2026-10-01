@@ -25,7 +25,8 @@ python -m pytest
 ```bash
 order-book-engine version    # 打印版本号
 order-book-engine --help     # 打印用法
-order-book-engine replay     # 从标准输入回放订单事件
+order-book-engine replay     # 从标准输入回放单证券 JSON Lines 订单事件
+order-book-engine events     # 从标准输入读取一个多证券有序事件 JSON 文档
 ```
 
 ## replay 输入输出约定
@@ -180,5 +181,78 @@ ACCOUNT_REPORT：
 
 ## 现有公开接口
 
-- 命令行程序 `order-book-engine`（`version`、`replay`）
+- 命令行程序 `order-book-engine`（`version`、`replay`、`events`）
 - Python 包 `order_book_engine`，其 `__version__` 为当前版本号
+- 多证券有序事件回放与快照（`replay_events`、`EventReplayer`、`export_snapshot`、`restore_replayer`、`canonical_json`、`SnapshotError`），见下文。
+
+## 多证券有序事件回放
+
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件仅覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT` 仍只属于基线 JSON Lines 入口）。
+
+### 命令行
+
+```bash
+order-book-engine events < request.json > response.json
+```
+
+标准输入读取**一个** UTF-8 JSON 请求文档，标准输出写出**一个** UTF-8 JSON 响应文档；程序不读写任何文件，快照只通过文档收发。请求非法时退出码为 2 并输出 `{"error":{"code":...,"message":...}}`；IO 失败时退出码为 1 且标准错误输出单行 `ERROR_IO`。
+
+### Python 入口
+
+```python
+from order_book_engine import replay_events
+response = replay_events(events, config=None, snapshot=None, snapshot_after="last")
+# {"results": [...], "snapshot": {...} | None}
+```
+
+### 请求事件
+
+每个事件是一个 JSON 对象，信封字段：
+
+- `event_id`：非空字符串，**全流唯一**（跨所有证券）。
+- `symbol`：非空字符串，证券代码；不同证券分别维护序列与簿状态。
+- `sequence`：正整数（布尔值不算整数）；同一证券严格按 `sequence` 递增处理，期望序列为该证券上一成功事件序列加 1。输入顺序即处理顺序，`timestamp`（可选，非负整数或非空字符串）相同或乱序都不得改变输入顺序。
+- 基线订单字段可**内联**携带（`type` + 基线 ADD/CANCEL/REPLACE 字段），也可放在嵌套的 `event` 对象中（该对象必须重复相同的 `event_id` 与 `type`）。内联形式只允许信封字段与基线字段；嵌套形式只允许信封字段加 `event`，任何未知字段按 `INVALID_EVENT` 拒绝。
+
+### 逐事件结果
+
+每个结果都关联 `event_id`、`symbol`、`sequence`，并含：
+
+- `status`：`ACCEPTED`（已接受）、`REJECTED`（业务拒绝）或 `DUPLICATE`（幂等重复）。
+- `result`：仅 `ACCEPTED` 时出现，沿用基线结果码（`RESTING`、`FILLED`、`REPLACED`、`CANCELLED` 等）。
+- `rejection_code`：仅 `REJECTED` 时出现，见下文错误码。
+- `expected_sequence`：序列类拒绝时给出该证券当前期望序列。
+- `trades`：该事件产生的成交，按发生顺序排列，字段与基线完全一致（`trade_id` 在**各证券内**从 1 连续递增）。
+- `book_changes`：本次盘口变更，`bids` 降序、`asks` 升序；仅列出数量发生变化的档位，被移除的档位以 `"quantity": 0` 表示。
+- `bids`/`asks`：该事件处理后的该证券完整盘口（已知证券的拒绝事件回显未变化盘口；未知证券的预分发拒绝为空盘口且不创建证券）。
+
+### 提交语义与错误码
+
+- 逐事件提交：先前成功事件不会因后续失败回滚；失败事件不留下订单、成交、计数器或盘口变更。
+- `INVALID_EVENT`：信封/必填字段缺失、非法数值、未知事件类型、载荷与信封不一致等（对应基线结构错误，不占用 `event_id` 与序列）。
+- `SEQUENCE_GAP`：当前证券序列出现空洞（大于期望值）；不占用该序列与 `event_id`，修正后的事件可立即提交。
+- `OUT_OF_ORDER`：序列倒退（小于期望值）。
+- `EVENT_ID_CONFLICT`：已见 `eventId` 但规范化内容不一致（或用于另一证券）；不再次撮合、不占用序列。
+- `DUPLICATE`：已见 `eventId` 且规范化内容（键排序后的紧凑 JSON）完全一致；不再次撮合、无成交无盘口变更。重试投递携带旧序列时仍识别为重复。
+- 撤单/改单不存在或已终结订单，继续沿用基线拒绝码（如 `UNKNOWN_ORDER`、`DUPLICATE_ORDER_ID`）；这类有效事件与基线一样占用其 `event_id` 并推进该证券序列。
+- 相同初始状态、配置和事件流产生字段顺序稳定、数值表示一致、可逐字节比较的 JSON（规范化序列化：键排序、紧凑分隔、整数不丢精度、无浮点）。
+
+### 快照与恢复
+
+`replay_events` 默认在响应中附带处理完最后一个事件后的 `snapshot`；`snapshot_after=None` 可省略，`snapshot_after={"symbol": ..., "sequence": ...}` 可在指定的**已接受**事件之后导出。有状态的会话也可用 `EventReplayer`（`submit`/`book`）配合 `export_snapshot`/`restore_replayer` 增量处理。
+
+快照是 JSON 对象：
+
+- `format_version`：格式版本（当前 `event-replay/1`）。
+- `engine_version`、`config`（撮合配置摘要）与 `config_digest`（配置的 SHA-256）。
+- `content`：各证券完整状态——价格时间队列顺序（含每档订单 id 队列）、订单剩余量、冰山当前公开量 `visible` 与补量所需 `display_quantity`、各证券最后序列 `last_sequence`、已接受事件日志、累计成交 `trade_log`、生成后续成交标识所需的 `next_trade_id`、账户集合。
+- `content_digest`：基于规范化内容（连同版本与配置）计算的 SHA-256。
+
+恢复（`restore_replayer(snapshot, config=None)` 或在 `replay_events` 中传 `snapshot=`）先验证版本、配置与摘要，再做结构与内部一致性交叉校验，全部通过后才采纳状态：
+
+- 摘要不符：`SNAPSHOT_CORRUPT`。
+- 版本不支持：`SNAPSHOT_VERSION_UNSUPPORTED`。
+- 配置或配置摘要不一致：`CONFIG_MISMATCH`。
+- 任何恢复失败都抛出 `SnapshotError`（其 `code` 为上述代码）且不创建部分恢复状态；CLI 将其映射为退出码 2 的错误文档。
+- 恢复成功后继续生成的逐笔成交标识、成交顺序和最终结果，与不中断的一次性回放完全一致（逐字节比较）。
+
