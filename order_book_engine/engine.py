@@ -13,6 +13,7 @@ from collections import deque
 ADD = "ADD"
 CANCEL = "CANCEL"
 REPLACE = "REPLACE"
+EXECUTION_REPORT = "EXECUTION_REPORT"
 BUY = "BUY"
 SELL = "SELL"
 LIMIT = "LIMIT"
@@ -33,6 +34,10 @@ UNFILLED_CANCELLED = "UNFILLED_CANCELLED"
 SELF_TRADE_PREVENTED = "SELF_TRADE_PREVENTED"
 CANCELLED = "CANCELLED"
 REJECTED = "REJECTED"
+REPORTED = "REPORTED"
+
+MAKER = "MAKER"
+TAKER = "TAKER"
 
 INVALID_JSON = "INVALID_JSON"
 INVALID_SCHEMA = "INVALID_SCHEMA"
@@ -45,6 +50,7 @@ _ALL_KEYS = frozenset(
      "time_in_force", "display_quantity", "account_id"}
 )
 _CANCEL_KEYS = frozenset({"event_id", "type", "order_id"})
+_REPORT_KEYS = frozenset({"event_id", "type", "order_id", "benchmark_price"})
 _REQUIRED_ADD_KEYS = frozenset({"event_id", "type", "order_id", "side", "order_type", "quantity"})
 _REQUIRED_REPLACE_KEYS = frozenset({"event_id", "type", "order_id", "quantity", "price"})
 _ALLOWED_REPLACE_KEYS = _REQUIRED_REPLACE_KEYS | {"display_quantity"}
@@ -67,6 +73,10 @@ class Engine:
         self._bid_totals: dict[int, int] = {}
         self._ask_totals: dict[int, int] = {}
         self._next_trade_id = 1
+        # Every trade ever executed, in trade_id order, tagged with the id of
+        # the event that produced it. Execution reports are built from this
+        # journal; matching output keeps its historical shape.
+        self._trade_log: list[dict[str, object]] = []
 
     def handle_line(self, line: str) -> tuple[str | None, str, str | None, list[dict[str, object]]]:
         """Process one input line (without line terminator).
@@ -83,27 +93,47 @@ class Engine:
     ) -> tuple[str | None, str, str | None, list[dict[str, object]], dict[str, object] | None]:
         """Like :meth:`handle_line`, additionally returning the self-trade
         prevention descriptor (``None`` for every other result)."""
+        event_id, result, reason, trades, stp, _analysis = self.handle_line_extended(line)
+        return event_id, result, reason, trades, stp
+
+    def handle_line_extended(
+        self, line: str
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Like :meth:`handle_line_full`, additionally returning the execution
+        analysis of an ``EXECUTION_REPORT`` query (``None`` otherwise)."""
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            return None, REJECTED, INVALID_JSON, [], None
-        return self.handle_object(obj)
+            return None, REJECTED, INVALID_JSON, [], None, None
+        return self.handle_object_extended(obj)
 
     def handle_object(
         self, obj: object
     ) -> tuple[str | None, str, str | None, list[dict[str, object]], dict[str, object] | None]:
+        event_id, result, reason, trades, stp, _analysis = self.handle_object_extended(obj)
+        return event_id, result, reason, trades, stp
+
+    def handle_object_extended(
+        self, obj: object
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None, dict[str, object] | None,
+    ]:
         if not isinstance(obj, dict):
-            return None, REJECTED, INVALID_SCHEMA, [], None
+            return None, REJECTED, INVALID_SCHEMA, [], None, None
 
         event_id = obj.get("event_id")
         event_id_out = event_id if isinstance(event_id, str) else None
 
         schema_error = self._schema_error(obj)
         if schema_error is not None:
-            return event_id_out, REJECTED, schema_error, [], None
+            return event_id_out, REJECTED, schema_error, [], None, None
 
         if event_id in self._event_ids:
-            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None
+            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None, None
         if obj["type"] == REPLACE and "display_quantity" in obj:
             target = self._orders.get(obj["order_id"])
             if (
@@ -113,27 +143,43 @@ class Engine:
             ):
                 # Only an iceberg target may be replaced with a display slice;
                 # like every schema error this consumes no event id.
-                return event_id, REJECTED, INVALID_SCHEMA, [], None
+                return event_id, REJECTED, INVALID_SCHEMA, [], None, None
         # The event is well formed, so its id occupies the stream from here,
         # even if a later business rule rejects it.
         self._event_ids.add(event_id)
 
         if obj["type"] == CANCEL:
             event_id, result, reason, trades = self._cancel(event_id, obj["order_id"])
-            return event_id, result, reason, trades, None
+            return event_id, result, reason, trades, None, None
         if obj["type"] == REPLACE:
-            return self._replace(event_id, obj)
-        return self._add(event_id, obj)
+            event_id, result, reason, trades, stp = self._replace(event_id, obj)
+            return event_id, result, reason, trades, stp, None
+        if obj["type"] == EXECUTION_REPORT:
+            return self._execution_report(event_id, obj)
+        event_id, result, reason, trades, stp = self._add(event_id, obj)
+        return event_id, result, reason, trades, stp, None
 
     @staticmethod
     def _schema_error(obj: dict[str, object]) -> str | None:
         keys = set(obj)
+        event_type = obj.get("type")
+        if event_type == EXECUTION_REPORT:
+            # A pure query: exactly the four fields, string identifiers and a
+            # positive integer benchmark (booleans are not integers).
+            if keys != _REPORT_KEYS:
+                return INVALID_SCHEMA
+            if not isinstance(obj.get("event_id"), str):
+                return INVALID_SCHEMA
+            if not isinstance(obj.get("order_id"), str):
+                return INVALID_SCHEMA
+            if not _is_positive_int(obj.get("benchmark_price")):
+                return INVALID_SCHEMA
+            return None
         if not keys <= _ALL_KEYS:
             return INVALID_SCHEMA
         if not isinstance(obj.get("event_id"), str):
             return INVALID_SCHEMA
 
-        event_type = obj.get("type")
         if event_type == CANCEL:
             if keys != _CANCEL_KEYS:
                 return INVALID_SCHEMA
@@ -297,7 +343,7 @@ class Engine:
                 return event_id, SELF_TRADE_PREVENTED, None, [], stp
 
         remaining, trades, stp_maker = self._match(
-            order_id, side, limit, remaining, account_id
+            event_id, order_id, side, limit, remaining, account_id
         )
 
         record = {"side": side, "price": limit}
@@ -394,6 +440,7 @@ class Engine:
 
     def _match(
         self,
+        event_id: str,
         order_id: str,
         side: str,
         limit: int | None,
@@ -436,15 +483,15 @@ class Engine:
                 maker["remaining"] -= matched
                 remaining -= matched
                 totals[price] -= matched
-                trades.append(
-                    {
-                        "trade_id": self._next_trade_id,
-                        "maker_order_id": maker_id,
-                        "taker_order_id": order_id,
-                        "price": price,
-                        "quantity": matched,
-                    }
-                )
+                trade: dict[str, object] = {
+                    "trade_id": self._next_trade_id,
+                    "maker_order_id": maker_id,
+                    "taker_order_id": order_id,
+                    "price": price,
+                    "quantity": matched,
+                }
+                trades.append(trade)
+                self._trade_log.append({**trade, "event_id": event_id})
                 self._next_trade_id += 1
                 if maker.get("visible") is not None:
                     maker["visible"] -= matched
@@ -531,7 +578,7 @@ class Engine:
 
         price: int = obj["price"]
         remaining, trades, stp_maker = self._match(
-            order_id, side, price, obj["quantity"], account_id
+            event_id, order_id, side, price, obj["quantity"], account_id
         )
 
         new_record: dict[str, object] = {"side": side, "price": price}
@@ -581,6 +628,80 @@ class Engine:
         record["status"] = CANCELLED
         record["remaining"] = 0
         return event_id, CANCELLED, None, []
+
+    def _execution_report(
+        self, event_id: str, obj: dict[str, object]
+    ) -> tuple[
+        str, str, str | None,
+        list[dict[str, object]], dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Answer a cumulative execution query without touching any state.
+
+        Every trade the order ever took part in is attributed to its original
+        ``order_id``: replacements keep the id and iceberg replenishment slices
+        trade under the same maker id, so the journal lookup alone gathers the
+        full history, whether the order acted as maker or taker.
+        """
+        order_id: str = obj["order_id"]
+        record = self._orders.get(order_id)
+        if record is None:
+            return event_id, REJECTED, UNKNOWN_ORDER, [], None, None
+
+        side: str = record["side"]
+        status: str = record["status"]
+        # A resting order's remaining total includes the iceberg reserve; a
+        # finished order has nothing open.
+        open_quantity = record["remaining"] if status == RESTING else 0
+
+        attribution: list[dict[str, object]] = []
+        filled_quantity = 0
+        executed_notional = 0
+        for trade in self._trade_log:
+            if trade["maker_order_id"] == order_id:
+                role = MAKER
+                counterparty = trade["taker_order_id"]
+            elif trade["taker_order_id"] == order_id:
+                role = TAKER
+                counterparty = trade["maker_order_id"]
+            else:
+                continue
+            filled_quantity += trade["quantity"]
+            executed_notional += trade["price"] * trade["quantity"]
+            attribution.append(
+                {
+                    "trade_id": trade["trade_id"],
+                    "role": role,
+                    "counterparty_order_id": counterparty,
+                    "event_id": trade["event_id"],
+                    "price": trade["price"],
+                    "quantity": trade["quantity"],
+                }
+            )
+
+        if filled_quantity:
+            vwap: dict[str, int] | None = {
+                "numerator": executed_notional,
+                "denominator": filled_quantity,
+            }
+        else:
+            vwap = None
+        benchmark_price: int = obj["benchmark_price"]
+        slippage = executed_notional - benchmark_price * filled_quantity
+        if side == SELL:
+            # Mirror the buy formula: negative always means improvement.
+            slippage = -slippage
+
+        analysis: dict[str, object] = {
+            "side": side,
+            "current_status": status,
+            "open_quantity": open_quantity,
+            "filled_quantity": filled_quantity,
+            "executed_notional": executed_notional,
+            "vwap": vwap,
+            "slippage_notional": slippage,
+            "trade_attribution": attribution,
+        }
+        return event_id, REPORTED, None, [], None, analysis
 
     def snapshot(self) -> tuple[list[dict[str, int]], list[dict[str, int]]]:
         bids = [

@@ -1696,3 +1696,269 @@ def test_replay_without_account_id_is_byte_for_byte_compatible():
         '"bids":[],"asks":[{"price":100,"quantity":5}]}'
     )
     assert out.splitlines()[0] == expected_first
+
+
+# --------------------------------------------------------------------------
+# EXECUTION_REPORT queries
+# --------------------------------------------------------------------------
+
+
+def report(event_id, order_id, benchmark_price):
+    return json.dumps(
+        {
+            "event_id": event_id,
+            "type": "EXECUTION_REPORT",
+            "order_id": order_id,
+            "benchmark_price": benchmark_price,
+        }
+    )
+
+
+def query(engine, line):
+    return engine.handle_line_extended(line)
+
+
+def test_execution_report_taker_and_maker_views_of_one_trade():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 5, 100)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 3, 100))
+
+    eid, result, reason, trades, stp, analysis = query(engine, report("e3", "b1", 100))
+    assert (eid, result, reason, trades, stp) == ("e3", "REPORTED", None, [], None)
+    assert analysis == {
+        "side": "BUY",
+        "current_status": "FILLED",
+        "open_quantity": 0,
+        "filled_quantity": 3,
+        "executed_notional": 300,
+        "vwap": {"numerator": 300, "denominator": 3},
+        "slippage_notional": 0,
+        "trade_attribution": [
+            {"trade_id": 1, "role": "TAKER", "counterparty_order_id": "s1",
+             "event_id": "e2", "price": 100, "quantity": 3}
+        ],
+    }
+
+    # The maker side of the same trade, still resting with its leftover.
+    *_, analysis = query(engine, report("e4", "s1", 99))
+    assert analysis["side"] == "SELL"
+    assert analysis["current_status"] == "RESTING"
+    assert analysis["open_quantity"] == 2
+    assert analysis["filled_quantity"] == 3
+    assert analysis["executed_notional"] == 300
+    assert analysis["vwap"] == {"numerator": 300, "denominator": 3}
+    # Sold at 100 against a benchmark of 99: 3 units of improvement.
+    assert analysis["slippage_notional"] == -3
+    assert analysis["trade_attribution"] == [
+        {"trade_id": 1, "role": "MAKER", "counterparty_order_id": "b1",
+         "event_id": "e2", "price": 100, "quantity": 3}
+    ]
+
+
+def test_execution_report_slippage_sign_convention():
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 5, 100)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 5, 100))
+
+    # A buy above benchmark is positive (worse), below is negative (better).
+    *_, analysis = query(engine, report("e3", "b1", 110))
+    assert analysis["slippage_notional"] == 500 - 550
+    *_, analysis = query(engine, report("e4", "b1", 90))
+    assert analysis["slippage_notional"] == 500 - 450
+    # The sell side mirrors the formula around its own benchmark.
+    *_, analysis = query(engine, report("e5", "s1", 110))
+    assert analysis["slippage_notional"] == 550 - 500
+    *_, analysis = query(engine, report("e6", "s1", 90))
+    assert analysis["slippage_notional"] == 450 - 500
+
+
+def test_execution_report_aggregates_across_replace():
+    engine, _ = book_after([add("e1", "b1", "BUY", "LIMIT", 5, 100)])
+    engine.handle_line(add("e2", "s1", "SELL", "LIMIT", 2, 100))   # b1 makes 2@100
+    assert engine.handle_line(replace("e3", "b1", 4, 101))[1] == "REPLACED"
+    engine.handle_line(add("e4", "s2", "SELL", "LIMIT", 4, 101))   # b1 makes 4@101
+
+    *_, analysis = query(engine, report("e5", "b1", 100))
+    assert analysis["current_status"] == "FILLED"
+    assert analysis["open_quantity"] == 0
+    assert analysis["filled_quantity"] == 6
+    assert analysis["executed_notional"] == 2 * 100 + 4 * 101
+    assert analysis["vwap"] == {"numerator": 604, "denominator": 6}
+    assert analysis["slippage_notional"] == 604 - 600
+    assert analysis["trade_attribution"] == [
+        {"trade_id": 1, "role": "MAKER", "counterparty_order_id": "s1",
+         "event_id": "e2", "price": 100, "quantity": 2},
+        {"trade_id": 2, "role": "MAKER", "counterparty_order_id": "s2",
+         "event_id": "e4", "price": 101, "quantity": 4},
+    ]
+
+
+def test_execution_report_iceberg_open_quantity_includes_reserve():
+    engine, _ = book_after([iceberg("e1", "i1", "SELL", 10, 100, 3)])
+
+    *_, analysis = query(engine, report("e2", "i1", 100))
+    assert analysis["current_status"] == "RESTING"
+    assert analysis["open_quantity"] == 10
+    assert analysis["filled_quantity"] == 0
+    assert analysis["executed_notional"] == 0
+    assert analysis["vwap"] is None
+    assert analysis["slippage_notional"] == 0
+    assert analysis["trade_attribution"] == []
+
+    # Replenished slices trade under the same maker id and one event id.
+    engine.handle_line(add("e3", "b1", "BUY", "LIMIT", 4, 100))
+    *_, analysis = query(engine, report("e4", "i1", 100))
+    assert analysis["open_quantity"] == 6
+    assert analysis["filled_quantity"] == 4
+    assert analysis["executed_notional"] == 400
+    assert analysis["vwap"] == {"numerator": 400, "denominator": 4}
+    assert analysis["trade_attribution"] == [
+        {"trade_id": 1, "role": "MAKER", "counterparty_order_id": "b1",
+         "event_id": "e3", "price": 100, "quantity": 3},
+        {"trade_id": 2, "role": "MAKER", "counterparty_order_id": "b1",
+         "event_id": "e3", "price": 100, "quantity": 1},
+    ]
+
+
+def test_execution_report_finished_orders_stay_queryable():
+    # Cancelled without ever trading.
+    engine, _ = book_after([add("e1", "b1", "BUY", "LIMIT", 3, 100)])
+    engine.handle_line(cancel("e2", "b1"))
+    *_, analysis = query(engine, report("e3", "b1", 100))
+    assert analysis["current_status"] == "CANCELLED"
+    assert analysis["open_quantity"] == 0
+    assert analysis["filled_quantity"] == 0
+    assert analysis["vwap"] is None
+    assert analysis["trade_attribution"] == []
+
+    # IOC taker: partially filled, leftover cancelled.
+    engine, _ = book_after([add("e1", "s1", "SELL", "LIMIT", 2, 100)])
+    engine.handle_line(add("e2", "b1", "BUY", "LIMIT", 5, 100, time_in_force="IOC"))
+    *_, analysis = query(engine, report("e3", "b1", 100))
+    assert analysis["current_status"] == "CANCELLED"
+    assert analysis["open_quantity"] == 0
+    assert analysis["filled_quantity"] == 2
+    assert analysis["trade_attribution"][0]["role"] == "TAKER"
+
+
+def test_execution_report_does_not_change_state_or_trade_ids():
+    engine, _ = book_after(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 2, 100),
+            add("e2", "s2", "SELL", "LIMIT", 2, 100),
+        ]
+    )
+    before = engine.snapshot()
+    assert query(engine, report("e3", "s1", 100))[1] == "REPORTED"
+    assert engine.snapshot() == before
+
+    # The next trade still gets the id it would have had without the query.
+    _, _, _, trades = engine.handle_line(add("e4", "b1", "BUY", "LIMIT", 2, 100))
+    assert [t["trade_id"] for t in trades] == [1]
+    assert [t["maker_order_id"] for t in trades] == ["s1"]
+
+
+def test_execution_report_unknown_order_occupies_event_id():
+    engine, _ = book_after([add("e1", "o1", "BUY", "LIMIT", 1, 100)])
+    line = report("e2", "missing", 100)
+    assert query(engine, line)[1:3] == ("REJECTED", "UNKNOWN_ORDER")
+    assert query(engine, line)[1:3] == ("REJECTED", "DUPLICATE_EVENT_ID")
+
+    # An order id that was never accepted is unknown; a well-formed report on
+    # a real order keeps working afterwards.
+    assert query(engine, report("e3", "o1", 100))[1] == "REPORTED"
+
+
+def test_execution_report_schema_rejections_consume_no_event_id():
+    engine, _ = book_after([add("e0", "o1", "BUY", "LIMIT", 5, 100)])
+    base = {"event_id": "eR", "type": "EXECUTION_REPORT", "order_id": "o1",
+            "benchmark_price": 100}
+    payloads = [
+        {k: v for k, v in base.items() if k != "order_id"},        # missing order_id
+        {k: v for k, v in base.items() if k != "benchmark_price"},  # missing benchmark
+        {k: v for k, v in base.items() if k != "event_id"},        # missing event_id
+        {**base, "side": "BUY"},                                   # extra field
+        {**base, "quantity": 1},                                   # extra field
+        {**base, "event_id": 7},                                   # non-string event id
+        {**base, "order_id": 7},                                   # non-string order id
+        {**base, "benchmark_price": True},                         # bool benchmark
+        {**base, "benchmark_price": 0},                            # non-positive
+        {**base, "benchmark_price": -5},                           # negative
+        {**base, "benchmark_price": 1.5},                          # float
+        {**base, "benchmark_price": "100"},                        # string
+        {**base, "benchmark_price": None},                         # null
+    ]
+    for payload in payloads:
+        assert query(engine, json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), payload
+        # Structural errors never occupy the event id.
+        assert query(engine, json.dumps(payload))[1:3] == (
+            "REJECTED", "INVALID_SCHEMA"
+        ), payload
+
+    # The book is untouched and the event id is still free.
+    assert engine.snapshot() == ([{"price": 100, "quantity": 5}], [])
+    assert query(engine, json.dumps(base))[1] == "REPORTED"
+
+
+def test_execution_report_duplicate_event_id():
+    engine, _ = book_after([add("e1", "o1", "BUY", "LIMIT", 1, 100)])
+    line = report("e2", "o1", 100)
+    assert query(engine, line)[1] == "REPORTED"
+    assert query(engine, line)[1:3] == ("REJECTED", "DUPLICATE_EVENT_ID")
+
+
+def test_execution_report_benchmark_price_field_is_report_only():
+    # benchmark_price remains an unknown field for every other event type.
+    engine = Engine()
+    assert engine.handle_line(
+        add("e1", "o1", "BUY", "LIMIT", 1, 100, benchmark_price=100)
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+    assert engine.handle_line(
+        json.dumps({"event_id": "e2", "type": "CANCEL", "order_id": "o1",
+                    "benchmark_price": 100})
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+    assert engine.handle_line(
+        json.dumps({"event_id": "e3", "type": "REPLACE", "order_id": "o1",
+                    "quantity": 1, "price": 100, "benchmark_price": 100})
+    )[1:3] == ("REJECTED", "INVALID_SCHEMA")
+
+
+def test_replay_execution_report_shape_and_byte_determinism():
+    stream = "\n".join(
+        [
+            add("e1", "s1", "SELL", "LIMIT", 5, 100),
+            add("e2", "b1", "BUY", "LIMIT", 3, 100),
+            report("e3", "b1", 101),
+            report("e4", "gone", 100),
+            report("e3", "b1", 101),
+        ]
+    ) + "\n"
+    code, out1, err = run_replay(stream)
+    assert code == 0
+    assert err == ""
+    _, out2, _ = run_replay(stream)
+    assert out2 == out1
+
+    lines = out1.splitlines()
+    records = [json.loads(line) for line in lines]
+    assert [r["result"] for r in records] == [
+        "RESTING", "FILLED", "REPORTED", "REJECTED", "REJECTED",
+    ]
+    # Only the report carries the analysis; every record keeps trades/bids/asks.
+    assert ["execution_analysis" in r for r in records] == [False, False, True, False, False]
+    analysis = records[2]["execution_analysis"]
+    assert analysis["filled_quantity"] == 3
+    assert analysis["slippage_notional"] == 300 - 303
+    assert records[2]["trades"] == []
+    # The query echoes the book without changing it.
+    assert records[2]["asks"] == records[1]["asks"] == [{"price": 100, "quantity": 2}]
+    assert records[3]["reason"] == "UNKNOWN_ORDER"
+    assert "execution_analysis" not in records[3]
+    assert records[4]["reason"] == "DUPLICATE_EVENT_ID"
+    # The analysis is serialized after the result and before the trades.
+    report_line = lines[2]
+    assert (
+        report_line.index('"result"')
+        < report_line.index('"execution_analysis"')
+        < report_line.index('"trades"')
+    )

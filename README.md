@@ -84,6 +84,30 @@ REPLACE：
 
 替换成功时先移除目标全部余量，再将新委托作为本事件到达的 GTC 委托处理：即使参数未变也失去原队列优先级，不会与旧状态成交，但可作为 taker 撮合其他订单。无成交且余量入簿时 `result` 为 `REPLACED`，部分成交后入簿为 `PARTIALLY_FILLED_RESTING`，全部成交为 `FILLED`。冰山余量仅展示 `min(display_quantity, remaining)`，补片仍排到同价队尾。替换沿用原 `order_id`，不触发 `DUPLICATE_ORDER_ID`，且该 id 不允许后续 ADD 重用；移除、撮合与余量入簿是不可分割的状态变更。目标未知的有效事件占用 `event_id`，结构错误不占用。
 
+EXECUTION_REPORT：
+
+```json
+{"event_id": "e4", "type": "EXECUTION_REPORT", "order_id": "o1", "benchmark_price": 100}
+```
+
+按 `order_id` 查询某个已接受订单的累计执行情况，是相对 `benchmark_price` 的只读分析，不撮合、不改变订单簿、队列顺序或下一个成交编号：
+
+- `event_id`：全流唯一字符串。
+- `order_id`：目标订单，必须为字符串；任何已被接受的订单均可查询（包括在簿、已成交、已撤销的订单），不存在时返回 `UNKNOWN_ORDER` 且占用 `event_id`。
+- `benchmark_price`：正整数基准价（布尔值不算整数）。
+- 字段缺失、多出或标识非字符串时按 `INVALID_SCHEMA` 拒绝，不占用 `event_id`；重复事件返回 `DUPLICATE_EVENT_ID`。
+
+查询成功时 `result` 为 `REPORTED`，`trades` 为空，`bids`/`asks` 为当前盘口，并在 `result` 之后附加 `execution_analysis`：
+
+- `side`：`BUY` 或 `SELL`。
+- `current_status`：`RESTING`、`FILLED` 或 `CANCELLED`。
+- `open_quantity`：在簿订单的总余量（ICEBERG 含未公开储备）；其他状态为零。
+- `filled_quantity`：累计成交数量。
+- `executed_notional`：成交价乘数量的总和。
+- `vwap`：无成交时为 `null`，否则为 `{"numerator": executed_notional, "denominator": filled_quantity}`。
+- `slippage_notional`：买单为 `executed_notional − benchmark_price × filled_quantity`，卖单取相反数；负值表示相对基准改善。
+- `trade_attribution`：按 `trade_id` 升序的成交归因，每项含 `trade_id`、`role`（`MAKER` 或 `TAKER`）、`counterparty_order_id`（对手订单）、`event_id`（产生该成交的事件）、`price`、`quantity`。maker 与 taker 成交均归集到本订单；REPLACE 前后与 ICEBERG 补片的成交都计入原 `order_id`。
+
 ### 撮合规则
 
 - 买单匹配最低卖价，卖单匹配最高买价；同价位先到者优先（价格时间优先）。
@@ -119,8 +143,10 @@ REPLACE：
   - 市价单：与 IOC 相同
   - 撤单成功：`CANCELLED`
   - 替换成功：`REPLACED`、`PARTIALLY_FILLED_RESTING`、`FILLED`、`SELF_TRADE_PREVENTED`、`PARTIALLY_FILLED_SELF_TRADE_PREVENTED`
+  - 执行查询成功：`REPORTED`（附加 `execution_analysis`）
   - 拒绝：`REJECTED`（附加 `reason`）
 - `self_trade_prevention`：仅在两种自成交防护结果下出现，序列化于 `result`/`reason` 之后、`trades` 之前，含 `maker_order_id`（触发的被动单）、`taker_order_id`（被取消的主动单）与 `cancelled_quantity`（取消量，等于触发时主动单的剩余量；FOK 预检触发时为原始委托量）。其他结果不得包含该字段。
+- `execution_analysis`：仅在 `REPORTED` 结果下出现，序列化于 `result` 之后、`trades` 之前，字段见上文 EXECUTION_REPORT 一节。其他结果不得包含该字段。
 - `trades`：按发生顺序排列；每笔含 `maker_order_id`、`taker_order_id`、`price`、`quantity` 与 `trade_id`。
 - `bids` 按价格降序、`asks` 按价格升序，每档含整数 `price` 与汇总 `quantity`。
 
