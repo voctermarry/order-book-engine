@@ -738,7 +738,10 @@ def test_snapshot_format_is_version_2():
     ])["snapshot"]
     assert snap["format_version"] == FORMAT_VERSION == "event-replay/2"
     state = snap["content"]["symbols"][0]["state"]
-    assert set(state) == {"last_sequence", "event_log", "plans", "engine"}
+    assert set(state) == {
+        "last_sequence", "event_log", "plans", "engine", "active_price_limits",
+    }
+    assert state["active_price_limits"] is None
     assert "reserved_order_ids" in state["engine"]
     assert state["engine"]["reserved_order_ids"] == ["p#1"]
 

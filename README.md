@@ -185,7 +185,7 @@ IMPACT_REPORT：
 - `price_breakdown`：按模拟成交顺序排列的明细，每次消耗一个被动可见片段产生一项（粒度与真实成交一致），每项含 `price` 与 `quantity`；同一价位的不同 maker 分别成项，同一冰山的各次补片也按其再次排到队尾后的实际成交次序分别成项。
 - 无流动性时 `executable_quantity` 与 `executed_notional` 为 0、`unfilled_quantity` 等于请求量、`best_price` 与 `vwap` 为 `null`、两项成本均为 0、`price_breakdown` 为空数组；部分成交时两项成本只按实际可执行量计算。
 
-`IMPACT_REPORT` 与 `EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 一样只属于基线 JSON Lines（`replay`）入口；`events` 多证券事件流不接受这些类型（按 `INVALID_EVENT` 拒绝且不占用 `event_id` 与序列），快照格式也不因其改变。与之对称，跨证券的 `PORTFOLIO_REPORT` 只属于多证券事件流（`events`/`replay_events`/`EventReplayer`），基线单证券 JSON Lines 入口不接受该类型（按基线 `INVALID_SCHEMA` 拒绝）。
+`IMPACT_REPORT` 与 `EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 一样只属于基线 JSON Lines（`replay`）入口；`events` 多证券事件流不接受这些类型（按 `INVALID_EVENT` 拒绝且不占用 `event_id` 与序列），快照格式也不因其改变。与之对称，跨证券的 `PORTFOLIO_REPORT` 与盘中 `PRICE_LIMIT_UPDATE` 只属于多证券事件流（`events`/`replay_events`/`EventReplayer`），基线单证券 JSON Lines 入口不接受这些类型（`PORTFOLIO_REPORT` 按基线 `INVALID_SCHEMA` 拒绝）。
 
 ### 撮合规则
 
@@ -245,7 +245,7 @@ IMPACT_REPORT：
 
 ## 多证券有序事件回放
 
-在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，以及跨证券只读查询 `PORTFOLIO_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，跨证券只读查询 `PORTFOLIO_REPORT`，以及只属于本入口的盘中涨跌停调整命令 `PRICE_LIMIT_UPDATE`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
 
 ### 命令行
 
@@ -285,6 +285,7 @@ response = replay_events(events, config=None, snapshot=None, snapshot_after="las
 - `bids`/`asks`：该事件处理后的该证券完整盘口（已知证券的拒绝事件回显未变化盘口；未知证券的预分发拒绝为空盘口且不创建证券）。
 - `execution_plan`：仅 TWAP/VWAP 命令的结果出现，字段见下文 TWAP 母单与 VWAP 母单两节。
 - `portfolio_analysis`：仅 `PORTFOLIO_REPORT` 的成功结果出现，字段见下文「跨证券组合报告 PORTFOLIO_REPORT」一节；其他结果不得包含该字段。
+- `active_price_limits`：仅 `PRICE_LIMIT_UPDATE` 的成功结果出现，为 `{"lower_price": …, "upper_price": …}`，回显替换后的该证券活动区间；其他结果不得包含该字段。
 
 ### TWAP 母单
 
@@ -405,6 +406,29 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 信封、幂等与顺序规则优先适用：成功与两类业务拒绝都占用 `event_id` 并推进信封证券序列；相同 `event_id` 同内容的重试返回 `DUPLICATE`，同 id 不同内容（或另一证券）返回 `EVENT_ID_CONFLICT`；序列空洞/倒退仍为 `SEQUENCE_GAP`/`OUT_OF_ORDER`。查询不改变快照中任何撮合相关结构；快照恢复后的查询结果与不中断连续回放逐字节一致。
 
+### 盘中涨跌停调整 PRICE_LIMIT_UPDATE
+
+`PRICE_LIMIT_UPDATE` 是只属于多证券事件流（`events`/`replay_events`/`EventReplayer`）的可回放命令；单证券 `replay` 协议与 `Engine` 不接受该类型。它沿用事件信封的 `event_id`、`symbol`、`sequence` 顺序与幂等语义，作用于信封 `symbol` 的**活动**涨跌停区间：
+
+```json
+{"event_id": "e9", "symbol": "AAA", "sequence": 5, "type": "PRICE_LIMIT_UPDATE",
+ "lower_price": 90, "upper_price": 110}
+```
+
+- 载荷**只含** `event_id`、`type`、`lower_price`、`upper_price`；两个边界均为正整数（布尔值不算整数，不接受字符串、浮点、空值），且 `lower_price <= upper_price`。
+- 字段缺失、多出、布尔值冒充整数、非正边界或上下界倒置均为 `INVALID_EVENT`，**不占用** `event_id` 或 `sequence`。
+- 接受后**完整替换**该证券当前活动区间（不是收窄或叠加）。成功结果 `status` 为 `ACCEPTED`、`result` 为 `PRICE_LIMIT_UPDATED`，`trades` 与 `book_changes` 为空，`bids`/`asks` 为未变盘口，并附加 `active_price_limits`（`{"lower_price", "upper_price"}`）。相同边界的更新仍然成功。
+- 命令不撮合、不移动订单或计划、不消耗成交编号；其 `event_id` 只进入重放日志，不进入引擎事件集合。重复、冲突与序列错误沿用 `DUPLICATE`/`EVENT_ID_CONFLICT`/`SEQUENCE_GAP`/`OUT_OF_ORDER`。
+
+活动区间约束**此后**提交的限价，校验对象与优先级沿用静态区间的既有规则：
+
+- 更新后提交的 `ADD`（LIMIT/ICEBERG）、`REPLACE` 与限价 `TWAP_START`/`VWAP_START`，仍按既有优先级（信封、幂等、序列、`DUPLICATE_ORDER_ID`、`UNKNOWN_ORDER`、`DUPLICATE_EXECUTION_PLAN`、派生标识冲突等）校验；越界统一返回 `PRICE_LIMIT_EXCEEDED`。
+- 已启动的限价 TWAP/VWAP 计划在**每次 SLICE 释放前**按当时活动区间复核其固定价格：越界则该 SLICE 返回 `PRICE_LIMIT_EXCEEDED`，占用该 SLICE 的 `event_id` 并推进序列，但不释放子单——**不推进片号与累计量**（`released`/`released_quantity` 等不变）、不撮合、不消耗成交编号，已保留的派生标识继续保留；下一次 SLICE 仍尝试同一价格。市价订单与市价计划不受任何区间限制。
+- 缩窄区间**不撤销、不移动**既有挂单：落在新区间外的旧单仍留在簿中，并可按原价格时间优先成为 maker。因此限制对象是**新提交的限价价格**，不是成交价——区间外旧单之间、或与市价单之间仍可成交。
+- 初始活动区间取自会话 `config` 的静态 `price_limits`；未配置的证券初始无约束。一次把某证券更新到任意合法闭区间即可对其施加约束（即使该证券此前未配置静态区间）。
+
+每个证券的活动区间进入快照的每证券状态（`active_price_limits`：有约束时为 `{"lower_price", "upper_price"}`，无约束时为 `null`），随 `content_digest` 受保护；恢复后继续回放与连续回放逐字节一致。缺少该字段的旧快照按会话 `config` 的静态区间初始化（未配置即为 `null`）。
+
 ### 提交语义与错误码
 
 - 逐事件提交：先前成功事件不会因后续失败回滚；失败事件不留下订单、成交、计数器或盘口变更。
@@ -417,7 +441,8 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 - TWAP/VWAP 业务拒绝码：`UNKNOWN_EXECUTION_PLAN`（未知计划）、`EXECUTION_PLAN_CLOSED`（对已关闭计划切片或取消）、`DUPLICATE_EXECUTION_PLAN`（同证券重复 `plan_id`，TWAP 与 VWAP 共用命名空间）；派生标识冲突沿用 `DUPLICATE_ORDER_ID`。这些有效命令同样占用 `event_id` 并推进序列，但不改变计划或盘口状态。
 - 跨证券组合报告拒绝码：`UNKNOWN_ACCOUNT`（账户在任一证券上均无已接受 ADD 或已接受 TWAP/VWAP 母单）、`MARK_PRICE_MISMATCH`（已知账户但 `mark_prices` 键集合未恰好覆盖其全部证券）。二者都是结构合法后的业务拒绝，占用 `event_id`、推进信封证券序列并回显未变盘口；结构错误仍为 `INVALID_EVENT`，不占用 `event_id` 与序列。
 - 相同初始状态、配置和事件流产生字段顺序稳定、数值表示一致、可逐字节比较的 JSON（规范化序列化：键排序、紧凑分隔、整数不丢精度、无浮点）。
-- 静态涨跌停越界码：`PRICE_LIMIT_EXCEEDED`，见下文「静态涨跌停 `price_limits`」一节。
+- 静态涨跌停越界码：`PRICE_LIMIT_EXCEEDED`，见下文「静态涨跌停 `price_limits`」与「盘中涨跌停调整 PRICE_LIMIT_UPDATE」两节。
+- 盘中涨跌停调整结果码：`PRICE_LIMIT_UPDATED`（`PRICE_LIMIT_UPDATE` 成功结果的 `result`）。已启动限价计划在 SLICE 释放前的区间复核越界同样返回 `PRICE_LIMIT_EXCEEDED`：占用该 SLICE 的 `event_id` 并推进序列，但不释放子单、不推进片号与累计量、不消耗成交编号、不释放派生标识。
 
 ### 静态涨跌停 `price_limits`
 
@@ -447,6 +472,7 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 - 相同配置从快照恢复后，后续结果、成交编号与最终盘口和连续回放逐字节一致。
 - 恢复时调用方配置（含涨跌停边界）与快照不一致时，抛出 `code` 为 `CONFIG_MISMATCH` 的 `SnapshotError`，CLI 沿用对应错误文档与退出码 2。
 - 单标的 `order-book-engine replay`、`Engine` 的既有输入输出、未传 `price_limits` 的历史调用，以及 TWAP/VWAP 的分片、汇总与报告字段均不因该特性改变。
+- 静态区间是每个证券的**初始**活动区间；盘中可由 `PRICE_LIMIT_UPDATE` 完整替换（见上文「盘中涨跌停调整 PRICE_LIMIT_UPDATE」一节），缩窄不撤销既有挂单，约束对象始终是新提交的限价价格而非成交价。
 
 ### 快照与恢复
 
@@ -454,9 +480,9 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 快照是 JSON 对象：
 
-- `format_version`：格式版本（当前 `event-replay/2`；较 `event-replay/1` 在每证券状态中增加 `plans`、在引擎状态中增加 `reserved_order_ids`）。
+- `format_version`：格式版本（当前 `event-replay/2`；较 `event-replay/1` 在每证券状态中增加 `plans`、在引擎状态中增加 `reserved_order_ids`；`PRICE_LIMIT_UPDATE` 的每证券活动区间在同一版本内以 `active_price_limits` 字段加入，缺该字段的旧快照从 `config` 初始化）。
 - `engine_version`、`config`（撮合配置摘要）与 `config_digest`（配置的 SHA-256）。
-- `content`：各证券完整状态——价格时间队列顺序（含每档订单 id 队列）、订单剩余量、冰山当前公开量 `visible` 与补量所需 `display_quantity`、各证券最后序列 `last_sequence`、已接受事件日志、TWAP/VWAP 计划列表 `plans`（计划参数——VWAP 计划另含 `algorithm` 与 `volume_weights`——各片数量、已释放片数与已释放量、成交量、取消量、成交额、生命周期状态）、引擎保留的未释放派生标识 `reserved_order_ids`、累计成交 `trade_log`、生成后续成交标识所需的 `next_trade_id`、账户集合。
+- `content`：各证券完整状态——价格时间队列顺序（含每档订单 id 队列）、订单剩余量、冰山当前公开量 `visible` 与补量所需 `display_quantity`、各证券最后序列 `last_sequence`、当前活动涨跌停区间 `active_price_limits`（`null` 或 `{"lower_price", "upper_price"}`，随摘要受保护）、已接受事件日志、TWAP/VWAP 计划列表 `plans`（计划参数——VWAP 计划另含 `algorithm` 与 `volume_weights`——各片数量、已释放片数与已释放量、成交量、取消量、成交额、生命周期状态）、引擎保留的未释放派生标识 `reserved_order_ids`、累计成交 `trade_log`、生成后续成交标识所需的 `next_trade_id`、账户集合。
 - `content_digest`：基于规范化内容（连同版本与配置）计算的 SHA-256。
 
 恢复（`restore_replayer(snapshot, config=None)` 或在 `replay_events` 中传 `snapshot=`）先验证版本、配置与摘要，再做结构与内部一致性交叉校验，全部通过后才采纳状态：
