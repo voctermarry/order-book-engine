@@ -934,6 +934,22 @@ class Engine:
         }
         return event_id, REPORTED, None, [], None, analysis
 
+    def execution_analysis(
+        self, event_id: str, obj: dict[str, object]
+    ) -> tuple[str | None, dict[str, object] | None]:
+        """Answer an EXECUTION_REPORT query without occupying the event id.
+
+        Used solely by the multi-symbol replay layer, whose read-only query
+        ids live in the replay log rather than the engine journal. Returns
+        ``(reason, analysis)``: ``(None, analysis)`` when the order is known,
+        ``(UNKNOWN_ORDER, None)`` otherwise. Like the baseline query itself
+        this never matches, replenishes or mutates any state.
+        """
+        _eid, _result, reason, _trades, _stp, analysis = self._execution_report(
+            event_id, obj
+        )
+        return reason, analysis
+
     def _impact_report(
         self, event_id: str, obj: dict[str, object]
     ) -> tuple[str, str, None, list[dict[str, object]], dict[str, object]]:

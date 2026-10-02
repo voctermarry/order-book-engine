@@ -12,7 +12,9 @@ matching rules, priorities, rejection semantics or trade record shapes:
   orders (TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
   VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT), resumable POV parent
   orders (POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT), the read-only
-  cross-security PORTFOLIO_REPORT query and the intraday PRICE_LIMIT_UPDATE
+  cross-security PORTFOLIO_REPORT query, the read-only per-order
+  EXECUTION_REPORT query (accepted orders of the envelope security,
+  including released plan child orders) and the intraday PRICE_LIMIT_UPDATE
   adjustment, which replaces one security's active price-limit interval
   (seeded from the static ``price_limits`` configuration) for all
   subsequently submitted limit prices; plans never read a wall clock and
@@ -52,6 +54,7 @@ from .engine import (
     CANCEL,
     DUPLICATE_EVENT_ID,
     DUPLICATE_ORDER_ID,
+    EXECUTION_REPORT,
     ICEBERG,
     IOC,
     LIMIT,
@@ -61,6 +64,7 @@ from .engine import (
     SELL,
     Engine,
     UNKNOWN_ACCOUNT,
+    UNKNOWN_ORDER,
     _is_int,
     _is_non_empty_str,
     _is_positive_int,
@@ -136,16 +140,17 @@ SNAPSHOT_VERSION_UNSUPPORTED = "SNAPSHOT_VERSION_UNSUPPORTED"
 CONFIG_MISMATCH = "CONFIG_MISMATCH"
 
 #: Event types this replay layer accepts. The TWAP/VWAP parent-order commands
-#: join the baseline mutating behaviours; the baseline single-security
+#: join the baseline mutating behaviours; the other baseline single-security
 #: read-only reports stay exclusive to the JSON Lines entry point, while the
-#: cross-security PORTFOLIO_REPORT query and the intraday PRICE_LIMIT_UPDATE
-#: adjustment are exclusive to this layer.
+#: cross-security PORTFOLIO_REPORT query, the per-order EXECUTION_REPORT
+#: query and the intraday PRICE_LIMIT_UPDATE adjustment are exclusive to
+#: this layer.
 SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
      TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
      VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
      POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT,
-     PORTFOLIO_REPORT, PRICE_LIMIT_UPDATE}
+     PORTFOLIO_REPORT, PRICE_LIMIT_UPDATE, EXECUTION_REPORT}
 )
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
@@ -155,6 +160,9 @@ _BASELINE_KEYS = frozenset(
 )
 _PORTFOLIO_REPORT_KEYS = frozenset(
     {"event_id", "type", "account_id", "mark_prices"}
+)
+_EXECUTION_REPORT_KEYS = frozenset(
+    {"event_id", "type", "order_id", "benchmark_price"}
 )
 _PRICE_LIMIT_UPDATE_KEYS = frozenset(
     {"event_id", "type", "lower_price", "upper_price"}
@@ -194,11 +202,13 @@ _POV_TYPES = frozenset({POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT})
 #: Every parent-order command type, across algorithms.
 _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES | _POV_TYPES
 #: Event types whose ids live solely in the replay log: parent-order commands
-#: never touch the engine journal, the cross-security portfolio query is
-#: read-only and matched by no engine, and a price-limit adjustment only
-#: rewrites replay-layer state. Baseline ADD/CANCEL/REPLACE ids occupy the
-#: per-symbol engine journal instead.
-_REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset({PORTFOLIO_REPORT, PRICE_LIMIT_UPDATE})
+#: never touch the engine journal, the cross-security portfolio query and the
+#: per-order execution query are read-only and matched by no engine, and a
+#: price-limit adjustment only rewrites replay-layer state. Baseline
+#: ADD/CANCEL/REPLACE ids occupy the per-symbol engine journal instead.
+_REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset(
+    {PORTFOLIO_REPORT, PRICE_LIMIT_UPDATE, EXECUTION_REPORT}
+)
 
 
 def _allocate_slices(total_quantity: int, weights: list[int]) -> list[int]:
@@ -416,6 +426,23 @@ def _portfolio_report_schema_error(payload: dict[str, object]) -> str | None:
             return INVALID_EVENT
         if not _is_positive_int(mark_price):
             return INVALID_EVENT
+    return None
+
+
+def _execution_report_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of an EXECUTION_REPORT query payload.
+
+    The query carries exactly ``event_id``, ``type``, ``order_id`` and
+    ``benchmark_price``; the order id is a non-empty string and the benchmark
+    is a positive integer (booleans do not count). Any field problem is an
+    ``INVALID_EVENT`` and consumes neither the event id nor the sequence.
+    """
+    if set(payload) != _EXECUTION_REPORT_KEYS:
+        return INVALID_EVENT
+    if not _is_non_empty_str(payload.get("order_id")):
+        return INVALID_EVENT
+    if not _is_positive_int(payload.get("benchmark_price")):
+        return INVALID_EVENT
     return None
 
 
@@ -976,6 +1003,8 @@ class EventReplayer:
             schema_error = _pov_schema_error(payload)
         elif event_type == PORTFOLIO_REPORT:
             schema_error = _portfolio_report_schema_error(payload)
+        elif event_type == EXECUTION_REPORT:
+            schema_error = _execution_report_schema_error(payload)
         elif event_type == PRICE_LIMIT_UPDATE:
             schema_error = _price_limit_update_schema_error(payload)
         else:
@@ -1101,6 +1130,11 @@ class EventReplayer:
 
         if event_type == PORTFOLIO_REPORT:
             return self._dispatch_portfolio_report(
+                event_id, payload, state, symbol, sequence, content
+            )
+
+        if event_type == EXECUTION_REPORT:
+            return self._dispatch_execution_report(
                 event_id, payload, state, symbol, sequence, content
             )
 
@@ -1244,6 +1278,8 @@ class EventReplayer:
             return _TWAP_PLAN_REF_KEYS
         if inline_type == PORTFOLIO_REPORT:
             return _PORTFOLIO_REPORT_KEYS
+        if inline_type == EXECUTION_REPORT:
+            return _EXECUTION_REPORT_KEYS
         if inline_type == PRICE_LIMIT_UPDATE:
             return _PRICE_LIMIT_UPDATE_KEYS
         return None
@@ -1836,6 +1872,63 @@ class EventReplayer:
             "bids": bids,
             "asks": asks,
             "portfolio_analysis": analysis,
+        }
+
+    # -- per-order execution report ------------------------------------------
+
+    def _dispatch_execution_report(
+        self,
+        event_id: str,
+        payload: dict[str, object],
+        state: _SymbolState,
+        symbol: str,
+        sequence: int,
+        content: str,
+    ) -> dict[str, object]:
+        """Answer a read-only execution query on one security's accepted order.
+
+        The query only reads the envelope security's own orders and trade
+        journal: it never matches, never releases a plan slice and never
+        moves a book, an order, a queue, the trade log, an account set, a
+        plan or the next trade id. Only orders the security's engine accepted
+        are queryable — plain, iceberg and replaced orders as well as
+        released TWAP/VWAP/POV child orders; a parent plan id or a derived id
+        whose slice was never released is not an order and rejects
+        ``UNKNOWN_ORDER``, exactly like any other unknown id (including every
+        id on a brand-new security). Like every other structurally valid
+        event the query occupies its event id and advances the envelope
+        symbol's sequence, including the business rejection; its id lives
+        solely in the replay log, exactly like a PORTFOLIO_REPORT id.
+        """
+        reason, analysis = state.engine.execution_analysis(event_id, payload)
+
+        state.last_sequence = sequence
+        state.seen[event_id] = content
+        self._events[event_id] = (symbol, content)
+        bids, asks = state.engine.snapshot()
+        if reason is not None:
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": REJECTED,
+                "rejection_code": reason,
+                "trades": [],
+                "book_changes": {"bids": [], "asks": []},
+                "bids": bids,
+                "asks": asks,
+            }
+        return {
+            "event_id": event_id,
+            "symbol": symbol,
+            "sequence": sequence,
+            "status": ACCEPTED,
+            "result": REPORTED,
+            "trades": [],
+            "book_changes": {"bids": [], "asks": []},
+            "bids": bids,
+            "asks": asks,
+            "execution_analysis": analysis,
         }
 
 
@@ -2714,8 +2807,9 @@ def replay_events(
         TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
         VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands, the POV
         POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT commands, the
-        read-only cross-security PORTFOLIO_REPORT query and the intraday
-        PRICE_LIMIT_UPDATE adjustment.
+        read-only cross-security PORTFOLIO_REPORT query, the read-only
+        per-order EXECUTION_REPORT query and the intraday PRICE_LIMIT_UPDATE
+        adjustment.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
         a resumed run must pass the same configuration the snapshot carries.
