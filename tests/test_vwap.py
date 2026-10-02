@@ -667,7 +667,9 @@ def test_snapshot_format_stays_version_2_with_vwap_state():
     ])["snapshot"]
     assert snap["format_version"] == FORMAT_VERSION == "event-replay/2"
     state = snap["content"]["symbols"][0]["state"]
-    assert set(state) == {"last_sequence", "event_log", "plans", "engine"}
+    assert set(state) == {"last_sequence", "price_limits", "event_log",
+                          "plans", "engine"}
+    assert state["price_limits"] is None
     plan = state["plans"][0]
     assert plan["algorithm"] == "VWAP"
     assert plan["volume_weights"] == [1, 2]

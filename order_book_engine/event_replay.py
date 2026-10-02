@@ -10,8 +10,11 @@ matching rules, priorities, rejection semantics or trade record shapes:
   order, so identical timestamps never reorder anything. The stream covers
   the baseline ADD/CANCEL/REPLACE behaviours, resumable TWAP/VWAP parent
   orders (TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
-  VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT) and the read-only
-  cross-security PORTFOLIO_REPORT query; plans never read a wall clock and
+  VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT), the read-only
+  cross-security PORTFOLIO_REPORT query and the intraday PRICE_LIMIT_UPDATE
+  adjustment, which replaces one security's active price-limit interval
+  (seeded from the static ``price_limits`` configuration) for all
+  subsequently submitted limit prices; plans never read a wall clock and
   are advanced solely by their SLICE events. TWAP slices divide
   the total evenly; VWAP slices follow a caller-supplied volume-weight
   curve.
@@ -84,6 +87,12 @@ DUPLICATE_EXECUTION_PLAN = "DUPLICATE_EXECUTION_PLAN"
 # Static per-security price-limit rejection code.
 PRICE_LIMIT_EXCEEDED = "PRICE_LIMIT_EXCEEDED"
 
+# Intraday price-limit adjustment event and its success result. The command
+# replaces the security's active interval wholesale; it is replay-only and
+# never reaches the baseline engine or the JSON Lines entry point.
+PRICE_LIMIT_UPDATE = "PRICE_LIMIT_UPDATE"
+PRICE_LIMIT_UPDATED = "PRICE_LIMIT_UPDATED"
+
 # Cross-security portfolio report event and its business rejection codes.
 PORTFOLIO_REPORT = "PORTFOLIO_REPORT"
 MARK_PRICE_MISMATCH = "MARK_PRICE_MISMATCH"
@@ -118,12 +127,13 @@ CONFIG_MISMATCH = "CONFIG_MISMATCH"
 #: Event types this replay layer accepts. The TWAP/VWAP parent-order commands
 #: join the baseline mutating behaviours; the baseline single-security
 #: read-only reports stay exclusive to the JSON Lines entry point, while the
-#: cross-security PORTFOLIO_REPORT query is exclusive to this layer.
+#: cross-security PORTFOLIO_REPORT query and the intraday PRICE_LIMIT_UPDATE
+#: adjustment are exclusive to this layer.
 SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
      TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
      VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
-     PORTFOLIO_REPORT}
+     PORTFOLIO_REPORT, PRICE_LIMIT_UPDATE}
 )
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
@@ -133,6 +143,9 @@ _BASELINE_KEYS = frozenset(
 )
 _PORTFOLIO_REPORT_KEYS = frozenset(
     {"event_id", "type", "account_id", "mark_prices"}
+)
+_PRICE_LIMIT_UPDATE_KEYS = frozenset(
+    {"event_id", "type", "lower_price", "upper_price"}
 )
 _TWAP_START_KEYS = frozenset(
     {"event_id", "type", "plan_id", "side", "total_quantity", "slice_count",
@@ -156,10 +169,11 @@ _VWAP_TYPES = frozenset({VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT})
 #: Every parent-order command type, across algorithms.
 _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES
 #: Event types whose ids live solely in the replay log: parent-order commands
-#: never touch the engine journal, and the cross-security portfolio query is
-#: read-only and matched by no engine. Baseline ADD/CANCEL/REPLACE ids occupy
-#: the per-symbol engine journal instead.
-_REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset({PORTFOLIO_REPORT})
+#: never touch the engine journal, the cross-security portfolio query is
+#: read-only and matched by no engine, and a price-limit adjustment only
+#: rewrites replay-layer state. Baseline ADD/CANCEL/REPLACE ids occupy the
+#: per-symbol engine journal instead.
+_REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset({PORTFOLIO_REPORT, PRICE_LIMIT_UPDATE})
 
 
 def _allocate_slices(total_quantity: int, weights: list[int]) -> list[int]:
@@ -319,6 +333,25 @@ def _portfolio_report_schema_error(payload: dict[str, object]) -> str | None:
             return INVALID_EVENT
         if not _is_positive_int(mark_price):
             return INVALID_EVENT
+    return None
+
+
+def _price_limit_update_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a PRICE_LIMIT_UPDATE command payload.
+
+    The command carries exactly ``event_id``, ``type``, ``lower_price`` and
+    ``upper_price``; both bounds are positive integers (booleans do not
+    count) with ``lower_price <= upper_price``. Any field problem is an
+    ``INVALID_EVENT`` and consumes neither the event id nor the sequence.
+    """
+    if set(payload) != _PRICE_LIMIT_UPDATE_KEYS:
+        return INVALID_EVENT
+    lower_price = payload.get("lower_price")
+    upper_price = payload.get("upper_price")
+    if not _is_positive_int(lower_price) or not _is_positive_int(upper_price):
+        return INVALID_EVENT
+    if lower_price > upper_price:
+        return INVALID_EVENT
     return None
 
 
@@ -573,7 +606,8 @@ class ExecutionPlan:
 
 
 class _SymbolState:
-    __slots__ = ("engine", "last_sequence", "seen", "plans", "plan_index")
+    __slots__ = ("engine", "last_sequence", "seen", "plans", "plan_index",
+                 "price_limits")
 
     def __init__(self, engine: Engine | None = None) -> None:
         self.engine = engine or Engine()
@@ -585,6 +619,10 @@ class _SymbolState:
         # child order id -> plan_id, for every derived id of every accepted
         # plan, including slices not yet released.
         self.plan_index: dict[str, str] = {}
+        # The security's active price-limit interval (closed), or None when
+        # unlimited. Seeded from the static config block and replaced
+        # wholesale by every accepted PRICE_LIMIT_UPDATE.
+        self.price_limits: tuple[int, int] | None = None
 
 
 class EventReplayer:
@@ -602,7 +640,10 @@ class EventReplayer:
         self.config: dict[str, object] = dict(DEFAULT_CONFIG if config is None else config)
         _validate_config(self.config)
         # Static per-security price bounds (closed interval), parsed from the
-        # validated config. Securities without an entry keep baseline rules.
+        # validated config. They seed each security's *active* interval (and
+        # a legacy snapshot's restored one); accepted PRICE_LIMIT_UPDATE
+        # events then replace the active interval per security. Securities
+        # without an entry start unlimited.
         raw_limits = self.config.get("price_limits") or {}
         self.price_limits: dict[str, tuple[int, int]] = {
             symbol: (bounds["lower"], bounds["upper"])
@@ -759,6 +800,8 @@ class EventReplayer:
             schema_error = _vwap_schema_error(payload)
         elif event_type == PORTFOLIO_REPORT:
             schema_error = _portfolio_report_schema_error(payload)
+        elif event_type == PRICE_LIMIT_UPDATE:
+            schema_error = _price_limit_update_schema_error(payload)
         else:
             schema_error = Engine._schema_error(payload)
         if schema_error is not None:
@@ -770,6 +813,9 @@ class EventReplayer:
         known_symbol = state is not None
         if state is None:
             state = _SymbolState()
+            # The active interval starts at the static configuration; an
+            # accepted PRICE_LIMIT_UPDATE replaces it from then on.
+            state.price_limits = self.price_limits.get(symbol)
 
         # ---- global idempotency (checked before sequencing) --------------
         # A retried delivery carries its original, now-stale sequence; it must
@@ -837,14 +883,16 @@ class EventReplayer:
                 "asks": asks,
             }
 
-        # ---- static per-security price limits -----------------------------
+        # ---- active per-security price limits ---------------------------
         # Enforced after the envelope, idempotency, sequence and identifier
         # conflict checks, and strictly before matching or any state change.
         # The identifier clashes the baseline engine would reach first (a
         # reused order id, a replace against a missing order, a duplicate plan
         # or a clashing derived id) keep their rejection-code precedence; a
-        # price breach is only reported when none applies.
-        price_rejection = self._price_limit_rejection(symbol, payload, event_type, state)
+        # price breach is only reported when none applies. The interval tested
+        # here is the security's *active* one: the static config interval as
+        # last replaced by any accepted PRICE_LIMIT_UPDATE.
+        price_rejection = self._price_limit_rejection(payload, event_type, state)
         if price_rejection is not None:
             # A committed business rejection: it occupies the event id and
             # advances the symbol sequence, but performs no matching, leaves
@@ -869,6 +917,11 @@ class EventReplayer:
                 "bids": bids,
                 "asks": asks,
             }
+
+        if event_type == PRICE_LIMIT_UPDATE:
+            return self._dispatch_price_limit_update(
+                event_id, payload, state, symbol, sequence, content
+            )
 
         if event_type == PORTFOLIO_REPORT:
             return self._dispatch_portfolio_report(
@@ -927,21 +980,22 @@ class EventReplayer:
 
     def _price_limit_rejection(
         self,
-        symbol: str,
         payload: dict[str, object],
         event_type: str,
         state: _SymbolState,
     ) -> str | None:
-        """Decide a static price-limit breach without mutating anything.
+        """Decide a price-limit breach against the active interval.
 
         Only the price of a LIMIT/ICEBERG ADD, of a REPLACE and of a LIMIT
-        TWAP/VWAP plan is tested against the security's closed interval;
-        MARKET orders and MARKET plans are exempt. Identifier clashes the
-        baseline reaches first keep precedence and are reported as ``None``
-        here: a reused order id, a replace against a non-resting target, a
-        duplicate plan id or a clash over a derived child id.
+        TWAP/VWAP plan is tested against the security's currently active
+        closed interval (the static config interval as replaced by accepted
+        PRICE_LIMIT_UPDATE events); MARKET orders and MARKET plans are
+        exempt. Identifier clashes the baseline reaches first keep precedence
+        and are reported as ``None`` here: a reused order id, a replace
+        against a non-resting target, a duplicate plan id or a clash over a
+        derived child id.
         """
-        bounds = self.price_limits.get(symbol)
+        bounds = state.price_limits
         if bounds is None:
             return None
         lower, upper = bounds
@@ -1006,6 +1060,8 @@ class EventReplayer:
             return _TWAP_PLAN_REF_KEYS
         if inline_type == PORTFOLIO_REPORT:
             return _PORTFOLIO_REPORT_KEYS
+        if inline_type == PRICE_LIMIT_UPDATE:
+            return _PRICE_LIMIT_UPDATE_KEYS
         return None
 
     # -- parent-order plan handling ------------------------------------------
@@ -1126,6 +1182,16 @@ class EventReplayer:
             return REJECTED, UNKNOWN_EXECUTION_PLAN, None, None
         if plan.status != PLAN_ACTIVE:
             return REJECTED, EXECUTION_PLAN_CLOSED, None, None
+
+        # A LIMIT plan started inside the band is re-checked against the
+        # *current* active interval before every release: an intraday
+        # PRICE_LIMIT_UPDATE may have moved the band since the start. A
+        # breach rejects the SLICE without advancing the slice number or any
+        # cumulative counter, and the reserved derived ids stay reserved.
+        if plan.order_type == LIMIT and state.price_limits is not None:
+            lower, upper = state.price_limits
+            if plan.price < lower or plan.price > upper:
+                return REJECTED, PRICE_LIMIT_EXCEEDED, None, None
 
         slice_number = plan.released + 1
         child_id = plan.child_order_id(slice_number)
@@ -1260,6 +1326,50 @@ class EventReplayer:
             "book_changes": {"bids": [], "asks": []},
             "bids": bids,
             "asks": asks,
+        }
+
+    # -- intraday price-limit adjustment -------------------------------------
+
+    def _dispatch_price_limit_update(
+        self,
+        event_id: str,
+        payload: dict[str, object],
+        state: _SymbolState,
+        symbol: str,
+        sequence: int,
+        content: str,
+    ) -> dict[str, object]:
+        """Replace the security's active price-limit interval wholesale.
+
+        Purely a replay-layer state change: no order, trade, plan or book is
+        touched, resting orders outside the new interval keep their queue
+        priority and may still become makers, and no trade id is spent. Like
+        every other structurally valid event the command occupies its event
+        id and advances the symbol sequence; its id lives solely in the
+        replay log, exactly like a parent-order command id. Re-applying the
+        current bounds is a successful update, not a conflict.
+        """
+        lower_price: int = payload["lower_price"]
+        upper_price: int = payload["upper_price"]
+        state.price_limits = (lower_price, upper_price)
+        state.last_sequence = sequence
+        state.seen[event_id] = content
+        self._events[event_id] = (symbol, content)
+        bids, asks = state.engine.snapshot()
+        return {
+            "event_id": event_id,
+            "symbol": symbol,
+            "sequence": sequence,
+            "status": ACCEPTED,
+            "result": PRICE_LIMIT_UPDATED,
+            "trades": [],
+            "book_changes": {"bids": [], "asks": []},
+            "bids": bids,
+            "asks": asks,
+            "active_price_limits": {
+                "lower_price": lower_price,
+                "upper_price": upper_price,
+            },
         }
 
     # -- cross-security portfolio report -------------------------------------
@@ -1422,6 +1532,14 @@ def _engine_to_json(state: _SymbolState) -> dict[str, object]:
     raw = state.engine.dump_state()
     return {
         "last_sequence": state.last_sequence,
+        # The security's active price-limit interval travels with the
+        # snapshot so a resumed run enforces exactly the band a continuous
+        # run would; ``None`` means the security is unlimited.
+        "price_limits": (
+            {"lower": state.price_limits[0], "upper": state.price_limits[1]}
+            if state.price_limits is not None
+            else None
+        ),
         "event_log": [
             {"event_id": event_id, "content": content}
             for event_id, content in state.seen.items()
@@ -1600,7 +1718,13 @@ _ORDER_RECORD_KEYS = frozenset(
 _TRADE_KEYS = frozenset(
     {"trade_id", "maker_order_id", "taker_order_id", "price", "quantity", "event_id"}
 )
-_SYMBOL_STATE_KEYS = frozenset({"last_sequence", "event_log", "plans", "engine"})
+_SYMBOL_STATE_KEYS = frozenset(
+    {"last_sequence", "price_limits", "event_log", "plans", "engine"}
+)
+#: Snapshots written before the intraday price-limit adjustment existed
+#: carry no per-symbol ``price_limits``; on restore the active interval is
+#: seeded from the static configuration instead.
+_SYMBOL_STATE_KEYS_LEGACY = _SYMBOL_STATE_KEYS - {"price_limits"}
 _ENGINE_KEYS = frozenset(
     {"event_ids", "order_ids", "reserved_order_ids", "orders", "bids", "asks",
      "bid_totals", "ask_totals", "next_trade_id", "accounts", "trade_log"}
@@ -1618,9 +1742,37 @@ _ENVELOPE_KEYS_SNAPSHOT = frozenset(
 _CONTENT_KEYS = frozenset({"symbols", "events"})
 
 
-def _engine_from_json(data: dict[str, object]) -> _SymbolState:
+def _engine_from_json(
+    data: dict[str, object],
+    config_price_limits: tuple[int, int] | None,
+) -> _SymbolState:
     _require(isinstance(data, dict), "symbol state must be an object")
-    _require(set(data) == _SYMBOL_STATE_KEYS, "symbol state has unknown fields")
+    keys = set(data)
+    _require(
+        keys == _SYMBOL_STATE_KEYS or keys == _SYMBOL_STATE_KEYS_LEGACY,
+        "symbol state has unknown fields",
+    )
+    if "price_limits" in keys:
+        raw_limits = data.get("price_limits")
+        if raw_limits is None:
+            price_limits: tuple[int, int] | None = None
+        else:
+            _require(
+                isinstance(raw_limits, dict) and set(raw_limits) == {"lower", "upper"},
+                "price_limits must be null or an object with exactly 'lower' and 'upper'",
+            )
+            lower = raw_limits["lower"]
+            upper = raw_limits["upper"]
+            _require(
+                _is_positive_int(lower) and _is_positive_int(upper),
+                "price_limits bounds must be positive integers",
+            )
+            _require(lower <= upper, "price_limits require lower <= upper")
+            price_limits = (lower, upper)
+    else:
+        # A legacy snapshot predates intraday adjustments: the security had
+        # only its static configured interval, so seed from the config.
+        price_limits = config_price_limits
     last_sequence = data.get("last_sequence")
     _require(
         isinstance(last_sequence, int) and not isinstance(last_sequence, bool) and last_sequence >= 0,
@@ -1990,6 +2142,7 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
     state.seen = seen
     state.plans = plans
     state.plan_index = plan_index
+    state.price_limits = price_limits
     return state
 
 
@@ -1998,9 +2151,10 @@ def export_snapshot(replayer: EventReplayer) -> dict[str, object]:
 
     The snapshot fully preserves (per security): price-time queue priority,
     order remainders, the iceberg current slice and replenishment state, the
-    last sequence, cumulative trades and the next trade id counter. It also
-    carries the format version, the matching configuration (plus its digest)
-    and a SHA-256 digest over the normalized whole document.
+    last sequence, cumulative trades, the next trade id counter and the
+    active price-limit interval. It also carries the format version, the
+    matching configuration (plus its digest) and a SHA-256 digest over the
+    normalized whole document.
     """
     symbols = [
         {"symbol": symbol, "state": _engine_to_json(replayer._symbols[symbol])}
@@ -2096,7 +2250,9 @@ def restore_replayer(
         if symbol in symbols:
             raise SnapshotError(SNAPSHOT_CORRUPT, f"duplicate symbol in snapshot: {symbol}")
         try:
-            symbols[symbol] = _engine_from_json(entry["state"])
+            symbols[symbol] = _engine_from_json(
+                entry["state"], replayer.price_limits.get(symbol)
+            )
         except (KeyError, TypeError, AttributeError) as exc:
             raise SnapshotError(SNAPSHOT_CORRUPT, f"snapshot state for {symbol} is malformed") from exc
     for entry in content.get("events", []):
@@ -2160,8 +2316,9 @@ def replay_events(
         ``"event"`` object that repeats ``event_id`` and ``type``. Supported
         kinds are the baseline ADD/CANCEL/REPLACE events, the TWAP/VWAP
         TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
-        VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands, and the
-        read-only cross-security PORTFOLIO_REPORT query.
+        VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands, the
+        read-only cross-security PORTFOLIO_REPORT query and the intraday
+        PRICE_LIMIT_UPDATE adjustment.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
         a resumed run must pass the same configuration the snapshot carries.

@@ -245,7 +245,7 @@ IMPACT_REPORT：
 
 ## 多证券有序事件回放
 
-在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，以及跨证券只读查询 `PORTFOLIO_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，跨证券只读查询 `PORTFOLIO_REPORT`，以及盘中涨跌停调整 `PRICE_LIMIT_UPDATE`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
 
 ### 命令行
 
@@ -285,6 +285,7 @@ response = replay_events(events, config=None, snapshot=None, snapshot_after="las
 - `bids`/`asks`：该事件处理后的该证券完整盘口（已知证券的拒绝事件回显未变化盘口；未知证券的预分发拒绝为空盘口且不创建证券）。
 - `execution_plan`：仅 TWAP/VWAP 命令的结果出现，字段见下文 TWAP 母单与 VWAP 母单两节。
 - `portfolio_analysis`：仅 `PORTFOLIO_REPORT` 的成功结果出现，字段见下文「跨证券组合报告 PORTFOLIO_REPORT」一节；其他结果不得包含该字段。
+- `active_price_limits`：仅 `PRICE_LIMIT_UPDATE` 的成功结果出现（`{"lower_price": ..., "upper_price": ...}`），回显替换后的活动区间；其他结果不得包含该字段。
 
 ### TWAP 母单
 
@@ -448,6 +449,21 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 - 恢复时调用方配置（含涨跌停边界）与快照不一致时，抛出 `code` 为 `CONFIG_MISMATCH` 的 `SnapshotError`，CLI 沿用对应错误文档与退出码 2。
 - 单标的 `order-book-engine replay`、`Engine` 的既有输入输出、未传 `price_limits` 的历史调用，以及 TWAP/VWAP 的分片、汇总与报告字段均不因该特性改变。
 
+### 盘中涨跌停调整 `PRICE_LIMIT_UPDATE`
+
+`PRICE_LIMIT_UPDATE` 是多证券事件流专属的盘中调整命令（`replay_events`/`EventReplayer`/`events` CLI；单证券 JSON Lines 入口与 `Engine` 不接受该类型），把某证券的**活动涨跌停区间**整体替换为新值。活动区间以静态 `price_limits` 配置为初始值（未配置则不限），此后由该证券每个已接受的 `PRICE_LIMIT_UPDATE` 完整替换：
+
+```json
+{"event_id": "e5", "symbol": "AAA", "sequence": 5,
+ "type": "PRICE_LIMIT_UPDATE", "lower_price": 98, "upper_price": 102}
+```
+
+- 载荷只含 `event_id`、`type`、`lower_price`、`upper_price`；两个边界均为正整数（布尔值不算整数）且 `lower_price <= upper_price`。字段缺失、多出、类型不符、非正边界或上下界倒置均为 `INVALID_EVENT`，不占用 `event_id` 与序列。
+- 接受后结果为 `status: ACCEPTED`、`result: PRICE_LIMIT_UPDATED`，`trades` 与 `book_changes` 为空、盘口保持不变，并附 `active_price_limits: {"lower_price": ..., "upper_price": ...}` 回显新区间。相同边界的更新仍然成功；重复、冲突与序列错误沿用 `DUPLICATE`、`EVENT_ID_CONFLICT`、`SEQUENCE_GAP`、`OUT_OF_ORDER` 等既有语义。
+- 活动区间约束**之后提交**的限价：LIMIT/ICEBERG `ADD`、`REPLACE`、LIMIT `TWAP_START`/`VWAP_START` 按既有优先级校验（标识冲突等既有拒绝码优先）；已启动的 LIMIT 计划在每次 `SLICE` 释放前按**当时**的活动区间复核。越界统一返回 `PRICE_LIMIT_EXCEEDED`，占用 `event_id` 并推进序列，但不撮合、不消耗成交编号：`ADD` 不建单，`REPLACE` 保留原单及队列位置，`START` 不建计划，`SLICE` 不推进片号与累计量且已保留的派生标识继续保留。市价订单与市价计划不受限制。
+- 缩窄区间不撤销也不移动既有挂单：区间外旧单仍按原优先级留在队列中并可成为 maker（限制对象是新提交的限价，不是成交价）。
+- 每证券活动区间进入快照（`price_limits`，`null` 表示不限）并受 `content_digest` 保护；恢复后与连续回放逐字节一致。缺少该字段的旧格式快照在恢复时从 `config` 的静态区间初始化。
+
 ### 快照与恢复
 
 `replay_events` 默认在响应中附带处理完最后一个事件后的 `snapshot`；`snapshot_after=None` 可省略，`snapshot_after={"symbol": ..., "sequence": ...}` 可在指定的**已接受**事件之后导出。有状态的会话也可用 `EventReplayer`（`submit`/`book`）配合 `export_snapshot`/`restore_replayer` 增量处理。
@@ -456,7 +472,7 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 - `format_version`：格式版本（当前 `event-replay/2`；较 `event-replay/1` 在每证券状态中增加 `plans`、在引擎状态中增加 `reserved_order_ids`）。
 - `engine_version`、`config`（撮合配置摘要）与 `config_digest`（配置的 SHA-256）。
-- `content`：各证券完整状态——价格时间队列顺序（含每档订单 id 队列）、订单剩余量、冰山当前公开量 `visible` 与补量所需 `display_quantity`、各证券最后序列 `last_sequence`、已接受事件日志、TWAP/VWAP 计划列表 `plans`（计划参数——VWAP 计划另含 `algorithm` 与 `volume_weights`——各片数量、已释放片数与已释放量、成交量、取消量、成交额、生命周期状态）、引擎保留的未释放派生标识 `reserved_order_ids`、累计成交 `trade_log`、生成后续成交标识所需的 `next_trade_id`、账户集合。
+- `content`：各证券完整状态——价格时间队列顺序（含每档订单 id 队列）、订单剩余量、冰山当前公开量 `visible` 与补量所需 `display_quantity`、各证券最后序列 `last_sequence`、活动涨跌停区间 `price_limits`（`null` 表示不限；旧格式快照缺少该字段，恢复时从 `config` 静态区间初始化）、已接受事件日志、TWAP/VWAP 计划列表 `plans`（计划参数——VWAP 计划另含 `algorithm` 与 `volume_weights`——各片数量、已释放片数与已释放量、成交量、取消量、成交额、生命周期状态）、引擎保留的未释放派生标识 `reserved_order_ids`、累计成交 `trade_log`、生成后续成交标识所需的 `next_trade_id`、账户集合。
 - `content_digest`：基于规范化内容（连同版本与配置）计算的 SHA-256。
 
 恢复（`restore_replayer(snapshot, config=None)` 或在 `replay_events` 中传 `snapshot=`）先验证版本、配置与摘要，再做结构与内部一致性交叉校验，全部通过后才采纳状态：
