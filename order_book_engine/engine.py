@@ -17,6 +17,7 @@ REPLACE = "REPLACE"
 EXECUTION_REPORT = "EXECUTION_REPORT"
 ACCOUNT_REPORT = "ACCOUNT_REPORT"
 DAY_END_RECONCILIATION = "DAY_END_RECONCILIATION"
+IMPACT_REPORT = "IMPACT_REPORT"
 BUY = "BUY"
 SELL = "SELL"
 LIMIT = "LIMIT"
@@ -64,6 +65,9 @@ _REPORT_KEYS = frozenset({"event_id", "type", "order_id", "benchmark_price"})
 _ACCOUNT_REPORT_KEYS = frozenset({"event_id", "type", "account_id", "mark_price"})
 _RECONCILIATION_KEYS = frozenset(
     {"event_id", "type", "expected_trades", "expected_accounts"}
+)
+_IMPACT_REPORT_KEYS = frozenset(
+    {"event_id", "type", "side", "quantity", "benchmark_price"}
 )
 _EXPECTED_TRADE_KEYS = frozenset(
     {"trade_id", "maker_order_id", "taker_order_id", "price", "quantity"}
@@ -190,6 +194,22 @@ class Engine:
             return None, REJECTED, INVALID_JSON, [], None, None, None, None
         return self.handle_object_reconciliation(obj)
 
+    def handle_line_impact(
+        self, line: str
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Like :meth:`handle_line_reconciliation`, additionally returning the
+        impact analysis of an ``IMPACT_REPORT`` query (``None`` otherwise)."""
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return None, REJECTED, INVALID_JSON, [], None, None, None, None, None
+        return self.handle_object_impact(obj)
+
     def handle_object(
         self, obj: object
     ) -> tuple[str | None, str, str | None, list[dict[str, object]], dict[str, object] | None]:
@@ -227,18 +247,47 @@ class Engine:
         dict[str, object] | None, dict[str, object] | None,
         dict[str, object] | None,
     ]:
+        """Apply one event object through the reconciliation-era chain.
+
+        Returns the eight fields documented on
+        :meth:`handle_line_reconciliation`; an ``IMPACT_REPORT`` query's
+        analysis is only available from :meth:`handle_object_impact`.
+        """
+        return self._dispatch_object(obj)[:8]
+
+    def handle_object_impact(
+        self, obj: object
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Like :meth:`handle_object_reconciliation`, additionally returning
+        the impact analysis of an ``IMPACT_REPORT`` query (``None`` for every
+        other event kind)."""
+        return self._dispatch_object(obj)
+
+    def _dispatch_object(
+        self, obj: object
+    ) -> tuple[
+        str | None, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
         if not isinstance(obj, dict):
-            return None, REJECTED, INVALID_SCHEMA, [], None, None, None, None
+            return None, REJECTED, INVALID_SCHEMA, [], None, None, None, None, None
 
         event_id = obj.get("event_id")
         event_id_out = event_id if isinstance(event_id, str) else None
 
         schema_error = self._schema_error(obj)
         if schema_error is not None:
-            return event_id_out, REJECTED, schema_error, [], None, None, None, None
+            return event_id_out, REJECTED, schema_error, [], None, None, None, None, None
 
         if event_id in self._event_ids:
-            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None, None, None, None
+            return event_id, REJECTED, DUPLICATE_EVENT_ID, [], None, None, None, None, None
         if obj["type"] == REPLACE and "display_quantity" in obj:
             target = self._orders.get(obj["order_id"])
             if (
@@ -248,31 +297,40 @@ class Engine:
             ):
                 # Only an iceberg target may be replaced with a display slice;
                 # like every schema error this consumes no event id.
-                return event_id, REJECTED, INVALID_SCHEMA, [], None, None, None, None
+                return event_id, REJECTED, INVALID_SCHEMA, [], None, None, None, None, None
         # The event is well formed, so its id occupies the stream from here,
         # even if a later business rule rejects it.
         self._event_ids.add(event_id)
 
         if obj["type"] == CANCEL:
             event_id, result, reason, trades = self._cancel(event_id, obj["order_id"])
-            return event_id, result, reason, trades, None, None, None, None
+            return event_id, result, reason, trades, None, None, None, None, None
         if obj["type"] == REPLACE:
             event_id, result, reason, trades, stp = self._replace(event_id, obj)
-            return event_id, result, reason, trades, stp, None, None, None
+            return event_id, result, reason, trades, stp, None, None, None, None
         if obj["type"] == EXECUTION_REPORT:
             event_id, result, reason, trades, stp, analysis = self._execution_report(
                 event_id, obj
             )
-            return event_id, result, reason, trades, stp, analysis, None, None
+            return event_id, result, reason, trades, stp, analysis, None, None, None
         if obj["type"] == ACCOUNT_REPORT:
             event_id, result, reason, trades, stp, analysis, position = (
                 self._account_report(event_id, obj)
             )
-            return event_id, result, reason, trades, stp, analysis, position, None
+            return event_id, result, reason, trades, stp, analysis, position, None, None
         if obj["type"] == DAY_END_RECONCILIATION:
-            return self._day_end_reconciliation(event_id, obj)
+            event_id, result, reason, trades, stp, analysis, position, reconciliation = (
+                self._day_end_reconciliation(event_id, obj)
+            )
+            return (
+                event_id, result, reason, trades, stp, analysis, position,
+                reconciliation, None,
+            )
+        if obj["type"] == IMPACT_REPORT:
+            event_id, result, reason, impact = self._impact_report(event_id, obj)
+            return event_id, result, reason, [], None, None, None, None, impact
         event_id, result, reason, trades, stp = self._add(event_id, obj)
-        return event_id, result, reason, trades, stp, None, None, None
+        return event_id, result, reason, trades, stp, None, None, None, None
 
     @staticmethod
     def _schema_error(obj: dict[str, object]) -> str | None:
@@ -345,6 +403,22 @@ class Engine:
                     return INVALID_SCHEMA
                 if not _is_int(item.get("cash_balance")):
                     return INVALID_SCHEMA
+            return None
+        if event_type == IMPACT_REPORT:
+            # A pure read-only query: exactly the five fields, a string event
+            # id (the same constraint every baseline query/order event uses),
+            # a BUY/SELL side and positive integer quantity and benchmark
+            # (booleans are not integers).
+            if keys != _IMPACT_REPORT_KEYS:
+                return INVALID_SCHEMA
+            if not isinstance(obj.get("event_id"), str):
+                return INVALID_SCHEMA
+            if obj.get("side") not in (BUY, SELL):
+                return INVALID_SCHEMA
+            if not _is_positive_int(obj.get("quantity")):
+                return INVALID_SCHEMA
+            if not _is_positive_int(obj.get("benchmark_price")):
+                return INVALID_SCHEMA
             return None
         if not keys <= _ALL_KEYS:
             return INVALID_SCHEMA
@@ -1027,6 +1101,110 @@ class Engine:
             "account_breaks": account_breaks,
         }
         return event_id, result, None, [], None, None, None, reconciliation
+
+    def _impact_report(
+        self, event_id: str, obj: dict[str, object]
+    ) -> tuple[str, str, str | None, dict[str, object] | None]:
+        """Answer an anonymous market-order impact query without any mutation.
+
+        The query simulates a MARKET order of ``quantity`` on ``side`` under
+        the baseline price-time priority rules against the current book. No
+        book, queue, order, iceberg slice, trade journal, account set or trade
+        id counter is touched: every walk uses per-order simulated remainder
+        and visible-slice counters copied from the resting records, and an
+        exhausted iceberg slice replenishes at the tail of its simulated level
+        exactly as in :meth:`_fok_probe`. The simulated taker is anonymous, so
+        self-trade prevention never applies (unlike the FOK probe).
+        """
+        side: str = obj["side"]
+        requested_quantity: int = obj["quantity"]
+        benchmark_price: int = obj["benchmark_price"]
+
+        opposite, _totals = self._opposite(side)
+        prices = sorted(opposite, reverse=side == SELL)
+
+        need = requested_quantity
+        executable_quantity = 0
+        executed_notional = 0
+        best_price: int | None = None
+        breakdown: list[dict[str, int]] = []
+        for price in prices:
+            if need == 0:
+                break
+            if best_price is None:
+                best_price = price
+            sim_remaining: dict[str, int] = {}
+            sim_visible: dict[str, int] = {}
+            queue: deque[str] = deque()
+            for maker_id in opposite[price]:
+                maker = self._orders[maker_id]
+                sim_remaining[maker_id] = maker["remaining"]
+                if maker.get("visible") is not None:
+                    sim_visible[maker_id] = maker["visible"]
+                queue.append(maker_id)
+            level_quantity = 0
+            while queue and need > 0:
+                maker_id = queue.popleft()
+                maker = self._orders[maker_id]
+                if maker_id in sim_visible:
+                    available = sim_visible[maker_id]
+                else:
+                    available = sim_remaining[maker_id]
+                matched = min(need, available)
+                need -= matched
+                sim_remaining[maker_id] -= matched
+                executable_quantity += matched
+                executed_notional += matched * price
+                level_quantity += matched
+                if maker_id in sim_visible:
+                    sim_visible[maker_id] -= matched
+                    if sim_visible[maker_id] == 0 and sim_remaining[maker_id] > 0:
+                        # The replenished slice waits behind every order still
+                        # ahead at this level, exactly as in a real fill.
+                        sim_visible[maker_id] = min(
+                            maker["display_quantity"], sim_remaining[maker_id]
+                        )
+                        queue.append(maker_id)
+            if level_quantity:
+                breakdown.append({"price": price, "quantity": level_quantity})
+
+        unfilled_quantity = requested_quantity - executable_quantity
+        if executable_quantity:
+            vwap: dict[str, int] | None = {
+                "numerator": executed_notional,
+                "denominator": executable_quantity,
+            }
+            slippage_notional = (
+                executed_notional - benchmark_price * executable_quantity
+            )
+            impact_reference_price = best_price
+            impact_notional = (
+                executed_notional - impact_reference_price * executable_quantity
+            )
+            if side == SELL:
+                # Mirror the buy formula: negative always means improvement.
+                slippage_notional = -slippage_notional
+                impact_notional = -impact_notional
+        else:
+            vwap = None
+            best_price = None
+            slippage_notional = 0
+            impact_notional = 0
+
+        analysis: dict[str, object] = {
+            "side": side,
+            "requested_quantity": requested_quantity,
+            "benchmark_price": benchmark_price,
+            "executable_quantity": executable_quantity,
+            "unfilled_quantity": unfilled_quantity,
+            "executed_notional": executed_notional,
+            "best_price": best_price,
+            "vwap": vwap,
+            "slippage_notional": slippage_notional,
+            "impact_notional": impact_notional,
+            "price_breakdown": breakdown,
+        }
+        return event_id, REPORTED, None, analysis
 
     @staticmethod
     def _reconcile_breaks(
