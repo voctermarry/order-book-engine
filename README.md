@@ -157,6 +157,36 @@ DAY_END_RECONCILIATION：
 - `trade_breaks`、`account_breaks`：差异数组，分别按 `trade_id`、`account_id` 升序排列，无差异时为空数组。
 - 每项含 `identifier`、`expected`、`actual` 与 `reason`：仅外部存在时 `reason` 为 `MISSING_ACTUAL`，仅引擎存在时为 `MISSING_EXPECTED`，两侧都存在但字段不同时为 `FIELD_MISMATCH`；缺失一侧为 `null`，存在一侧保留完整对象。
 
+IMPACT_REPORT：
+
+```json
+{"event_id": "e7", "type": "IMPACT_REPORT", "side": "BUY", "quantity": 10, "benchmark_price": 100}
+```
+
+按盘口估算一笔**匿名市价单**的可执行量、均价、滑点与盘口冲击，是只读的假设分析：严格按价格时间优先模拟成交，成交价取 maker 价格；不撮合、不改变盘口、队列顺序、订单与冰山状态、成交日志、账户集合或下一个成交编号，也不产生任何成交。
+
+- `event_id`：全流唯一字符串。
+- `side`：`BUY` 或 `SELL`，分别模拟吃卖盘、买盘。
+- `quantity`：正整数（布尔值不算整数）。
+- `benchmark_price`：正整数基准价（布尔值不算整数）。
+- 字段缺失、多出或类型错误（含非字符串 `event_id`、非法 `side`、布尔/零/负/浮点/字符串/空值的 `quantity` 或 `benchmark_price`）按 `INVALID_SCHEMA` 拒绝，不占用 `event_id`；合法查询占用 `event_id`，重复事件返回 `DUPLICATE_EVENT_ID`。
+
+模拟规则与真实市价单一致：买单从最低卖价、卖单从最高买价起逐档成交；冰山被动单先消耗当前公开片段，片段耗尽但仍有储备时按既有规则补一片 `min(display_quantity, remaining)` 并移至同价队尾，同一模拟单可在同价其他订单之后再次遇到它。模拟单匿名且无账户，自成交防护不适用；直至请求量满足或可成交流动性全部耗尽。
+
+查询成功时 `result` 为 `REPORTED`，`trades` 为空，`bids`/`asks` 为未变化的查询时盘口，并在 `result` 之后附加 `impact_analysis`：
+
+- `side`、`requested_quantity`、`benchmark_price`：回显查询参数。
+- `executable_quantity`：可执行（成交）数量；`unfilled_quantity`：`requested_quantity − executable_quantity`。
+- `executed_notional`：各档成交价乘数量之和。
+- `best_price`：查询前最佳对手价（买单为最低卖价、卖单为最高买价）；无流动性时为 `null`。
+- `vwap`：无可成交时为 `null`，否则为 `{"numerator": executed_notional, "denominator": executable_quantity}` 的精确分数。
+- `slippage_notional`：买单为 `executed_notional − benchmark_price × executable_quantity`，卖单取相反数；负值表示相对基准改善。
+- `impact_notional`：以**查询前最佳对手价**替代基准价按同一公式计算的盘口冲击成本；卖单同样取相反数。
+- `price_breakdown`：按模拟成交顺序排列的明细，每次消耗一个被动可见片段产生一项（粒度与真实成交一致），每项含 `price` 与 `quantity`；同一价位的不同 maker 分别成项，同一冰山的各次补片也按其再次排到队尾后的实际成交次序分别成项。
+- 无流动性时 `executable_quantity` 与 `executed_notional` 为 0、`unfilled_quantity` 等于请求量、`best_price` 与 `vwap` 为 `null`、两项成本均为 0、`price_breakdown` 为空数组；部分成交时两项成本只按实际可执行量计算。
+
+`IMPACT_REPORT` 与 `EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 一样只属于基线 JSON Lines（`replay`）入口；`events` 多证券事件流不接受该类型（按 `INVALID_EVENT` 拒绝且不占用 `event_id` 与序列），快照格式也不因其改变。
+
 ### 撮合规则
 
 - 买单匹配最低卖价，卖单匹配最高买价；同价位先到者优先（价格时间优先）。
@@ -195,11 +225,13 @@ DAY_END_RECONCILIATION：
   - 执行查询成功：`REPORTED`（附加 `execution_analysis`）
   - 账户查询成功：`REPORTED`（附加 `position_analysis`）
   - 日终对账查询成功：`RECONCILED` 或 `BREAKS_FOUND`（附加 `reconciliation`）
+  - 盘口冲击估算成功：`REPORTED`（附加 `impact_analysis`）
   - 拒绝：`REJECTED`（附加 `reason`）
 - `self_trade_prevention`：仅在两种自成交防护结果下出现，序列化于 `result`/`reason` 之后、`trades` 之前，含 `maker_order_id`（触发的被动单）、`taker_order_id`（被取消的主动单）与 `cancelled_quantity`（取消量，等于触发时主动单的剩余量；FOK 预检触发时为原始委托量）。其他结果不得包含该字段。
 - `execution_analysis`：仅在 EXECUTION_REPORT 的 `REPORTED` 结果下出现，序列化于 `result` 之后、`trades` 之前，字段见上文 EXECUTION_REPORT 一节。其他结果不得包含该字段。
 - `position_analysis`：仅在 ACCOUNT_REPORT 的 `REPORTED` 结果下出现，序列化于 `result` 之后、`trades` 之前，字段见上文 ACCOUNT_REPORT 一节。其他结果不得包含该字段。
 - `reconciliation`：仅在 DAY_END_RECONCILIATION 的 `RECONCILED`/`BREAKS_FOUND` 结果下出现，序列化于 `result` 之后、`trades` 之前，字段见上文 DAY_END_RECONCILIATION 一节。其他结果不得包含该字段。
+- `impact_analysis`：仅在 IMPACT_REPORT 的 `REPORTED` 结果下出现，序列化于 `result`/`reason` 之后、`trades` 之前，字段见上文 IMPACT_REPORT 一节。其他结果不得包含该字段。
 - `trades`：按发生顺序排列；每笔含 `maker_order_id`、`taker_order_id`、`price`、`quantity` 与 `trade_id`。
 - `bids` 按价格降序、`asks` 按价格升序，每档含整数 `price` 与汇总 `quantity`。
 
@@ -213,7 +245,7 @@ DAY_END_RECONCILIATION：
 
 ## 多证券有序事件回放
 
-在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，以及可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，以及可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
 
 ### 命令行
 
