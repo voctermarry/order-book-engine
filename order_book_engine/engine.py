@@ -1075,6 +1075,36 @@ class Engine:
         """Whether an id is already spent or reserved by any accepted order."""
         return order_id in self._order_ids or order_id in self._reserved_order_ids
 
+    def mark_event_id(self, event_id: str) -> None:
+        """Record a dispatched event id without matching or touching orders.
+
+        Used by outer replay layers that reject a structurally valid,
+        in-sequence event on an additional business rule (such as a static
+        price-limit breach) strictly before the engine would match: the event
+        still occupies its id exactly like any other dispatched rejection, so
+        snapshot id bookkeeping stays consistent.
+        """
+        self._event_ids.add(event_id)
+
+    def replace_target_reason(
+        self, order_id: str, has_display_quantity: bool
+    ) -> str | None:
+        """Classify a REPLACE target read-only, before any state change.
+
+        Mirrors exactly the baseline short circuits the engine itself hits
+        before consuming the event id: ``UNKNOWN_ORDER`` for a missing or
+        non-resting target and ``INVALID_SCHEMA`` when an iceberg display
+        slice is offered for a target that is not an iceberg. Returns ``None``
+        when the replacement is clear to proceed to price-limit checks and
+        matching. It never mutates engine state.
+        """
+        record = self._orders.get(order_id)
+        if record is None or record["status"] != RESTING:
+            return UNKNOWN_ORDER
+        if has_display_quantity and "display_quantity" not in record:
+            return INVALID_SCHEMA
+        return None
+
     def reserve_order_id(self, order_id: str) -> None:
         """Block an id from external ADD before its derived order is submitted.
 

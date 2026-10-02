@@ -335,6 +335,35 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 计划完整状态（算法、权重曲线、各片数量、进度与累计分析）进入快照；快照格式版本保持 `event-replay/2`，恢复后继续执行与不中断回放逐字节一致。
 
+### 静态涨跌停价格边界（可选 `price_limits`）
+
+会话 `config` 可携带可选的静态涨跌停配置 `price_limits`，按证券给出闭区间边界：
+
+```json
+{"price_limits": {"AAA": {"lower": 90, "upper": 110},
+                  "BBB": {"lower": 1, "upper": 100000}}}
+```
+
+- 配置是一个 JSON 对象：键为非空证券名字符串，值是只含 `lower` 与 `upper` 两个字段的对象；二者都必须是非布尔正整数，且 `lower <= upper`。不允许额外字段，证券名不得为空或为非字符串。
+- 缺省（不传 `config`、配置中无 `price_limits`）、空对象 `{}` 或未在其中配置的证券，均保持原行为。
+- 非法配置属于调用方错误：Python 入口（`EventReplayer(...)`、`replay_events(...)`、`restore_replayer(...)`）在处理任何事件或采纳任何快照状态之前抛出 `ValueError`（`config` 本身非对象时仍为 `TypeError`）；命令行返回退出码 2 与既有 `INVALID_REQUEST` 错误文档。
+
+对已配置证券，以下价格必须落在 `[lower, upper]` 闭区间内（边界价合法）：
+
+- `ADD` 中 `LIMIT` 与 `ICEBERG` 委托的 `price`；`MARKET` 委托不校验。
+- `REPLACE` 的 `price`（目标无论是普通限价单还是冰山单）。
+- `TWAP_START`、`VWAP_START` 中 `order_type` 为 `LIMIT` 的计划 `price`；`MARKET` 计划不校验。已接受计划的后续 `SLICE` 沿用计划登记的价格，不额外校验。
+
+校验时机在既有的信封、幂等（重复/冲突）、序列与标识冲突检查之后，撮合与任何状态变更之前。因此：
+
+- 越界事件返回 `status` 为 `REJECTED`、`rejection_code` 为 `PRICE_LIMIT_EXCEEDED`，`trades` 与 `book_changes` 均为空，但仍占用 `event_id`（全局幂等日志与该证券引擎事件集合都登记）并推进该证券 `sequence`。
+- 越界 `ADD` 不创建任何订单、不产生成交、不消耗成交编号；越界 `REPLACE` 完全保留原委托（数量、价格、冰山当前公开片与储备）及其队列优先级，不撮合、不消耗成交编号，原委托此后仍可正常撤销或替换。
+- 越界的 `TWAP_START`/`VWAP_START` 不创建计划、不登记 `plan_id`、不保留任何派生子单标识（之后对该 `plan_id` 的切片按 `UNKNOWN_EXECUTION_PLAN` 处理）。
+- 既有的业务结果优先级不变：`DUPLICATE_ORDER_ID`（含计划派生标识冲突）、`UNKNOWN_ORDER`、`DUPLICATE_EXECUTION_PLAN` 等判定先于价格边界；结构非法仍是 `INVALID_EVENT`/`INVALID_SCHEMA`，不占用 `event_id` 与序列。
+- 合法事件的价格时间优先、FOK 原子性、IOC 余量取消、冰山补片与自成交防护行为均不变。
+
+价格边界作为会话 `config` 的一部分，参与 `config_digest` 与 `content_digest` 的确定性（键排序、紧凑分隔）序列化：配置的书写键序不影响摘要。携带相同 `price_limits` 的快照恢复后，后续结果、成交编号与最终盘口与连续回放逐字节一致；调用方配置与快照边界不一致（含一侧有边界、另一侧缺省）时，在采纳状态前抛出 `code` 为 `CONFIG_MISMATCH` 的 `SnapshotError`，命令行沿用对应错误文档与退出码 2。单标的 `order-book-engine replay`、`Engine` 的既有输入输出、未传 `price_limits` 的历史调用，以及 TWAP/VWAP 的分片、汇总与报告字段均不改变。
+
 ### 提交语义与错误码
 
 - 逐事件提交：先前成功事件不会因后续失败回滚；失败事件不留下订单、成交、计数器或盘口变更。
@@ -345,6 +374,7 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 - `DUPLICATE`：已见 `eventId` 且规范化内容（键排序后的紧凑 JSON）完全一致；不再次撮合、无成交无盘口变更。重试投递携带旧序列时仍识别为重复。
 - 撤单/改单不存在或已终结订单，继续沿用基线拒绝码（如 `UNKNOWN_ORDER`、`DUPLICATE_ORDER_ID`）；这类有效事件与基线一样占用其 `event_id` 并推进该证券序列。
 - TWAP/VWAP 业务拒绝码：`UNKNOWN_EXECUTION_PLAN`（未知计划）、`EXECUTION_PLAN_CLOSED`（对已关闭计划切片或取消）、`DUPLICATE_EXECUTION_PLAN`（同证券重复 `plan_id`，TWAP 与 VWAP 共用命名空间）；派生标识冲突沿用 `DUPLICATE_ORDER_ID`。这些有效命令同样占用 `event_id` 并推进序列，但不改变计划或盘口状态。
+- `PRICE_LIMIT_EXCEEDED`：见下节「静态涨跌停价格边界」。
 - 相同初始状态、配置和事件流产生字段顺序稳定、数值表示一致、可逐字节比较的 JSON（规范化序列化：键排序、紧凑分隔、整数不丢精度、无浮点）。
 
 ### 快照与恢复

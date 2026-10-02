@@ -46,6 +46,7 @@ from .engine import (
     CANCEL,
     DUPLICATE_EVENT_ID,
     DUPLICATE_ORDER_ID,
+    ICEBERG,
     IOC,
     LIMIT,
     MARKET,
@@ -71,6 +72,7 @@ INVALID_EVENT = "INVALID_EVENT"
 SEQUENCE_GAP = "SEQUENCE_GAP"
 OUT_OF_ORDER = "OUT_OF_ORDER"
 EVENT_ID_CONFLICT = "EVENT_ID_CONFLICT"
+PRICE_LIMIT_EXCEEDED = "PRICE_LIMIT_EXCEEDED"
 
 # TWAP parent-order rejection codes.
 UNKNOWN_EXECUTION_PLAN = "UNKNOWN_EXECUTION_PLAN"
@@ -287,6 +289,56 @@ DEFAULT_CONFIG: dict[str, object] = {
     "iceberg_replenishment": "tail_of_price_level",
     "self_trade_prevention": "same_account_only",
 }
+
+_PRICE_LIMIT_KEYS = frozenset({"lower", "upper"})
+
+
+def _validate_price_limits(value: object) -> dict[str, tuple[int, int]]:
+    """Validate the optional static ``price_limits`` configuration.
+
+    The mapping binds a security name to the inclusive ``{"lower", "upper"}``
+    boundary pair; names must be non-empty strings, boundaries non-boolean
+    positive integers with ``lower <= upper``, and no other fields are
+    allowed. An absent key or an empty mapping leaves every security on its
+    baseline behaviour. Any structural problem is a caller error and raises
+    :class:`ValueError` before events are processed or snapshots adopted.
+    Returns a normalized ``symbol -> (lower, upper)`` map.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("config price_limits must be a JSON object")
+    normalized: dict[str, tuple[int, int]] = {}
+    for symbol, bounds in value.items():
+        if not _is_non_empty_str(symbol):
+            raise ValueError("price_limits keys must be non-empty security strings")
+        if not isinstance(bounds, dict) or set(bounds) != _PRICE_LIMIT_KEYS:
+            raise ValueError(
+                f"price_limits for {symbol!r} must be an object carrying "
+                'exactly "lower" and "upper"'
+            )
+        lower = bounds["lower"]
+        upper = bounds["upper"]
+        if not _is_positive_int(lower) or not _is_positive_int(upper):
+            raise ValueError(
+                f"price_limits for {symbol!r} must use non-boolean positive "
+                "integer boundaries"
+            )
+        if lower > upper:
+            raise ValueError(
+                f"price_limits for {symbol!r} require lower <= upper"
+            )
+        normalized[symbol] = (lower, upper)
+    return normalized
+
+
+def _validate_config(config: object) -> dict[str, tuple[int, int]]:
+    """Validate a session configuration and return its normalized price map."""
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise TypeError("config must be a JSON object or None")
+    if "price_limits" not in config:
+        return {}
+    return _validate_price_limits(config["price_limits"])
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +566,10 @@ class EventReplayer:
         if config is not None and not isinstance(config, dict):
             raise TypeError("config must be a JSON object or None")
         self.config: dict[str, object] = dict(DEFAULT_CONFIG if config is None else config)
+        # The static per-security price limits are validated up front so a
+        # malformed configuration fails before any event is processed or any
+        # snapshot state adopted; absent/empty limits leave every symbol open.
+        self._price_limits: dict[str, tuple[int, int]] = _validate_config(self.config)
         self.config_digest = _digest(self.config)
         self._symbols: dict[str, _SymbolState] = {}
         # Global index of every accepted eventId: eventId -> (symbol, content).
@@ -741,6 +797,32 @@ class EventReplayer:
                 "asks": asks,
             }
 
+        # ---- static per-security price limits ----------------------------
+        # Checked only after envelope, idempotency, sequencing and identifier
+        # conflicts, so those classifications keep priority; and before any
+        # matching or state change. MARKET events carry no limit price and are
+        # never checked. A boundary breach is a committed business rejection.
+        if self._violates_price_limit(event_type, payload, state, symbol):
+            # A committed business rejection: occupy the id in both the
+            # replay log and the engine journal (no order, trade or book
+            # change, no trade id spent), and advance the symbol sequence.
+            state.engine.mark_event_id(event_id)
+            state.last_sequence = sequence
+            state.seen[event_id] = content
+            self._events[event_id] = (symbol, content)
+            bids, asks = state.engine.snapshot()
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": REJECTED,
+                "rejection_code": PRICE_LIMIT_EXCEEDED,
+                "trades": [],
+                "book_changes": {"bids": [], "asks": []},
+                "bids": bids,
+                "asks": asks,
+            }
+
         if event_type in _PLAN_TYPES:
             out = self._dispatch_plan(
                 event, payload, event_type, state, symbol, sequence, content
@@ -805,6 +887,48 @@ class EventReplayer:
             return _TWAP_PLAN_REF_KEYS
         return None
 
+    def _violates_price_limit(
+        self,
+        event_type: str,
+        payload: dict[str, object],
+        state: _SymbolState,
+        symbol: str,
+    ) -> bool:
+        """Whether a baseline event breaches the symbol's static price limit.
+
+        Only priced events are bounded: LIMIT and ICEBERG ``ADD`` carry their
+        limit price, ``REPLACE`` always carries one, and MARKET events are
+        never checked (CANCEL carries no price at all). The baseline business
+        classifications that the engine itself reaches before matching keep
+        priority — an unknown/non-resting REPLACE target (``UNKNOWN_ORDER``)
+        and a display slice offered for a non-iceberg target
+        (``INVALID_SCHEMA``) fall through to the regular dispatch path rather
+        than being reported as price breaches.
+        """
+        bounds = self._price_limits.get(symbol)
+        if bounds is None:
+            return False
+        lower, upper = bounds
+        if event_type == ADD:
+            if payload["order_type"] not in (LIMIT, ICEBERG):
+                return False
+            if state.engine.has_order_id(payload["order_id"]):
+                # A spent or plan-reserved order id yields the baseline
+                # DUPLICATE_ORDER_ID and keeps priority over the limit check.
+                return False
+            price = payload["price"]
+        elif event_type == REPLACE:
+            prior_reason = state.engine.replace_target_reason(
+                payload["order_id"], "display_quantity" in payload
+            )
+            if prior_reason is not None:
+                # UNKNOWN_ORDER / INVALID_SCHEMA keep their baseline priority.
+                return False
+            price = payload["price"]
+        else:
+            return False
+        return not (lower <= price <= upper)
+
     # -- parent-order plan handling ------------------------------------------
 
     def _dispatch_plan(
@@ -830,9 +954,9 @@ class EventReplayer:
         before_asks = dict(before_asks)
 
         if event_type == TWAP_START:
-            result_out = self._twap_start(payload, state)
+            result_out = self._twap_start(payload, state, symbol)
         elif event_type == VWAP_START:
-            result_out = self._vwap_start(payload, state)
+            result_out = self._vwap_start(payload, state, symbol)
         elif event_type in (TWAP_SLICE, VWAP_SLICE):
             result_out = self._plan_slice(payload, state)
         elif event_type in (TWAP_CANCEL, VWAP_CANCEL):
@@ -855,7 +979,7 @@ class EventReplayer:
         )
 
     def _twap_start(
-        self, payload: dict[str, object], state: _SymbolState
+        self, payload: dict[str, object], state: _SymbolState, symbol: str
     ) -> tuple[str, str | None, ExecutionPlan | None, None]:
         """Create the TWAP plan; no matching occurs."""
         plan = ExecutionPlan(
@@ -868,10 +992,10 @@ class EventReplayer:
             price=payload.get("price") if payload["order_type"] == LIMIT else None,
             account_id=payload.get("account_id"),
         )
-        return self._register_plan(state, plan)
+        return self._register_plan(state, plan, self._price_limits.get(symbol))
 
     def _vwap_start(
-        self, payload: dict[str, object], state: _SymbolState
+        self, payload: dict[str, object], state: _SymbolState, symbol: str
     ) -> tuple[str, str | None, ExecutionPlan | None, None]:
         """Create the VWAP plan; no matching occurs."""
         weights: list[int] = payload["volume_weights"]
@@ -887,11 +1011,13 @@ class EventReplayer:
             algorithm=ALGORITHM_VWAP,
             volume_weights=weights,
         )
-        return self._register_plan(state, plan)
+        return self._register_plan(state, plan, self._price_limits.get(symbol))
 
     @staticmethod
     def _register_plan(
-        state: _SymbolState, plan: ExecutionPlan
+        state: _SymbolState,
+        plan: ExecutionPlan,
+        price_limits: tuple[int, int] | None,
     ) -> tuple[str, str | None, ExecutionPlan | None, None]:
         """Register a new plan and reserve its derived ids.
 
@@ -900,6 +1026,11 @@ class EventReplayer:
         Every derived id is reserved up front; a clash with an existing order
         or another plan's derived id rejects the start before anything is
         registered, so the event leaves no plan or reservation behind.
+
+        The duplicate-plan and derived-id conflicts both take priority over
+        the static price limit check; the limit is therefore enforced only
+        after those checks and still before any id is reserved, so an
+        out-of-range LIMIT plan leaves no plan and no derived ids behind.
         """
         plan_id = plan.plan_id
         if plan_id in state.plans:
@@ -907,6 +1038,13 @@ class EventReplayer:
         for child_id in plan.child_ids():
             if state.engine.has_order_id(child_id) or child_id in state.plan_index:
                 return REJECTED, DUPLICATE_ORDER_ID, None, None
+        if (
+            price_limits is not None
+            and plan.order_type == LIMIT
+            and plan.price is not None
+            and not (price_limits[0] <= plan.price <= price_limits[1])
+        ):
+            return REJECTED, PRICE_LIMIT_EXCEEDED, None, None
         for child_id in plan.child_ids():
             state.engine.reserve_order_id(child_id)
             state.plan_index[child_id] = plan_id
@@ -1686,6 +1824,11 @@ def restore_replayer(
         raise SnapshotError(SNAPSHOT_CORRUPT, "snapshot must be a JSON object")
     if not set(snapshot) <= _ENVELOPE_KEYS_SNAPSHOT:
         raise SnapshotError(SNAPSHOT_CORRUPT, "snapshot document has unknown fields")
+
+    # A malformed caller configuration is a ValueError (or TypeError for a
+    # non-object) before any snapshot content is examined or state adopted,
+    # exactly as for a fresh session.
+    _validate_config(config)
 
     version = snapshot.get("format_version")
     if version != FORMAT_VERSION:
