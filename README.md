@@ -185,7 +185,7 @@ IMPACT_REPORT：
 - `price_breakdown`：按模拟成交顺序排列的明细，每次消耗一个被动可见片段产生一项（粒度与真实成交一致），每项含 `price` 与 `quantity`；同一价位的不同 maker 分别成项，同一冰山的各次补片也按其再次排到队尾后的实际成交次序分别成项。
 - 无流动性时 `executable_quantity` 与 `executed_notional` 为 0、`unfilled_quantity` 等于请求量、`best_price` 与 `vwap` 为 `null`、两项成本均为 0、`price_breakdown` 为空数组；部分成交时两项成本只按实际可执行量计算。
 
-`IMPACT_REPORT` 与 `EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 一样只属于基线 JSON Lines（`replay`）入口；`events` 多证券事件流不接受该类型（按 `INVALID_EVENT` 拒绝且不占用 `event_id` 与序列），快照格式也不因其改变。
+`IMPACT_REPORT` 与 `EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 一样只属于基线 JSON Lines（`replay`）入口；`events` 多证券事件流不接受这些类型（按 `INVALID_EVENT` 拒绝且不占用 `event_id` 与序列），快照格式也不因其改变。与之对称，跨证券的 `PORTFOLIO_REPORT` 只属于多证券事件流（`events`/`replay_events`/`EventReplayer`），基线单证券 JSON Lines 入口不接受该类型（按基线 `INVALID_SCHEMA` 拒绝）。
 
 ### 撮合规则
 
@@ -245,7 +245,7 @@ IMPACT_REPORT：
 
 ## 多证券有序事件回放
 
-在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，以及可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，以及跨证券只读查询 `PORTFOLIO_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
 
 ### 命令行
 
@@ -284,6 +284,7 @@ response = replay_events(events, config=None, snapshot=None, snapshot_after="las
 - `book_changes`：本次盘口变更，`bids` 降序、`asks` 升序；仅列出数量发生变化的档位，被移除的档位以 `"quantity": 0` 表示。
 - `bids`/`asks`：该事件处理后的该证券完整盘口（已知证券的拒绝事件回显未变化盘口；未知证券的预分发拒绝为空盘口且不创建证券）。
 - `execution_plan`：仅 TWAP/VWAP 命令的结果出现，字段见下文 TWAP 母单与 VWAP 母单两节。
+- `portfolio_analysis`：仅 `PORTFOLIO_REPORT` 的成功结果出现，字段见下文「跨证券组合报告 PORTFOLIO_REPORT」一节；其他结果不得包含该字段。
 
 ### TWAP 母单
 
@@ -367,6 +368,43 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 计划完整状态（算法、权重曲线、各片数量、进度与累计分析）进入快照；快照格式版本保持 `event-replay/2`，恢复后继续执行与不中断回放逐字节一致。
 
+### 跨证券组合报告 PORTFOLIO_REPORT
+
+`PORTFOLIO_REPORT` 是属于多证券事件流的只读跨证券查询，在确定时点汇总一个账户跨全部证券的持仓、资金与风险。它沿用事件信封的 `event_id`、`symbol`、`sequence` 顺序与幂等语义：
+
+```json
+{"event_id": "e8", "symbol": "AAA", "sequence": 4, "type": "PORTFOLIO_REPORT",
+ "account_id": "acct-1", "mark_prices": {"AAA": 100, "BBB": 50}}
+```
+
+- `account_id`：非空字符串。账户在**任一证券**上已有携带该 `account_id` 的已接受 ADD（无论订单最终在簿、成交、撤销或被自成交防护取消）即视为已知；已释放的 TWAP/VWAP 子单继承母单账户，同样计入，已接受的 TWAP/VWAP 母单即使尚未释放任何子单也使该账户在该证券上已知；仅出现在被拒绝事件中的账户不算已知。
+- `mark_prices`：对象，键为非空证券名字符串，值为正整数标记价（布尔值不算整数）。键集合必须**恰好**覆盖该账户出现过的全部证券——既不能缺，也不能多。
+- 字段缺失、多出、类型错误、`account_id` 为空标识、`mark_prices` 不是对象、含空键或非法价格（布尔、零、负、浮点、字符串、空值）均按 `INVALID_EVENT` 拒绝，**不占用** `event_id` 且**不推进** `sequence`。
+- 结构合法但账户未知：`UNKNOWN_ACCOUNT`；账户已知但 `mark_prices` 键集合不符（含空对象）：`MARK_PRICE_MISMATCH`。二者都是业务拒绝：**占用** `event_id`、**推进**信封 `symbol` 的序列，并回显该信封证券的未变盘口；其 `event_id` 只进入重放日志，不进入任何证券的引擎事件集合。
+- 查询只读取此前已接受事件产生的成交：不撮合、不释放计划切片，也不改变盘口、成交编号、计划或账户集合。
+
+查询成功时 `status` 为 `ACCEPTED`、`result` 为 `REPORTED`；`trades` 与 `book_changes` 为空，`bids`/`asks` 为**信封 `symbol`** 的未变盘口，并附加 `portfolio_analysis`：
+
+- `account_id`：回显查询账户。
+- `positions`：按 `symbol` 字典序排列的每证券持仓项。统计同时计入该账户作为 maker、taker、REPLACE 后继承账户以及冰山补片的成交，未带 `account_id` 的订单不计入；每项含：
+  - `symbol`、`mark_price`：证券代码与本次标记价。
+  - `buy_quantity`、`sell_quantity`：累计买入、卖出数量。
+  - `buy_notional`、`sell_notional`：累计买入、卖出成交额（成交价乘数量）。
+  - `net_position`：`buy_quantity − sell_quantity`。
+  - `cash_balance`：`sell_notional − buy_notional`。
+  - `buy_vwap`、`sell_vwap`：对应数量为零时为 `null`，否则为 `{"numerator": 成交额, "denominator": 数量}` 的精确分数。
+  - `turnover_notional`：`buy_notional + sell_notional`。
+  - `position_market_value`：`net_position × mark_price`。
+  - `risk_exposure`：`|net_position| × mark_price`（绝对风险敞口）。
+  - `mark_to_market_pnl`：`cash_balance + position_market_value`。
+- `totals`：跨证券汇总：
+  - `buy_notional`、`sell_notional`、`cash_balance`（卖出额减买入额）、`turnover_notional` 为各证券对应项之和。
+  - `position_market_value`：各证券 `net_position × mark_price` 之和（不先取绝对值，多空市值可相消）。
+  - `risk_exposure`：各证券绝对风险敞口之和。
+  - `mark_to_market_pnl`：`totals.cash_balance + totals.position_market_value`，与各证券盯市损益之和相等。
+
+信封、幂等与顺序规则优先适用：成功与两类业务拒绝都占用 `event_id` 并推进信封证券序列；相同 `event_id` 同内容的重试返回 `DUPLICATE`，同 id 不同内容（或另一证券）返回 `EVENT_ID_CONFLICT`；序列空洞/倒退仍为 `SEQUENCE_GAP`/`OUT_OF_ORDER`。查询不改变快照中任何撮合相关结构；快照恢复后的查询结果与不中断连续回放逐字节一致。
+
 ### 提交语义与错误码
 
 - 逐事件提交：先前成功事件不会因后续失败回滚；失败事件不留下订单、成交、计数器或盘口变更。
@@ -377,6 +415,7 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 - `DUPLICATE`：已见 `eventId` 且规范化内容（键排序后的紧凑 JSON）完全一致；不再次撮合、无成交无盘口变更。重试投递携带旧序列时仍识别为重复。
 - 撤单/改单不存在或已终结订单，继续沿用基线拒绝码（如 `UNKNOWN_ORDER`、`DUPLICATE_ORDER_ID`）；这类有效事件与基线一样占用其 `event_id` 并推进该证券序列。
 - TWAP/VWAP 业务拒绝码：`UNKNOWN_EXECUTION_PLAN`（未知计划）、`EXECUTION_PLAN_CLOSED`（对已关闭计划切片或取消）、`DUPLICATE_EXECUTION_PLAN`（同证券重复 `plan_id`，TWAP 与 VWAP 共用命名空间）；派生标识冲突沿用 `DUPLICATE_ORDER_ID`。这些有效命令同样占用 `event_id` 并推进序列，但不改变计划或盘口状态。
+- 跨证券组合报告拒绝码：`UNKNOWN_ACCOUNT`（账户在任一证券上均无已接受 ADD 或已接受 TWAP/VWAP 母单）、`MARK_PRICE_MISMATCH`（已知账户但 `mark_prices` 键集合未恰好覆盖其全部证券）。二者都是结构合法后的业务拒绝，占用 `event_id`、推进信封证券序列并回显未变盘口；结构错误仍为 `INVALID_EVENT`，不占用 `event_id` 与序列。
 - 相同初始状态、配置和事件流产生字段顺序稳定、数值表示一致、可逐字节比较的 JSON（规范化序列化：键排序、紧凑分隔、整数不丢精度、无浮点）。
 - 静态涨跌停越界码：`PRICE_LIMIT_EXCEEDED`，见下文「静态涨跌停 `price_limits`」一节。
 

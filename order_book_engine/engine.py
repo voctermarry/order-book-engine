@@ -1050,25 +1050,27 @@ class Engine:
         executed_notional = sum(price * qty for price, qty in fills)
         return fills, executable_quantity, executed_notional
 
-    def _account_report(
-        self, event_id: str, obj: dict[str, object]
-    ) -> tuple[
-        str, str, str | None,
-        list[dict[str, object]], dict[str, object] | None,
-        dict[str, object] | None, dict[str, object] | None,
-    ]:
-        """Answer a cumulative account query without touching any state.
+    def knows_account(self, account_id: str) -> bool:
+        """Whether an accepted ADD ever named ``account_id``.
 
-        Every trade is attributed to an account through the order it was
-        resting or arriving as: replacements keep the order id and its
-        account, and iceberg replenishment slices trade under the same maker
-        id, so the journal lookup alone gathers the full history. Orders
+        Orders keep their account however they ended up (resting, filled or
+        cancelled); rejected ADDs never reach the account set. Used by the
+        multi-symbol replay layer's cross-security portfolio query.
+        """
+        return account_id in self._accounts
+
+    def account_aggregates(
+        self, account_id: str
+    ) -> tuple[int, int, int, int]:
+        """Cumulative traded quantities and notionals for one account.
+
+        Returns ``(buy_quantity, sell_quantity, buy_notional, sell_notional)``
+        accumulated from every trade the account's orders took part in as maker
+        or taker on this engine's security. Replacements keep the order id and
+        its account, and iceberg replenishment slices trade under the same
+        maker id, so the journal lookup alone gathers the full history. Orders
         without an ``account_id`` never contribute.
         """
-        account_id: str = obj["account_id"]
-        if account_id not in self._accounts:
-            return event_id, REJECTED, UNKNOWN_ACCOUNT, [], None, None, None
-
         buy_quantity = 0
         sell_quantity = 0
         buy_notional = 0
@@ -1085,6 +1087,30 @@ class Engine:
                 else:
                     sell_quantity += trade["quantity"]
                     sell_notional += notional
+        return buy_quantity, sell_quantity, buy_notional, sell_notional
+
+    def _account_report(
+        self, event_id: str, obj: dict[str, object]
+    ) -> tuple[
+        str, str, str | None,
+        list[dict[str, object]], dict[str, object] | None,
+        dict[str, object] | None, dict[str, object] | None,
+    ]:
+        """Answer a cumulative account query without touching any state.
+
+        Every trade is attributed to an account through the order it was
+        resting or arriving as: replacements keep the order id and its
+        account, and iceberg replenishment slices trade under the same maker
+        id, so the journal lookup alone gathers the full history. Orders
+        without an ``account_id`` never contribute.
+        """
+        account_id: str = obj["account_id"]
+        if not self.knows_account(account_id):
+            return event_id, REJECTED, UNKNOWN_ACCOUNT, [], None, None, None
+
+        buy_quantity, sell_quantity, buy_notional, sell_notional = (
+            self.account_aggregates(account_id)
+        )
 
         net_position = buy_quantity - sell_quantity
         if buy_quantity:

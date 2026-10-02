@@ -8,10 +8,11 @@ matching rules, priorities, rejection semantics or trade record shapes:
   order events for one or several securities. Every security keeps its own
   sequence counter and its own book; events are applied strictly in input
   order, so identical timestamps never reorder anything. The stream covers
-  the baseline ADD/CANCEL/REPLACE behaviours and resumable TWAP/VWAP parent
+  the baseline ADD/CANCEL/REPLACE behaviours, resumable TWAP/VWAP parent
   orders (TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
-  VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT); plans never read a wall
-  clock and are advanced solely by their SLICE events. TWAP slices divide
+  VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT) and the read-only
+  cross-security PORTFOLIO_REPORT query; plans never read a wall clock and
+  are advanced solely by their SLICE events. TWAP slices divide
   the total evenly; VWAP slices follow a caller-supplied volume-weight
   curve.
 * Each event is committed individually: a later failure never rolls back an
@@ -51,8 +52,10 @@ from .engine import (
     LIMIT,
     MARKET,
     REPLACE,
+    REPORTED,
     SELL,
     Engine,
+    UNKNOWN_ACCOUNT,
     _is_non_empty_str,
     _is_positive_int,
 )
@@ -80,6 +83,10 @@ DUPLICATE_EXECUTION_PLAN = "DUPLICATE_EXECUTION_PLAN"
 
 # Static per-security price-limit rejection code.
 PRICE_LIMIT_EXCEEDED = "PRICE_LIMIT_EXCEEDED"
+
+# Cross-security portfolio report event and its business rejection codes.
+PORTFOLIO_REPORT = "PORTFOLIO_REPORT"
+MARK_PRICE_MISMATCH = "MARK_PRICE_MISMATCH"
 
 # TWAP event types.
 TWAP_START = "TWAP_START"
@@ -109,18 +116,23 @@ SNAPSHOT_VERSION_UNSUPPORTED = "SNAPSHOT_VERSION_UNSUPPORTED"
 CONFIG_MISMATCH = "CONFIG_MISMATCH"
 
 #: Event types this replay layer accepts. The TWAP/VWAP parent-order commands
-#: join the baseline mutating behaviours; the baseline read-only reports stay
-#: exclusive to the JSON Lines entry point.
+#: join the baseline mutating behaviours; the baseline single-security
+#: read-only reports stay exclusive to the JSON Lines entry point, while the
+#: cross-security PORTFOLIO_REPORT query is exclusive to this layer.
 SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
      TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
-     VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT}
+     VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
+     PORTFOLIO_REPORT}
 )
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
 _BASELINE_KEYS = frozenset(
     {"event_id", "type", "order_id", "side", "order_type", "quantity", "price",
      "time_in_force", "display_quantity", "account_id"}
+)
+_PORTFOLIO_REPORT_KEYS = frozenset(
+    {"event_id", "type", "account_id", "mark_prices"}
 )
 _TWAP_START_KEYS = frozenset(
     {"event_id", "type", "plan_id", "side", "total_quantity", "slice_count",
@@ -143,6 +155,11 @@ _VWAP_START_REQUIRED = frozenset(
 _VWAP_TYPES = frozenset({VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT})
 #: Every parent-order command type, across algorithms.
 _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES
+#: Event types whose ids live solely in the replay log: parent-order commands
+#: never touch the engine journal, and the cross-security portfolio query is
+#: read-only and matched by no engine. Baseline ADD/CANCEL/REPLACE ids occupy
+#: the per-symbol engine journal instead.
+_REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset({PORTFOLIO_REPORT})
 
 
 def _allocate_slices(total_quantity: int, weights: list[int]) -> list[int]:
@@ -273,6 +290,35 @@ def _vwap_schema_error(payload: dict[str, object]) -> str | None:
         return INVALID_EVENT
     if not _is_non_empty_str(payload.get("plan_id")):
         return INVALID_EVENT
+    return None
+
+
+def _portfolio_report_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a PORTFOLIO_REPORT query payload.
+
+    The query carries exactly ``event_id``, ``type``, ``account_id`` and
+    ``mark_prices``; identifiers are non-empty strings and ``mark_prices`` is
+    an object mapping non-empty symbol strings to positive integers (booleans
+    do not count). The map may be empty structurally: for a known account it
+    can never match that account's securities, so the empty map is classified
+    as ``MARK_PRICE_MISMATCH`` (which consumes the id and the sequence) rather
+    than as a schema error. Whether the account is known and whether the key
+    set actually covers its securities are therefore business checks, not
+    schema checks: an INVALID_EVENT consumes neither the event id nor the
+    sequence, while the business rejections do.
+    """
+    if set(payload) != _PORTFOLIO_REPORT_KEYS:
+        return INVALID_EVENT
+    if not _is_non_empty_str(payload.get("account_id")):
+        return INVALID_EVENT
+    mark_prices = payload.get("mark_prices")
+    if not isinstance(mark_prices, dict):
+        return INVALID_EVENT
+    for symbol, mark_price in mark_prices.items():
+        if not _is_non_empty_str(symbol):
+            return INVALID_EVENT
+        if not _is_positive_int(mark_price):
+            return INVALID_EVENT
     return None
 
 
@@ -711,6 +757,8 @@ class EventReplayer:
             schema_error = _twap_schema_error(payload)
         elif event_type in _VWAP_TYPES:
             schema_error = _vwap_schema_error(payload)
+        elif event_type == PORTFOLIO_REPORT:
+            schema_error = _portfolio_report_schema_error(payload)
         else:
             schema_error = Engine._schema_error(payload)
         if schema_error is not None:
@@ -821,6 +869,11 @@ class EventReplayer:
                 "bids": bids,
                 "asks": asks,
             }
+
+        if event_type == PORTFOLIO_REPORT:
+            return self._dispatch_portfolio_report(
+                event_id, payload, state, symbol, sequence, content
+            )
 
         if event_type in _PLAN_TYPES:
             out = self._dispatch_plan(
@@ -951,6 +1004,8 @@ class EventReplayer:
         if inline_type in (TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
                            VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT):
             return _TWAP_PLAN_REF_KEYS
+        if inline_type == PORTFOLIO_REPORT:
+            return _PORTFOLIO_REPORT_KEYS
         return None
 
     # -- parent-order plan handling ------------------------------------------
@@ -1207,6 +1262,156 @@ class EventReplayer:
             "asks": asks,
         }
 
+    # -- cross-security portfolio report -------------------------------------
+
+    def _account_symbols(self, account_id: str) -> set[str]:
+        """The securities on which an accepted event named ``account_id``.
+
+        An account is known on a security once either an accepted ADD carried
+        it or an accepted TWAP/VWAP plan carried it; released slices inherit
+        the plan's account and therefore already show up in the engine's
+        account set, while a started-but-never-sliced plan is picked up
+        directly. This mirrors the baseline rule that an accepted ADD makes an
+        account known whatever later happens to the order.
+        """
+        symbols: set[str] = set()
+        for sym, symbol_state in self._symbols.items():
+            if symbol_state.engine.knows_account(account_id):
+                symbols.add(sym)
+                continue
+            for plan in symbol_state.plans.values():
+                if plan.account_id == account_id:
+                    symbols.add(sym)
+                    break
+        return symbols
+
+    def _dispatch_portfolio_report(
+        self,
+        event_id: str,
+        payload: dict[str, object],
+        state: _SymbolState,
+        symbol: str,
+        sequence: int,
+        content: str,
+    ) -> dict[str, object]:
+        """Answer a read-only cross-security portfolio query.
+
+        The query only reads trades produced by earlier accepted events: it
+        never matches, never releases a plan slice and never moves a book, a
+        trade id, a plan or an account set. Like every other structurally
+        valid event it occupies its event id and advances the envelope
+        symbol's sequence, including the ``UNKNOWN_ACCOUNT`` and
+        ``MARK_PRICE_MISMATCH`` business rejections. Its id lives solely in
+        the replay log, exactly like a parent-order command id.
+        """
+        account_id: str = payload["account_id"]
+        mark_prices: dict[str, object] = payload["mark_prices"]
+
+        def reject(code: str) -> dict[str, object]:
+            state.last_sequence = sequence
+            state.seen[event_id] = content
+            self._events[event_id] = (symbol, content)
+            bids, asks = state.engine.snapshot()
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": REJECTED,
+                "rejection_code": code,
+                "trades": [],
+                "book_changes": {"bids": [], "asks": []},
+                "bids": bids,
+                "asks": asks,
+            }
+
+        known_symbols = self._account_symbols(account_id)
+        if not known_symbols:
+            return reject(UNKNOWN_ACCOUNT)
+        # The mark map must name exactly the securities the account ever
+        # appeared on: one missing or one extra is a business rejection, not a
+        # schema error, and still consumes the id and the sequence.
+        if set(mark_prices) != known_symbols:
+            return reject(MARK_PRICE_MISMATCH)
+
+        positions: list[dict[str, object]] = []
+        total_buy_notional = 0
+        total_sell_notional = 0
+        total_turnover = 0
+        total_market_value = 0
+        total_exposure = 0
+        total_pnl = 0
+        for sym in sorted(known_symbols):
+            mark_price = mark_prices[sym]
+            engine = self._symbols[sym].engine
+            buy_quantity, sell_quantity, buy_notional, sell_notional = (
+                engine.account_aggregates(account_id)
+            )
+            net_position = buy_quantity - sell_quantity
+            cash_balance = sell_notional - buy_notional
+            turnover = buy_notional + sell_notional
+            market_value = net_position * mark_price
+            exposure = abs(net_position) * mark_price
+            pnl = cash_balance + market_value
+            positions.append({
+                "symbol": sym,
+                "mark_price": mark_price,
+                "buy_quantity": buy_quantity,
+                "sell_quantity": sell_quantity,
+                "buy_notional": buy_notional,
+                "sell_notional": sell_notional,
+                "net_position": net_position,
+                "cash_balance": cash_balance,
+                "buy_vwap": (
+                    {"numerator": buy_notional, "denominator": buy_quantity}
+                    if buy_quantity else None
+                ),
+                "sell_vwap": (
+                    {"numerator": sell_notional, "denominator": sell_quantity}
+                    if sell_quantity else None
+                ),
+                "turnover_notional": turnover,
+                "position_market_value": market_value,
+                "risk_exposure": exposure,
+                "mark_to_market_pnl": pnl,
+            })
+            total_buy_notional += buy_notional
+            total_sell_notional += sell_notional
+            total_turnover += turnover
+            total_market_value += market_value
+            total_exposure += exposure
+            total_pnl += pnl
+
+        analysis: dict[str, object] = {
+            "account_id": account_id,
+            "positions": positions,
+            "totals": {
+                "buy_notional": total_buy_notional,
+                "sell_notional": total_sell_notional,
+                "cash_balance": total_sell_notional - total_buy_notional,
+                "turnover_notional": total_turnover,
+                "position_market_value": total_market_value,
+                "risk_exposure": total_exposure,
+                "mark_to_market_pnl": total_pnl,
+            },
+        }
+
+        state.last_sequence = sequence
+        state.seen[event_id] = content
+        self._events[event_id] = (symbol, content)
+        bids, asks = state.engine.snapshot()
+        return {
+            "event_id": event_id,
+            "symbol": symbol,
+            "sequence": sequence,
+            "status": ACCEPTED,
+            "result": REPORTED,
+            "trades": [],
+            "book_changes": {"bids": [], "asks": []},
+            "bids": bids,
+            "asks": asks,
+            "portfolio_analysis": analysis,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Snapshot export / restoration
@@ -1436,19 +1641,20 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
         seen[event_id] = content
 
     # Partition the accepted events into baseline engine events and
-    # parent-order command events: the engine journal only knows the former
-    # plus the child orders synthesized for released slices, while every
-    # TWAP/VWAP command id lives solely in the replay log.
+    # replay-only events: the engine journal only knows the former plus the
+    # child orders synthesized for released slices, while every TWAP/VWAP
+    # command id and every read-only PORTFOLIO_REPORT id lives solely in the
+    # replay log.
     baseline_event_ids: set[str] = set()
-    plan_event_ids: set[str] = set()
+    replay_only_event_ids: set[str] = set()
     for event_id, content in seen.items():
         try:
             stored_type = json.loads(content).get("type")
         except (ValueError, AttributeError):
             _require(False, f"event log content for {event_id} is not a JSON object")
             stored_type = None
-        if stored_type in _PLAN_TYPES:
-            plan_event_ids.add(event_id)
+        if stored_type in _REPLAY_ONLY_TYPES:
+            replay_only_event_ids.add(event_id)
         else:
             baseline_event_ids.add(event_id)
 
@@ -1952,9 +2158,10 @@ def replay_events(
         strictly increasing per symbol) and a payload — either inline
         (``"type"`` plus the fields of that event kind) or nested under an
         ``"event"`` object that repeats ``event_id`` and ``type``. Supported
-        kinds are the baseline ADD/CANCEL/REPLACE events and the TWAP/VWAP
+        kinds are the baseline ADD/CANCEL/REPLACE events, the TWAP/VWAP
         TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
-        VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands.
+        VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands, and the
+        read-only cross-security PORTFOLIO_REPORT query.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
         a resumed run must pass the same configuration the snapshot carries.
