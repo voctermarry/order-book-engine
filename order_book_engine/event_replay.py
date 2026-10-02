@@ -46,6 +46,7 @@ from .engine import (
     CANCEL,
     DUPLICATE_EVENT_ID,
     DUPLICATE_ORDER_ID,
+    ICEBERG,
     IOC,
     LIMIT,
     MARKET,
@@ -76,6 +77,9 @@ EVENT_ID_CONFLICT = "EVENT_ID_CONFLICT"
 UNKNOWN_EXECUTION_PLAN = "UNKNOWN_EXECUTION_PLAN"
 EXECUTION_PLAN_CLOSED = "EXECUTION_PLAN_CLOSED"
 DUPLICATE_EXECUTION_PLAN = "DUPLICATE_EXECUTION_PLAN"
+
+# Static per-security price-limit rejection code.
+PRICE_LIMIT_EXCEEDED = "PRICE_LIMIT_EXCEEDED"
 
 # TWAP event types.
 TWAP_START = "TWAP_START"
@@ -287,6 +291,42 @@ DEFAULT_CONFIG: dict[str, object] = {
     "iceberg_replenishment": "tail_of_price_level",
     "self_trade_prevention": "same_account_only",
 }
+
+
+def _price_limit_error(price_limits: object) -> str | None:
+    """Validate the optional static ``price_limits`` configuration block.
+
+    The block maps each configured security name (a non-empty string) to an
+    object holding exactly ``lower`` and ``upper``; both bounds are positive
+    integers (booleans do not count) with ``lower <= upper``. An empty block
+    (or an absent one) leaves every security at the baseline behaviour.
+    Returns an error message when the block is malformed, otherwise ``None``.
+    """
+    if not isinstance(price_limits, dict):
+        return "price_limits must be an object mapping symbols to bounds"
+    for symbol, bounds in price_limits.items():
+        if not _is_non_empty_str(symbol):
+            return "price_limits keys must be non-empty symbol strings"
+        if not isinstance(bounds, dict) or set(bounds) != {"lower", "upper"}:
+            return (
+                f"price_limits for {symbol!r} must be an object with exactly "
+                "'lower' and 'upper'"
+            )
+        lower = bounds["lower"]
+        upper = bounds["upper"]
+        if not _is_positive_int(lower) or not _is_positive_int(upper):
+            return f"price_limits for {symbol!r} must use positive integer bounds"
+        if lower > upper:
+            return f"price_limits for {symbol!r} require lower <= upper"
+    return None
+
+
+def _validate_config(config: dict[str, object]) -> None:
+    """Raise ``ValueError`` before any event or snapshot is touched."""
+    if "price_limits" in config:
+        message = _price_limit_error(config["price_limits"])
+        if message is not None:
+            raise ValueError(message)
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +554,14 @@ class EventReplayer:
         if config is not None and not isinstance(config, dict):
             raise TypeError("config must be a JSON object or None")
         self.config: dict[str, object] = dict(DEFAULT_CONFIG if config is None else config)
+        _validate_config(self.config)
+        # Static per-security price bounds (closed interval), parsed from the
+        # validated config. Securities without an entry keep baseline rules.
+        raw_limits = self.config.get("price_limits") or {}
+        self.price_limits: dict[str, tuple[int, int]] = {
+            symbol: (bounds["lower"], bounds["upper"])
+            for symbol, bounds in raw_limits.items()
+        }
         self.config_digest = _digest(self.config)
         self._symbols: dict[str, _SymbolState] = {}
         # Global index of every accepted eventId: eventId -> (symbol, content).
@@ -741,6 +789,39 @@ class EventReplayer:
                 "asks": asks,
             }
 
+        # ---- static per-security price limits -----------------------------
+        # Enforced after the envelope, idempotency, sequence and identifier
+        # conflict checks, and strictly before matching or any state change.
+        # The identifier clashes the baseline engine would reach first (a
+        # reused order id, a replace against a missing order, a duplicate plan
+        # or a clashing derived id) keep their rejection-code precedence; a
+        # price breach is only reported when none applies.
+        price_rejection = self._price_limit_rejection(symbol, payload, event_type, state)
+        if price_rejection is not None:
+            # A committed business rejection: it occupies the event id and
+            # advances the symbol sequence, but performs no matching, leaves
+            # no order or plan behind and spends no trade id. Baseline event
+            # ids also occupy the per-symbol engine journal, exactly as an
+            # engine-side business rejection would; plan commands live solely
+            # in the replay log.
+            state.last_sequence = sequence
+            state.seen[event_id] = content
+            self._events[event_id] = (symbol, content)
+            if event_type not in _PLAN_TYPES:
+                state.engine.occupy_event_id(event_id)
+            bids, asks = state.engine.snapshot()
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": REJECTED,
+                "rejection_code": price_rejection,
+                "trades": [],
+                "book_changes": {"bids": [], "asks": []},
+                "bids": bids,
+                "asks": asks,
+            }
+
         if event_type in _PLAN_TYPES:
             out = self._dispatch_plan(
                 event, payload, event_type, state, symbol, sequence, content
@@ -790,6 +871,73 @@ class EventReplayer:
                 "asks": asks,
             }
         return out
+
+    def _price_limit_rejection(
+        self,
+        symbol: str,
+        payload: dict[str, object],
+        event_type: str,
+        state: _SymbolState,
+    ) -> str | None:
+        """Decide a static price-limit breach without mutating anything.
+
+        Only the price of a LIMIT/ICEBERG ADD, of a REPLACE and of a LIMIT
+        TWAP/VWAP plan is tested against the security's closed interval;
+        MARKET orders and MARKET plans are exempt. Identifier clashes the
+        baseline reaches first keep precedence and are reported as ``None``
+        here: a reused order id, a replace against a non-resting target, a
+        duplicate plan id or a clash over a derived child id.
+        """
+        bounds = self.price_limits.get(symbol)
+        if bounds is None:
+            return None
+        lower, upper = bounds
+
+        def out_of_bounds(price: int) -> bool:
+            return price < lower or price > upper
+
+        if event_type == ADD:
+            order_type = payload["order_type"]
+            if order_type not in (LIMIT, ICEBERG):
+                return None
+            order_id: str = payload["order_id"]
+            if state.engine.has_order_id(order_id):
+                # The engine would reject DUPLICATE_ORDER_ID first.
+                return None
+            return PRICE_LIMIT_EXCEEDED if out_of_bounds(payload["price"]) else None
+
+        if event_type == REPLACE:
+            order_id = payload["order_id"]
+            target_kind = state.engine.replace_target_kind(order_id)
+            if target_kind is None:
+                # A missing or finished target yields UNKNOWN_ORDER first.
+                return None
+            if target_kind == "plain" and "display_quantity" in payload:
+                # The engine rejects this pre-commit with INVALID_SCHEMA; it
+                # must keep precedence and consume neither id nor sequence.
+                return None
+            return PRICE_LIMIT_EXCEEDED if out_of_bounds(payload["price"]) else None
+
+        if event_type in (TWAP_START, VWAP_START):
+            if payload["order_type"] != LIMIT:
+                # MARKET plans are exempt, exactly like MARKET orders.
+                return None
+            plan_id: str = payload["plan_id"]
+            if plan_id in state.plans:
+                # Mirror _register_plan: the plan id clash wins.
+                return None
+            if event_type == TWAP_START:
+                child_count: int = payload["slice_count"]
+            else:
+                child_count = len(payload["volume_weights"])
+            for index in range(child_count):
+                child_id = f"{plan_id}#{index + 1}"
+                if state.engine.has_order_id(child_id) or child_id in state.plan_index:
+                    # A derived id clash rejects DUPLICATE_ORDER_ID first.
+                    return None
+            return PRICE_LIMIT_EXCEEDED if out_of_bounds(payload["price"]) else None
+
+        return None
 
     @staticmethod
     def _allowed_payload_keys(inline_type: object) -> frozenset[str] | None:
@@ -1686,6 +1834,11 @@ def restore_replayer(
         raise SnapshotError(SNAPSHOT_CORRUPT, "snapshot must be a JSON object")
     if not set(snapshot) <= _ENVELOPE_KEYS_SNAPSHOT:
         raise SnapshotError(SNAPSHOT_CORRUPT, "snapshot document has unknown fields")
+
+    # A malformed caller configuration is a request error and is rejected
+    # before any snapshot content (or the configuration comparison) is
+    # consulted, so it never masquerades as a CONFIG_MISMATCH.
+    _validate_config(dict(DEFAULT_CONFIG if config is None else config))
 
     version = snapshot.get("format_version")
     if version != FORMAT_VERSION:

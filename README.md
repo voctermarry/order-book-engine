@@ -346,6 +346,36 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 - 撤单/改单不存在或已终结订单，继续沿用基线拒绝码（如 `UNKNOWN_ORDER`、`DUPLICATE_ORDER_ID`）；这类有效事件与基线一样占用其 `event_id` 并推进该证券序列。
 - TWAP/VWAP 业务拒绝码：`UNKNOWN_EXECUTION_PLAN`（未知计划）、`EXECUTION_PLAN_CLOSED`（对已关闭计划切片或取消）、`DUPLICATE_EXECUTION_PLAN`（同证券重复 `plan_id`，TWAP 与 VWAP 共用命名空间）；派生标识冲突沿用 `DUPLICATE_ORDER_ID`。这些有效命令同样占用 `event_id` 并推进序列，但不改变计划或盘口状态。
 - 相同初始状态、配置和事件流产生字段顺序稳定、数值表示一致、可逐字节比较的 JSON（规范化序列化：键排序、紧凑分隔、整数不丢精度、无浮点）。
+- 静态涨跌停越界码：`PRICE_LIMIT_EXCEEDED`，见下文「静态涨跌停 `price_limits`」一节。
+
+### 静态涨跌停 `price_limits`
+
+可选的会话级配置，按证券给出静态涨跌停闭区间，放在 `config` 中：
+
+```json
+{"price_limits": {"AAA": {"lower": 95, "upper": 105},
+                  "BBB": {"lower": 10, "upper": 20}}}
+```
+
+- 键为非空证券名字符串；值是**只含** `lower` 与 `upper` 的对象。
+- `lower`、`upper` 均为正整数（布尔值不算整数，不接受字符串、浮点等），且 `lower <= upper`；二者可以相等（区间退化为单一允许价格）。
+- 缺省 `config`、空块 `{"price_limits": {}}` 或未配置的证券保持基线行为。
+- 配置在处理任何事件、采纳任何快照之前校验；非法配置使 Python 入口抛出 `ValueError`，CLI 返回退出码 2 与既有 `INVALID_REQUEST` 错误文档。
+
+校验范围（闭区间，边界价合法）：
+
+- LIMIT 与 ICEBERG 的 `ADD`：其 `price` 必须在区间内；`MARKET` 的 ADD 不受校验。
+- `REPLACE`：新 `price` 必须在区间内。越界替换是业务拒绝：**保留原委托及其队列优先级**，不撮合、不改变盘口或成交编号。
+- `TWAP_START`、`VWAP_START`：仅 LIMIT 计划校验其 `price`；MARKET 计划不受校验。越界启动**不创建计划、不保留任何派生标识**（`plan_id#n` 可立即被其他委托或新计划使用）。
+- 校验时机在现有信封、幂等、序列与标识冲突检查**之后**、撮合与任何状态变更**之前**。因此 `DUPLICATE_ORDER_ID`（含派生标识冲突）、`UNKNOWN_ORDER`、`DUPLICATE_EXECUTION_PLAN` 等既有结果优先于越界；结构非法仍为 `INVALID_EVENT` 且不占用任何标识。
+
+越界事件的结果：`status` 为 `REJECTED`、`rejection_code` 为 `PRICE_LIMIT_EXCEEDED`，`trades` 与 `book_changes` 均为空，并回显未变化盘口。它与其他业务拒绝一样**占用 `event_id` 并推进该证券 `sequence`**，但不留下订单或计划、不消耗成交编号；合法事件的价格时间优先、FOK 原子性、IOC 余量取消、冰山补片与自成交防护规则不变。
+
+涨跌停配置属于会话 `config`，随快照的 `config`、`config_digest` 与 `content_digest` 做确定性序列化（键排序的规范化 JSON）：
+
+- 相同配置从快照恢复后，后续结果、成交编号与最终盘口和连续回放逐字节一致。
+- 恢复时调用方配置（含涨跌停边界）与快照不一致时，抛出 `code` 为 `CONFIG_MISMATCH` 的 `SnapshotError`，CLI 沿用对应错误文档与退出码 2。
+- 单标的 `order-book-engine replay`、`Engine` 的既有输入输出、未传 `price_limits` 的历史调用，以及 TWAP/VWAP 的分片、汇总与报告字段均不因该特性改变。
 
 ### 快照与恢复
 

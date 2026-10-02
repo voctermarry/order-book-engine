@@ -1075,6 +1075,30 @@ class Engine:
         """Whether an id is already spent or reserved by any accepted order."""
         return order_id in self._order_ids or order_id in self._reserved_order_ids
 
+    def replace_target_kind(self, order_id: str) -> str | None:
+        """Classify a REPLACE target without touching any state.
+
+        Returns ``"iceberg"`` for a resting iceberg order, ``"plain"`` for any
+        other resting order, or ``None`` when the id is unknown or finished
+        (the baseline then rejects with ``UNKNOWN_ORDER``). Used solely by the
+        multi-symbol replay layer to preserve the baseline precedence of the
+        pre-commit rule that forbids a ``display_quantity`` on a plain target.
+        """
+        record = self._orders.get(order_id)
+        if record is None or record["status"] != RESTING:
+            return None
+        return "iceberg" if "display_quantity" in record else "plain"
+
+    def occupy_event_id(self, event_id: str) -> None:
+        """Record a well-formed event id without processing any order event.
+
+        Used solely by the multi-symbol replay layer's pre-matching business
+        rejections (a static price-limit breach is decided before this engine
+        is dispatched, yet the rejected event still occupies its id). The
+        baseline JSON Lines entry point never calls this.
+        """
+        self._event_ids.add(event_id)
+
     def reserve_order_id(self, order_id: str) -> None:
         """Block an id from external ADD before its derived order is submitted.
 
