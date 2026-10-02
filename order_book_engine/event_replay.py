@@ -51,8 +51,10 @@ from .engine import (
     LIMIT,
     MARKET,
     REPLACE,
+    REPORTED,
     SELL,
     Engine,
+    UNKNOWN_ACCOUNT,
     _is_non_empty_str,
     _is_positive_int,
 )
@@ -93,6 +95,13 @@ VWAP_SLICE = "VWAP_SLICE"
 VWAP_CANCEL = "VWAP_CANCEL"
 VWAP_REPORT = "VWAP_REPORT"
 
+# Multi-security read-only portfolio query.
+PORTFOLIO_REPORT = "PORTFOLIO_REPORT"
+
+# The queried account is unknown across every security, or the mark price map
+# does not cover exactly the securities the account ever appeared on.
+MARK_PRICE_MISMATCH = "MARK_PRICE_MISMATCH"
+
 # Plan algorithm labels: TWAP plans keep the historical summary shape, VWAP
 # plans additionally report their algorithm and per-slice schedule.
 ALGORITHM_TWAP = "TWAP"
@@ -114,13 +123,17 @@ CONFIG_MISMATCH = "CONFIG_MISMATCH"
 SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
      TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
-     VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT}
+     VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
+     PORTFOLIO_REPORT}
 )
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
 _BASELINE_KEYS = frozenset(
     {"event_id", "type", "order_id", "side", "order_type", "quantity", "price",
      "time_in_force", "display_quantity", "account_id"}
+)
+_PORTFOLIO_REPORT_KEYS = frozenset(
+    {"event_id", "type", "account_id", "mark_prices"}
 )
 _TWAP_START_KEYS = frozenset(
     {"event_id", "type", "plan_id", "side", "total_quantity", "slice_count",
@@ -143,6 +156,10 @@ _VWAP_START_REQUIRED = frozenset(
 _VWAP_TYPES = frozenset({VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT})
 #: Every parent-order command type, across algorithms.
 _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES
+#: Commands and queries that live solely in the replay layer's event log:
+#: plan commands never touch the engine journal, and the cross-security
+#: portfolio query performs no matching and occupies no engine event id.
+_REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset({PORTFOLIO_REPORT})
 
 
 def _allocate_slices(total_quantity: int, weights: list[int]) -> list[int]:
@@ -273,6 +290,31 @@ def _vwap_schema_error(payload: dict[str, object]) -> str | None:
         return INVALID_EVENT
     if not _is_non_empty_str(payload.get("plan_id")):
         return INVALID_EVENT
+    return None
+
+
+def _portfolio_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a multi-security ``PORTFOLIO_REPORT`` query.
+
+    The query carries exactly ``event_id``/``type``/``account_id``/
+    ``mark_prices``: a non-empty account identifier and an object mapping
+    non-empty symbol names to positive integer marks (booleans are not
+    integers). Any structural problem is an ``INVALID_EVENT`` and consumes
+    neither the event id nor the envelope symbol's sequence; the account and
+    mark-key coverage are business checks handled by the dispatcher.
+    """
+    if set(payload) != _PORTFOLIO_REPORT_KEYS:
+        return INVALID_EVENT
+    if not _is_non_empty_str(payload.get("account_id")):
+        return INVALID_EVENT
+    mark_prices = payload.get("mark_prices")
+    if not isinstance(mark_prices, dict):
+        return INVALID_EVENT
+    for symbol, mark_price in mark_prices.items():
+        if not _is_non_empty_str(symbol):
+            return INVALID_EVENT
+        if not _is_positive_int(mark_price):
+            return INVALID_EVENT
     return None
 
 
@@ -711,6 +753,8 @@ class EventReplayer:
             schema_error = _twap_schema_error(payload)
         elif event_type in _VWAP_TYPES:
             schema_error = _vwap_schema_error(payload)
+        elif event_type == PORTFOLIO_REPORT:
+            schema_error = _portfolio_schema_error(payload)
         else:
             schema_error = Engine._schema_error(payload)
         if schema_error is not None:
@@ -807,7 +851,7 @@ class EventReplayer:
             state.last_sequence = sequence
             state.seen[event_id] = content
             self._events[event_id] = (symbol, content)
-            if event_type not in _PLAN_TYPES:
+            if event_type not in _REPLAY_ONLY_TYPES:
                 state.engine.occupy_event_id(event_id)
             bids, asks = state.engine.snapshot()
             return {
@@ -827,6 +871,11 @@ class EventReplayer:
                 event, payload, event_type, state, symbol, sequence, content
             )
             return out
+
+        if event_type == PORTFOLIO_REPORT:
+            return self._dispatch_portfolio_report(
+                event_id, symbol, sequence, payload, state, content
+            )
 
         before_bids, before_asks = state.engine.level_totals()
         before_bids = dict(before_bids)
@@ -951,6 +1000,8 @@ class EventReplayer:
         if inline_type in (TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
                            VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT):
             return _TWAP_PLAN_REF_KEYS
+        if inline_type == PORTFOLIO_REPORT:
+            return _PORTFOLIO_REPORT_KEYS
         return None
 
     # -- parent-order plan handling ------------------------------------------
@@ -1207,6 +1258,176 @@ class EventReplayer:
             "asks": asks,
         }
 
+    # -- multi-security portfolio query -------------------------------------
+
+    def _dispatch_portfolio_report(
+        self,
+        event_id: str,
+        symbol: str,
+        sequence: int,
+        payload: dict[str, object],
+        state: _SymbolState,
+        content: str,
+    ) -> dict[str, object]:
+        """Answer a cross-security account query without matching anything.
+
+        A structurally valid query occupies its event id and advances the
+        envelope symbol's sequence whatever its business outcome, exactly like
+        every other well-formed command. It never enters a matching engine,
+        spends no trade id and leaves every book, plan and account set
+        untouched; it is logged solely in the replay layer's event journal.
+        """
+        account_id: str = payload["account_id"]
+        mark_prices: dict[str, int] = payload["mark_prices"]
+
+        # A well-formed query commits before the business outcome is known,
+        # mirroring the plan command contract.
+        state.last_sequence = sequence
+        state.seen[event_id] = content
+        self._events[event_id] = (symbol, content)
+
+        # The account is known per security as soon as an accepted ADD carried
+        # it; released plan slices are regular IOC child ADDs, so they are
+        # already members of the engine account set.
+        known_symbols = {
+            sym
+            for sym, sym_state in self._symbols.items()
+            if account_id in sym_state.engine._accounts
+        }
+
+        def finish(
+            code: str | None, analysis: dict[str, object] | None
+        ) -> dict[str, object]:
+            bids, asks = state.engine.snapshot()
+            if code is None:
+                return {
+                    "event_id": event_id,
+                    "symbol": symbol,
+                    "sequence": sequence,
+                    "status": ACCEPTED,
+                    "result": REPORTED,
+                    "trades": [],
+                    "book_changes": {"bids": [], "asks": []},
+                    "bids": bids,
+                    "asks": asks,
+                    "portfolio_analysis": analysis,
+                }
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": REJECTED,
+                "rejection_code": code,
+                "trades": [],
+                "book_changes": {"bids": [], "asks": []},
+                "bids": bids,
+                "asks": asks,
+            }
+
+        if not known_symbols:
+            return finish(UNKNOWN_ACCOUNT, None)
+        if set(mark_prices) != known_symbols:
+            return finish(MARK_PRICE_MISMATCH, None)
+
+        return finish(None, self._portfolio_analysis(account_id, mark_prices, known_symbols))
+
+    def _portfolio_analysis(
+        self,
+        account_id: str,
+        mark_prices: dict[str, int],
+        known_symbols: set[str],
+    ) -> dict[str, object]:
+        """Build the read-only cross-security position and risk summary.
+
+        The per-security accumulation mirrors the baseline single-symbol
+        account report: every trade is attributed through the order it rested
+        or arrived as (replacements and replenished iceberg slices keep their
+        original order id and account), counting maker and taker fills alike.
+        """
+        positions: list[dict[str, object]] = []
+        total_buy_notional = 0
+        total_sell_notional = 0
+        total_cash = 0
+        total_turnover = 0
+        total_position_value = 0
+        total_risk = 0
+        total_pnl = 0
+
+        for sym in sorted(known_symbols):
+            engine = self._symbols[sym].engine
+            buy_quantity = 0
+            sell_quantity = 0
+            buy_notional = 0
+            sell_notional = 0
+            for trade in engine._trade_log:
+                for order_key in ("maker_order_id", "taker_order_id"):
+                    order = engine._orders[trade[order_key]]
+                    if order.get("account_id") != account_id:
+                        continue
+                    notional = trade["price"] * trade["quantity"]
+                    if order["side"] == BUY:
+                        buy_quantity += trade["quantity"]
+                        buy_notional += notional
+                    else:
+                        sell_quantity += trade["quantity"]
+                        sell_notional += notional
+
+            net_position = buy_quantity - sell_quantity
+            cash_balance = sell_notional - buy_notional
+            buy_vwap = (
+                {"numerator": buy_notional, "denominator": buy_quantity}
+                if buy_quantity else None
+            )
+            sell_vwap = (
+                {"numerator": sell_notional, "denominator": sell_quantity}
+                if sell_quantity else None
+            )
+            mark_price = mark_prices[sym]
+            position_value = net_position * mark_price
+            risk_exposure = abs(net_position) * mark_price
+            mark_to_market_pnl = cash_balance + position_value
+
+            positions.append({
+                "symbol": sym,
+                "mark_price": mark_price,
+                "buy_quantity": buy_quantity,
+                "sell_quantity": sell_quantity,
+                "buy_notional": buy_notional,
+                "sell_notional": sell_notional,
+                "net_position": net_position,
+                "cash_balance": cash_balance,
+                "buy_vwap": buy_vwap,
+                "sell_vwap": sell_vwap,
+                "turnover_notional": buy_notional + sell_notional,
+                "position_value": position_value,
+                "risk_exposure": risk_exposure,
+                "mark_to_market_pnl": mark_to_market_pnl,
+            })
+
+            total_buy_notional += buy_notional
+            total_sell_notional += sell_notional
+            total_cash += cash_balance
+            total_turnover += buy_notional + sell_notional
+            total_position_value += position_value
+            total_risk += risk_exposure
+            total_pnl += mark_to_market_pnl
+
+        totals = {
+            "buy_notional": total_buy_notional,
+            "sell_notional": total_sell_notional,
+            "cash_balance": total_cash,
+            "turnover_notional": total_turnover,
+            "position_value": total_position_value,
+            "risk_exposure": total_risk,
+            "mark_to_market_pnl": total_pnl,
+        }
+        return {
+            "account_id": account_id,
+            "mark_prices": dict(mark_prices),
+            "positions": positions,
+            "totals": totals,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Snapshot export / restoration
@@ -1436,19 +1657,20 @@ def _engine_from_json(data: dict[str, object]) -> _SymbolState:
         seen[event_id] = content
 
     # Partition the accepted events into baseline engine events and
-    # parent-order command events: the engine journal only knows the former
-    # plus the child orders synthesized for released slices, while every
-    # TWAP/VWAP command id lives solely in the replay log.
+    # replay-only command/query events: the engine journal only knows the
+    # former plus the child orders synthesized for released slices, while
+    # every TWAP/VWAP command id and PORTFOLIO_REPORT id lives solely in the
+    # replay log.
     baseline_event_ids: set[str] = set()
-    plan_event_ids: set[str] = set()
+    replay_only_event_ids: set[str] = set()
     for event_id, content in seen.items():
         try:
             stored_type = json.loads(content).get("type")
         except (ValueError, AttributeError):
             _require(False, f"event log content for {event_id} is not a JSON object")
             stored_type = None
-        if stored_type in _PLAN_TYPES:
-            plan_event_ids.add(event_id)
+        if stored_type in _REPLAY_ONLY_TYPES:
+            replay_only_event_ids.add(event_id)
         else:
             baseline_event_ids.add(event_id)
 
@@ -1952,9 +2174,10 @@ def replay_events(
         strictly increasing per symbol) and a payload — either inline
         (``"type"`` plus the fields of that event kind) or nested under an
         ``"event"`` object that repeats ``event_id`` and ``type``. Supported
-        kinds are the baseline ADD/CANCEL/REPLACE events and the TWAP/VWAP
+        kinds are the baseline ADD/CANCEL/REPLACE events, the TWAP/VWAP
         TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
-        VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands.
+        VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands and the
+        cross-security read-only PORTFOLIO_REPORT query.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
         a resumed run must pass the same configuration the snapshot carries.

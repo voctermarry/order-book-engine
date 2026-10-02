@@ -245,7 +245,7 @@ IMPACT_REPORT：
 
 ## 多证券有序事件回放
 
-在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，以及可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，以及跨证券只读持仓风险查询 `PORTFOLIO_REPORT`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
 
 ### 命令行
 
@@ -284,6 +284,7 @@ response = replay_events(events, config=None, snapshot=None, snapshot_after="las
 - `book_changes`：本次盘口变更，`bids` 降序、`asks` 升序；仅列出数量发生变化的档位，被移除的档位以 `"quantity": 0` 表示。
 - `bids`/`asks`：该事件处理后的该证券完整盘口（已知证券的拒绝事件回显未变化盘口；未知证券的预分发拒绝为空盘口且不创建证券）。
 - `execution_plan`：仅 TWAP/VWAP 命令的结果出现，字段见下文 TWAP 母单与 VWAP 母单两节。
+- `portfolio_analysis`：仅 `PORTFOLIO_REPORT` 成功（`result` 为 `REPORTED`）时出现，字段见下文「跨证券持仓风险查询」一节。
 
 ### TWAP 母单
 
@@ -367,6 +368,40 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 计划完整状态（算法、权重曲线、各片数量、进度与累计分析）进入快照；快照格式版本保持 `event-replay/2`，恢复后继续执行与不中断回放逐字节一致。
 
+### 跨证券持仓风险查询 PORTFOLIO_REPORT
+
+`PORTFOLIO_REPORT` 是多证券入口的只读查询：在确定时点读取一个账户跨全部证券、由此前已接受事件产生的成交所形成的持仓与风险。它沿用信封的 `event_id`、`symbol`、`sequence` 顺序与幂等语义——只占用查询自身的事件标识、推进**信封 `symbol`** 的序列，不撮合、不释放计划切片，也不改变任何盘口、成交编号、计划或账户集合，不进入任何证券的引擎事件日志。
+
+```json
+{"event_id": "e9", "symbol": "AAA", "sequence": 9, "type": "PORTFOLIO_REPORT",
+ "account_id": "acct-1",
+ "mark_prices": {"AAA": 100, "BBB": 50}}
+```
+
+- `account_id`：非空字符串。账户在任一证券上只要此前存在一笔携带相同 `account_id` 的已接受 `ADD` 即视为**已知**（订单此后的状态不影响认定；已释放的 TWAP/VWAP 子单是带母单账户的常规 IOC 子单，同样计入；仅出现在被拒绝事件中的账户不算已知）。
+- `mark_prices`：对象，键为非空证券名字符串，值为正整数标记价（布尔值不算整数）。键集合必须**恰好**覆盖该账户出现过的全部证券——少一个、多一个（含账户从未出现的证券）均不符。
+- 字段缺失、多出、类型错误、空 `account_id`/空键名、`mark_prices` 不是对象、标记价非正整数（含布尔）等均按 `INVALID_EVENT` 拒绝，**不占用** `event_id` 且**不推进**序列。
+- 结构合法但账户在所有证券上均未知时按 `UNKNOWN_ACCOUNT` 拒绝；账户已知但 `mark_prices` 键集合与账户出现过的证券集合不符时按 `MARK_PRICE_MISMATCH` 拒绝。二者都占用 `event_id`、推进信封 `symbol` 的序列，并回显信封 `symbol` 的未变盘口。
+
+查询成功时 `status` 为 `ACCEPTED`、`result` 为 `REPORTED`，`trades` 与 `book_changes` 为空，`bids`/`asks` 为信封 `symbol` 的未变盘口，并附加 `portfolio_analysis`：
+
+- `account_id`：回显查询账户。
+- `mark_prices`：回显查询的标记价映射。
+- `positions`：按 `symbol` 字典序排列的逐证券条目；统计该账户作为 maker 或 taker 的全部历史成交，`REPLACE` 继承账户、ICEBERG 补片沿用原订单账户、TWAP/VWAP 已释放子单携带母单账户，均计入；未带 `account_id` 的订单不计入。每项含：
+  - `symbol`、`mark_price`：证券与本次标记价。
+  - `buy_quantity`、`sell_quantity`：累计买入、卖出数量。
+  - `buy_notional`、`sell_notional`：累计买入、卖出成交额（成交价乘数量累加）。
+  - `net_position`：`buy_quantity − sell_quantity`。
+  - `cash_balance`：`sell_notional − buy_notional`。
+  - `buy_vwap`、`sell_vwap`：对应数量为零时为 `null`，否则为 `{"numerator": 成交额, "denominator": 数量}` 的精确分数。
+  - `turnover_notional`：`buy_notional + sell_notional`（换手额）。
+  - `position_value`：`net_position × mark_price`（净持仓市值，可为负）。
+  - `risk_exposure`：`|net_position| × mark_price`（绝对风险敞口）。
+  - `mark_to_market_pnl`：`cash_balance + position_value`（盯市损益）。
+- `totals`：跨证券汇总，含 `buy_notional`、`sell_notional`、`cash_balance`（各证券现金余额之和）、`turnover_notional`（换手额之和）、`position_value`（各证券净持仓乘标记价之和）、`risk_exposure`（绝对风险敞口之和）、`mark_to_market_pnl`（各证券盯市损益之和）。
+
+查询事件本身（含其拒绝结果）进入每证券事件日志与全局事件日志，随快照携带；恢复后继续回放与不中断回放逐字节一致。`replay_events`、`EventReplayer` 与 `order-book-engine events` 命令行均支持该事件；单标的 `order-book-engine replay` 入口行为不变。
+
 ### 提交语义与错误码
 
 - 逐事件提交：先前成功事件不会因后续失败回滚；失败事件不留下订单、成交、计数器或盘口变更。
@@ -377,6 +412,7 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 - `DUPLICATE`：已见 `eventId` 且规范化内容（键排序后的紧凑 JSON）完全一致；不再次撮合、无成交无盘口变更。重试投递携带旧序列时仍识别为重复。
 - 撤单/改单不存在或已终结订单，继续沿用基线拒绝码（如 `UNKNOWN_ORDER`、`DUPLICATE_ORDER_ID`）；这类有效事件与基线一样占用其 `event_id` 并推进该证券序列。
 - TWAP/VWAP 业务拒绝码：`UNKNOWN_EXECUTION_PLAN`（未知计划）、`EXECUTION_PLAN_CLOSED`（对已关闭计划切片或取消）、`DUPLICATE_EXECUTION_PLAN`（同证券重复 `plan_id`，TWAP 与 VWAP 共用命名空间）；派生标识冲突沿用 `DUPLICATE_ORDER_ID`。这些有效命令同样占用 `event_id` 并推进序列，但不改变计划或盘口状态。
+- `PORTFOLIO_REPORT` 业务拒绝码：`UNKNOWN_ACCOUNT`（账户在全部证券上均未知）、`MARK_PRICE_MISMATCH`（`mark_prices` 键集合未恰好覆盖账户出现过的证券集合）。二者都占用 `event_id`、推进信封 `symbol` 的序列并回显其未变盘口。
 - 相同初始状态、配置和事件流产生字段顺序稳定、数值表示一致、可逐字节比较的 JSON（规范化序列化：键排序、紧凑分隔、整数不丢精度、无浮点）。
 - 静态涨跌停越界码：`PRICE_LIMIT_EXCEEDED`，见下文「静态涨跌停 `price_limits`」一节。
 
