@@ -10,14 +10,16 @@ matching rules, priorities, rejection semantics or trade record shapes:
   order, so identical timestamps never reorder anything. The stream covers
   the baseline ADD/CANCEL/REPLACE behaviours, resumable TWAP/VWAP parent
   orders (TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
-  VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT), the read-only
+  VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT), resumable POV parent
+  orders (POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT), the read-only
   cross-security PORTFOLIO_REPORT query and the intraday PRICE_LIMIT_UPDATE
   adjustment, which replaces one security's active price-limit interval
   (seeded from the static ``price_limits`` configuration) for all
   subsequently submitted limit prices; plans never read a wall clock and
-  are advanced solely by their SLICE events. TWAP slices divide
+  are advanced solely by their command events. TWAP slices divide
   the total evenly; VWAP slices follow a caller-supplied volume-weight
-  curve.
+  curve; POV releases follow a participation rate against caller-fed
+  cumulative market volume.
 * Each event is committed individually: a later failure never rolls back an
   earlier success, and a failed event leaves no order, trade, counter or book
   change behind.
@@ -59,6 +61,7 @@ from .engine import (
     SELL,
     Engine,
     UNKNOWN_ACCOUNT,
+    _is_int,
     _is_non_empty_str,
     _is_positive_int,
 )
@@ -109,10 +112,18 @@ VWAP_SLICE = "VWAP_SLICE"
 VWAP_CANCEL = "VWAP_CANCEL"
 VWAP_REPORT = "VWAP_REPORT"
 
+# POV event types.
+POV_START = "POV_START"
+POV_VOLUME = "POV_VOLUME"
+POV_CANCEL = "POV_CANCEL"
+POV_REPORT = "POV_REPORT"
+
 # Plan algorithm labels: TWAP plans keep the historical summary shape, VWAP
-# plans additionally report their algorithm and per-slice schedule.
+# plans additionally report their algorithm and per-slice schedule, and POV
+# plans track a participation rate against a caller-fed market volume.
 ALGORITHM_TWAP = "TWAP"
 ALGORITHM_VWAP = "VWAP"
+ALGORITHM_POV = "POV"
 
 # TWAP plan lifecycle statuses.
 PLAN_ACTIVE = "ACTIVE"
@@ -133,6 +144,7 @@ SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
      TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
      VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
+     POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT,
      PORTFOLIO_REPORT, PRICE_LIMIT_UPDATE}
 )
 
@@ -166,8 +178,21 @@ _VWAP_START_REQUIRED = frozenset(
      "order_type", "benchmark_price"}
 )
 _VWAP_TYPES = frozenset({VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT})
+_POV_START_KEYS = frozenset(
+    {"event_id", "type", "plan_id", "side", "total_quantity",
+     "participation_bps", "order_type", "benchmark_price", "price",
+     "account_id"}
+)
+_POV_START_REQUIRED = frozenset(
+    {"event_id", "type", "plan_id", "side", "total_quantity",
+     "participation_bps", "order_type", "benchmark_price"}
+)
+_POV_VOLUME_KEYS = frozenset(
+    {"event_id", "type", "plan_id", "market_volume_increment"}
+)
+_POV_TYPES = frozenset({POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT})
 #: Every parent-order command type, across algorithms.
-_PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES
+_PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES | _POV_TYPES
 #: Event types whose ids live solely in the replay log: parent-order commands
 #: never touch the engine journal, the cross-security portfolio query is
 #: read-only and matched by no engine, and a price-limit adjustment only
@@ -300,6 +325,64 @@ def _vwap_schema_error(payload: dict[str, object]) -> str | None:
             return INVALID_EVENT
         return None
     # VWAP_SLICE / VWAP_CANCEL / VWAP_REPORT are pure plan references.
+    if set(payload) != _TWAP_PLAN_REF_KEYS:
+        return INVALID_EVENT
+    if not _is_non_empty_str(payload.get("plan_id")):
+        return INVALID_EVENT
+    return None
+
+
+def _pov_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a POV command payload.
+
+    POV_START mirrors the TWAP/VWAP contract; the schedule parameter is a
+    participation rate in basis points, an integer from 1 to 10000. POV_VOLUME
+    carries the plan id plus a positive integer market volume increment;
+    POV_CANCEL and POV_REPORT are pure plan references. Any field problem is an
+    ``INVALID_EVENT`` and consumes neither the event id nor the sequence.
+    """
+    event_type = payload["type"]
+    if event_type == POV_START:
+        keys = set(payload)
+        if not keys >= _POV_START_REQUIRED or not keys <= _POV_START_KEYS:
+            return INVALID_EVENT
+        if not _is_non_empty_str(payload.get("plan_id")):
+            return INVALID_EVENT
+        if payload.get("side") not in (BUY, SELL):
+            return INVALID_EVENT
+        order_type = payload.get("order_type")
+        if order_type not in (LIMIT, MARKET):
+            return INVALID_EVENT
+        total_quantity = payload.get("total_quantity")
+        participation_bps = payload.get("participation_bps")
+        benchmark_price = payload.get("benchmark_price")
+        if not _is_positive_int(total_quantity):
+            return INVALID_EVENT
+        if not _is_int(participation_bps) or not (1 <= participation_bps <= 10000):
+            # Booleans are not integers; zero and out-of-range rates are
+            # rejected structurally.
+            return INVALID_EVENT
+        if not _is_positive_int(benchmark_price):
+            return INVALID_EVENT
+        if order_type == LIMIT:
+            if not _is_positive_int(payload.get("price")):
+                return INVALID_EVENT
+        elif "price" in payload and payload["price"] is not None:
+            # MARKET plans must not carry a non-null price; omission or an
+            # explicit null is accepted.
+            return INVALID_EVENT
+        if "account_id" in payload and not _is_non_empty_str(payload.get("account_id")):
+            return INVALID_EVENT
+        return None
+    if event_type == POV_VOLUME:
+        if set(payload) != _POV_VOLUME_KEYS:
+            return INVALID_EVENT
+        if not _is_non_empty_str(payload.get("plan_id")):
+            return INVALID_EVENT
+        if not _is_positive_int(payload.get("market_volume_increment")):
+            return INVALID_EVENT
+        return None
+    # POV_CANCEL / POV_REPORT are pure plan references.
     if set(payload) != _TWAP_PLAN_REF_KEYS:
         return INVALID_EVENT
     if not _is_non_empty_str(payload.get("plan_id")):
@@ -456,16 +539,19 @@ class SnapshotError(ValueError):
 
 
 class ExecutionPlan:
-    """Mutable state of one resumable TWAP or VWAP parent order on one security.
+    """Mutable state of one resumable TWAP, VWAP or POV parent order.
 
     All cumulative analytics (filled quantity, notional, cancelled quantity)
     are maintained incrementally, so a snapshot carries exactly the state a
-    continued or resumed slice needs. Slice quantities are fixed at creation:
-    a TWAP plan divides the total evenly across ``slice_count`` slices and
-    spreads the division remainder as one extra unit over the earliest
-    slices, while a VWAP plan allocates one unit per bucket up front and
-    distributes the rest proportionally to its volume weights (see
-    :func:`_allocate_slices`).
+    continued or resumed slice needs. TWAP and VWAP slice quantities are fixed
+    at creation: a TWAP plan divides the total evenly across ``slice_count``
+    slices and spreads the division remainder as one extra unit over the
+    earliest slices, while a VWAP plan allocates one unit per bucket up front
+    and distributes the rest proportionally to its volume weights (see
+    :func:`_allocate_slices`). A POV plan has no fixed schedule: its release
+    quantities are derived at run time from the cumulative market volume fed
+    by POV_VOLUME events and the participation rate, so its slice list grows
+    one entry per positive release.
     """
 
     __slots__ = (
@@ -473,6 +559,7 @@ class ExecutionPlan:
         "account_id", "algorithm", "volume_weights", "slice_quantities",
         "released", "released_quantity", "filled_quantity",
         "cancelled_quantity", "notional", "status",
+        "participation_bps", "market_volume", "plan_total",
     )
 
     def __init__(
@@ -488,6 +575,7 @@ class ExecutionPlan:
         *,
         algorithm: str = ALGORITHM_TWAP,
         volume_weights: list[int] | None = None,
+        participation_bps: int | None = None,
     ) -> None:
         self.plan_id = plan_id
         self.side = side
@@ -497,17 +585,30 @@ class ExecutionPlan:
         self.account_id = account_id
         self.algorithm = algorithm
         self.volume_weights = list(volume_weights) if volume_weights is not None else None
+        # POV parameters: the participation rate in basis points and the
+        # cumulative caller-fed market volume. TWAP/VWAP leave both unused.
+        self.participation_bps = participation_bps
+        self.market_volume = 0
+        # POV keeps its total explicitly; the fixed-schedule plans derive
+        # theirs from the slice list.
+        self.plan_total: int | None = None
         if algorithm == ALGORITHM_VWAP:
             self.slice_quantities: list[int] = _allocate_slices(
                 total_quantity, self.volume_weights
             )
+        elif algorithm == ALGORITHM_POV:
+            self.plan_total = total_quantity
+            # One entry is appended per positive release, holding that
+            # child order's original quantity.
+            self.slice_quantities = []
         else:
             base, extra = divmod(total_quantity, slice_count)
             self.slice_quantities = [
                 base + (1 if index < extra else 0)
                 for index in range(slice_count)
             ]
-        # Number of slices already released; also the index of the next one.
+        # Number of releases (child orders) already sent; also the index of
+        # the next one for every algorithm.
         self.released = 0
         self.released_quantity = 0
         self.filled_quantity = 0
@@ -517,28 +618,69 @@ class ExecutionPlan:
 
     @property
     def slice_count(self) -> int:
+        """Fixed schedule length for TWAP/VWAP; releases so far for POV.
+
+        A POV plan's slice list only ever contains its released children, so
+        its length is the current count of positive releases.
+        """
+        return len(self.slice_quantities)
+
+    @property
+    def child_count(self) -> int:
+        """Number of derived child ids the plan owns.
+
+        TWAP/VWAP own one fixed id per scheduled slice; POV owns one id per
+        unit of its total quantity, of which only the released prefix is ever
+        submitted (an unfinished POV release would itself carry more than one
+        unit, so the release count never reaches the id count).
+        """
+        if self.algorithm == ALGORITHM_POV:
+            return self.plan_total
         return len(self.slice_quantities)
 
     @property
     def total_quantity(self) -> int:
+        if self.algorithm == ALGORITHM_POV:
+            return self.plan_total
         return sum(self.slice_quantities)
 
     @property
     def remaining_slices(self) -> int:
         if self.status != PLAN_ACTIVE:
             return 0
+        if self.algorithm == ALGORITHM_POV:
+            # A POV release is driven by market volume rather than a fixed
+            # bucket list; until the total is reached another release can
+            # always occur.
+            return 1 if self.released_quantity < self.total_quantity else 0
         return self.slice_count - self.released
 
-    def child_order_id(self, slice_number: int) -> str:
-        """The deterministic derived order id of slice ``slice_number``.
+    def unreleased_quantity(self) -> int:
+        """Quantity still awaiting release (zero once completed or cancelled)."""
+        return (
+            self.total_quantity
+            - self.released_quantity
+            - self.cancelled_quantity
+        )
 
-        Slice numbers are 1-based and joined with ``#``; the scheme is fixed,
-        so the same input stream always derives the same identifiers.
+    def child_order_id(self, slice_number: int) -> str:
+        """The deterministic derived order id of release ``slice_number``.
+
+        Release numbers are 1-based and joined with ``#``; the scheme is
+        fixed, so the same input stream always derives the same identifiers.
         """
         return f"{self.plan_id}#{slice_number}"
 
     def child_ids(self) -> list[str]:
-        return [self.child_order_id(i + 1) for i in range(self.slice_count)]
+        """All derived ids reserved when the plan starts.
+
+        TWAP/VWAP reserve one id per scheduled slice; POV reserves one id per
+        unit of its total quantity (``plan_id#1 … plan_id#total_quantity``),
+        of which only the released prefix is ever submitted. Up-front
+        reservation keeps the external event/order-id protection identical
+        across algorithms.
+        """
+        return [self.child_order_id(i + 1) for i in range(self.child_count)]
 
     def summary(
         self,
@@ -547,6 +689,8 @@ class ExecutionPlan:
         child_order_id: str | None = None,
         target_weight: int | None = None,
         scheduled_quantity: int | None = None,
+        release_number: int | None = None,
+        pov_volume: bool = False,
     ) -> dict[str, object]:
         """Build the ``execution_plan`` object echoed by plan responses."""
         vwap = (
@@ -558,7 +702,29 @@ class ExecutionPlan:
         if self.side == SELL:
             # Mirror the buy formula: negative always means improvement.
             slippage = -slippage
-        plan: dict[str, object] = {
+        if self.algorithm == ALGORITHM_POV:
+            # POV reports the still-unreleased quantity instead of a fixed
+            # remaining-slice count.
+            plan: dict[str, object] = {
+                "status": self.status,
+                "released_quantity": self.released_quantity,
+                "filled_quantity": self.filled_quantity,
+                "cancelled_quantity": self.cancelled_quantity,
+                "unreleased_quantity": self.unreleased_quantity(),
+                "executed_notional": self.notional,
+                "vwap": vwap,
+                "slippage_notional": slippage,
+                "algorithm": ALGORITHM_POV,
+            }
+            if pov_volume:
+                # Every POV_VOLUME response names the child order id (null
+                # when the event released nothing); the release ordinal
+                # exists only for an actual positive release.
+                plan["child_order_id"] = child_order_id
+                if release_number is not None:
+                    plan["release_number"] = release_number
+            return plan
+        plan = {
             "status": self.status,
             "released_quantity": self.released_quantity,
             "filled_quantity": self.filled_quantity,
@@ -602,6 +768,14 @@ class ExecutionPlan:
             # algorithm label and the schedule the allocation derives from.
             data["algorithm"] = ALGORITHM_VWAP
             data["volume_weights"] = list(self.volume_weights)
+        elif self.algorithm == ALGORITHM_POV:
+            # POV records add the rate, the cumulative observed market volume
+            # and the total the schedule converges to; slice_quantities holds
+            # one original quantity per released child, in release order.
+            data["algorithm"] = ALGORITHM_POV
+            data["total_quantity"] = self.total_quantity
+            data["participation_bps"] = self.participation_bps
+            data["market_volume"] = self.market_volume
         return data
 
 
@@ -798,6 +972,8 @@ class EventReplayer:
             schema_error = _twap_schema_error(payload)
         elif event_type in _VWAP_TYPES:
             schema_error = _vwap_schema_error(payload)
+        elif event_type in _POV_TYPES:
+            schema_error = _pov_schema_error(payload)
         elif event_type == PORTFOLIO_REPORT:
             schema_error = _portfolio_report_schema_error(payload)
         elif event_type == PRICE_LIMIT_UPDATE:
@@ -862,8 +1038,8 @@ class EventReplayer:
 
         # A derived child id (``plan_id#slice``) is reserved from plan start;
         # it occupies both the order-id and event-id role of the future child,
-        # so no external event — baseline or TWAP command — may reuse it as an
-        # event id.
+        # so no external event — baseline or parent-order command — may reuse
+        # it as an event id.
         if event_id in state.plan_index:
             # Committed like every baseline business rejection: the well-formed
             # event occupies its id and the sequence, but nothing else moves.
@@ -987,7 +1163,7 @@ class EventReplayer:
         """Decide a price-limit breach against the active interval.
 
         Only the price of a LIMIT/ICEBERG ADD, of a REPLACE and of a LIMIT
-        TWAP/VWAP plan is tested against the security's currently active
+        TWAP/VWAP/POV plan is tested against the security's currently active
         closed interval (the static config interval as replaced by accepted
         PRICE_LIMIT_UPDATE events); MARKET orders and MARKET plans are
         exempt. Identifier clashes the baseline reaches first keep precedence
@@ -1025,7 +1201,7 @@ class EventReplayer:
                 return None
             return PRICE_LIMIT_EXCEEDED if out_of_bounds(payload["price"]) else None
 
-        if event_type in (TWAP_START, VWAP_START):
+        if event_type in (TWAP_START, VWAP_START, POV_START):
             if payload["order_type"] != LIMIT:
                 # MARKET plans are exempt, exactly like MARKET orders.
                 return None
@@ -1035,8 +1211,11 @@ class EventReplayer:
                 return None
             if event_type == TWAP_START:
                 child_count: int = payload["slice_count"]
-            else:
+            elif event_type == VWAP_START:
                 child_count = len(payload["volume_weights"])
+            else:
+                # POV reserves one derived id per unit of its total.
+                child_count = payload["total_quantity"]
             for index in range(child_count):
                 child_id = f"{plan_id}#{index + 1}"
                 if state.engine.has_order_id(child_id) or child_id in state.plan_index:
@@ -1055,8 +1234,13 @@ class EventReplayer:
             return _TWAP_START_KEYS
         if inline_type == VWAP_START:
             return _VWAP_START_KEYS
+        if inline_type == POV_START:
+            return _POV_START_KEYS
+        if inline_type == POV_VOLUME:
+            return _POV_VOLUME_KEYS
         if inline_type in (TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
-                           VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT):
+                           VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
+                           POV_CANCEL, POV_REPORT):
             return _TWAP_PLAN_REF_KEYS
         if inline_type == PORTFOLIO_REPORT:
             return _PORTFOLIO_REPORT_KEYS
@@ -1092,9 +1276,13 @@ class EventReplayer:
             result_out = self._twap_start(payload, state)
         elif event_type == VWAP_START:
             result_out = self._vwap_start(payload, state)
+        elif event_type == POV_START:
+            result_out = self._pov_start(payload, state)
+        elif event_type == POV_VOLUME:
+            result_out = self._plan_volume(payload, state)
         elif event_type in (TWAP_SLICE, VWAP_SLICE):
             result_out = self._plan_slice(payload, state)
-        elif event_type in (TWAP_CANCEL, VWAP_CANCEL):
+        elif event_type in (TWAP_CANCEL, VWAP_CANCEL, POV_CANCEL):
             result_out = self._plan_cancel(payload, state)
         else:
             result_out = self._plan_report(payload, state)
@@ -1148,6 +1336,123 @@ class EventReplayer:
         )
         return self._register_plan(state, plan)
 
+    def _pov_start(
+        self, payload: dict[str, object], state: _SymbolState
+    ) -> tuple[str, str | None, ExecutionPlan | None, None]:
+        """Create the POV plan; no matching occurs."""
+        plan = ExecutionPlan(
+            plan_id=payload["plan_id"],
+            side=payload["side"],
+            order_type=payload["order_type"],
+            total_quantity=payload["total_quantity"],
+            slice_count=0,
+            benchmark_price=payload["benchmark_price"],
+            price=payload.get("price") if payload["order_type"] == LIMIT else None,
+            account_id=payload.get("account_id"),
+            algorithm=ALGORITHM_POV,
+            participation_bps=payload["participation_bps"],
+        )
+        return self._register_plan(state, plan)
+
+    def _plan_volume(
+        self, payload: dict[str, object], state: _SymbolState
+    ) -> tuple[str, str | None, ExecutionPlan | None, dict[str, object] | None]:
+        """Feed a market volume increment and release one POV child order.
+
+        The cumulative target release is
+        ``min(total_quantity, floor(market_volume * participation_bps / 10000))``;
+        the event releases the difference between the target and the quantity
+        already released, if positive. A zero difference still consumes the
+        increment (and the event id/sequence) but submits no child order.
+        """
+        plan_id: str = payload["plan_id"]
+        plan = state.plans.get(plan_id)
+        if plan is None:
+            return REJECTED, UNKNOWN_EXECUTION_PLAN, None, None
+        if plan.algorithm != ALGORITHM_POV:
+            # A fixed-schedule TWAP/VWAP plan cannot be driven by market
+            # volume: no POV plan with this id exists, so this is reported
+            # like an unknown plan and moves nothing.
+            return REJECTED, UNKNOWN_EXECUTION_PLAN, None, None
+        if plan.status != PLAN_ACTIVE:
+            return REJECTED, EXECUTION_PLAN_CLOSED, None, None
+
+        # A LIMIT plan started inside the band is re-checked against the
+        # current active interval before every release, exactly like a TWAP/
+        # VWAP slice. The check precedes any state change: on a breach neither
+        # the cumulative market volume nor the release state moves, and the
+        # reserved derived ids stay reserved.
+        if plan.order_type == LIMIT and state.price_limits is not None:
+            lower, upper = state.price_limits
+            if plan.price < lower or plan.price > upper:
+                return REJECTED, PRICE_LIMIT_EXCEEDED, None, None
+
+        increment: int = payload["market_volume_increment"]
+        plan.market_volume += increment
+
+        target = min(
+            plan.total_quantity,
+            plan.market_volume * plan.participation_bps // 10000,
+        )
+        release_quantity = target - plan.released_quantity
+        release_number = plan.released + 1
+
+        if release_quantity == 0:
+            # The event succeeds and the market volume is retained, but no
+            # child order is submitted and no trade id is spent.
+            return ACCEPTED, None, plan, {
+                "pov_volume": True,
+                "release_number": None,
+                "child_order_id": None,
+                "engine_result": None,
+                "trades": [],
+                "release_quantity": 0,
+            }
+
+        child_id = plan.child_order_id(release_number)
+        child: dict[str, object] = {
+            "event_id": child_id,
+            "type": ADD,
+            "order_id": child_id,
+            "side": plan.side,
+            "order_type": plan.order_type,
+            "quantity": release_quantity,
+            "time_in_force": IOC,
+        }
+        if plan.order_type == LIMIT:
+            child["price"] = plan.price
+        if plan.account_id is not None:
+            child["account_id"] = plan.account_id
+
+        # The child id was reserved at plan start; release it immediately
+        # before the baseline ADD spends it through the regular path.
+        state.engine.release_order_id(child_id)
+        _eid, engine_result, reason, trades, _stp = state.engine.handle_object(child)
+        # A correctly synthesized child can only fail on a programming error;
+        # fail loudly rather than corrupt the plan counters.
+        if reason is not None:  # pragma: no cover - defensive
+            raise RuntimeError(f"plan release child order rejected: {reason}")
+
+        traded_quantity = sum(trade["quantity"] for trade in trades)
+        plan.released += 1
+        plan.released_quantity += release_quantity
+        # The released child's original quantity joins the schedule list, in
+        # release order; snapshot validation reads it back per child.
+        plan.slice_quantities.append(release_quantity)
+        plan.filled_quantity += traded_quantity
+        plan.notional += sum(trade["price"] * trade["quantity"] for trade in trades)
+        if plan.released_quantity == plan.total_quantity:
+            plan.status = PLAN_COMPLETED
+
+        return ACCEPTED, None, plan, {
+            "pov_volume": True,
+            "release_number": release_number,
+            "child_order_id": child_id,
+            "engine_result": engine_result,
+            "trades": trades,
+            "release_quantity": release_quantity,
+        }
+
     @staticmethod
     def _register_plan(
         state: _SymbolState, plan: ExecutionPlan
@@ -1179,6 +1484,11 @@ class EventReplayer:
         plan_id: str = payload["plan_id"]
         plan = state.plans.get(plan_id)
         if plan is None:
+            return REJECTED, UNKNOWN_EXECUTION_PLAN, None, None
+        if plan.algorithm == ALGORITHM_POV:
+            # A fixed-schedule slice command cannot drive a volume-driven
+            # plan: the id names an existing plan but none of this command's
+            # kind, so it is reported like an unknown plan and moves nothing.
             return REJECTED, UNKNOWN_EXECUTION_PLAN, None, None
         if plan.status != PLAN_ACTIVE:
             return REJECTED, EXECUTION_PLAN_CLOSED, None, None
@@ -1289,13 +1599,17 @@ class EventReplayer:
                 result: str | None = None
                 slice_number = child_order_id = None
                 target_weight = scheduled_quantity = None
+                release_number = None
+                pov_volume = False
             else:
                 trades = slice_info["trades"]
                 result = slice_info["engine_result"]
-                slice_number = slice_info["slice_number"]
+                slice_number = slice_info.get("slice_number")
                 child_order_id = slice_info["child_order_id"]
                 target_weight = slice_info.get("target_weight")
                 scheduled_quantity = slice_info.get("scheduled_quantity")
+                release_number = slice_info.get("release_number")
+                pov_volume = slice_info.get("pov_volume", False)
             out: dict[str, object] = {
                 "event_id": event_id,
                 "symbol": symbol,
@@ -1313,6 +1627,8 @@ class EventReplayer:
                 child_order_id=child_order_id,
                 target_weight=target_weight,
                 scheduled_quantity=scheduled_quantity,
+                release_number=release_number,
+                pov_volume=pov_volume,
             ) if plan is not None else None
             return out
         # Business rejection: the book is untouched by the command itself.
@@ -1378,11 +1694,11 @@ class EventReplayer:
         """The securities on which an accepted event named ``account_id``.
 
         An account is known on a security once either an accepted ADD carried
-        it or an accepted TWAP/VWAP plan carried it; released slices inherit
-        the plan's account and therefore already show up in the engine's
-        account set, while a started-but-never-sliced plan is picked up
-        directly. This mirrors the baseline rule that an accepted ADD makes an
-        account known whatever later happens to the order.
+        it or an accepted TWAP/VWAP/POV plan carried it; released slices
+        inherit the plan's account and therefore already show up in the
+        engine's account set, while a started-but-never-released plan is
+        picked up directly. This mirrors the baseline rule that an accepted
+        ADD makes an account known whatever later happens to the order.
         """
         symbols: set[str] = set()
         for sym, symbol_state in self._symbols.items():
@@ -1615,10 +1931,7 @@ def _parse_plan_entry(entry: dict[str, object]) -> "ExecutionPlan":
         f"plan {plan_id} account_id is malformed",
     )
     raw_slices = entry.get("slice_quantities")
-    _require(
-        isinstance(raw_slices, list) and len(raw_slices) > 0,
-        f"plan {plan_id} slice_quantities must be a non-empty list",
-    )
+    _require(isinstance(raw_slices, list), f"plan {plan_id} slice_quantities must be a list")
     slice_quantities: list[int] = []
     for value in raw_slices:
         _require(
@@ -1644,12 +1957,19 @@ def _parse_plan_entry(entry: dict[str, object]) -> "ExecutionPlan":
         status in (PLAN_ACTIVE, PLAN_COMPLETED, PLAN_CANCELLED),
         f"plan {plan_id} has a bad status",
     )
-    slice_count = len(slice_quantities)
-    _require(0 <= released <= slice_count, f"plan {plan_id} released slice index out of range")
-    total_quantity = sum(slice_quantities)
     algorithm = entry.get("algorithm", ALGORITHM_TWAP)
     volume_weights: list[int] | None = None
+    participation_bps: int | None = None
+    market_volume: int | None = None
+    plan_total: int | None = None
+
+    slice_count = len(slice_quantities)
+    _require(0 <= released <= slice_count, f"plan {plan_id} released slice index out of range")
+
     if algorithm == ALGORITHM_VWAP:
+        # TWAP/VWAP plans always carry at least one scheduled slice.
+        _require(slice_count > 0, f"plan {plan_id} slice_quantities must be a non-empty list")
+        total_quantity = sum(slice_quantities)
         raw_weights = entry.get("volume_weights")
         _require(
             isinstance(raw_weights, list) and len(raw_weights) == slice_count,
@@ -1666,20 +1986,88 @@ def _parse_plan_entry(entry: dict[str, object]) -> "ExecutionPlan":
             slice_quantities == _allocate_slices(total_quantity, volume_weights),
             f"plan {plan_id} slice quantities disagree with its volume weights",
         )
+        _require(
+            released_quantity == sum(slice_quantities[:released]),
+            f"plan {plan_id} released_quantity does not match its slices",
+        )
+    elif algorithm == ALGORITHM_POV:
+        # POV carries an explicit total and rate; its slice list holds exactly
+        # one original quantity per positive release and may be empty before
+        # the first one.
+        plan_total = pos_int("total_quantity")
+        participation_bps = entry.get("participation_bps")
+        _require(
+            _is_int(participation_bps) and 1 <= participation_bps <= 10000,
+            f"plan {plan_id} participation_bps must be an integer from 1 to 10000",
+        )
+        market_volume = entry.get("market_volume")
+        _require(
+            _non_negative_int(market_volume),
+            f"plan {plan_id} market_volume must be a non-negative integer",
+        )
+        _require(
+            released == slice_count,
+            f"plan {plan_id} POV release count disagrees with its released slices",
+        )
+        _require(
+            released_quantity == sum(slice_quantities),
+            f"plan {plan_id} released_quantity does not match its releases",
+        )
+        _require(
+            released_quantity <= plan_total,
+            f"plan {plan_id} released quantity exceeds its total",
+        )
+        # Every accepted POV_VOLUME event leaves the released quantity exactly
+        # at the participation target for the cumulative market volume (capped
+        # at the total), whatever lifecycle status followed.
+        target = min(
+            plan_total, market_volume * participation_bps // 10000
+        )
+        _require(
+            released_quantity == target,
+            f"plan {plan_id} released quantity disagrees with market volume",
+        )
+        total_quantity = plan_total
     else:
         _require(
             algorithm == ALGORITHM_TWAP,
             f"plan {plan_id} has an unknown algorithm",
         )
-    _require(
-        released_quantity == sum(slice_quantities[:released]),
-        f"plan {plan_id} released_quantity does not match its slices",
-    )
+        _require(slice_count > 0, f"plan {plan_id} slice_quantities must be a non-empty list")
+        total_quantity = sum(slice_quantities)
+        _require(
+            released_quantity == sum(slice_quantities[:released]),
+            f"plan {plan_id} released_quantity does not match its slices",
+        )
+
     _require(
         filled_quantity <= released_quantity,
         f"plan {plan_id} filled quantity exceeds released quantity",
     )
-    if status == PLAN_ACTIVE:
+
+    if algorithm == ALGORITHM_POV:
+        if status == PLAN_ACTIVE:
+            _require(
+                released_quantity < total_quantity,
+                f"plan {plan_id} is ACTIVE after its total was released",
+            )
+            _require(cancelled_quantity == 0, f"plan {plan_id} is ACTIVE but carries cancellations")
+        elif status == PLAN_COMPLETED:
+            _require(
+                released_quantity == total_quantity,
+                f"plan {plan_id} is COMPLETED before its total was released",
+            )
+            _require(cancelled_quantity == 0, f"plan {plan_id} is COMPLETED but carries cancellations")
+        else:
+            _require(
+                released_quantity < total_quantity,
+                f"plan {plan_id} is CANCELLED after its total was released",
+            )
+            _require(
+                cancelled_quantity == total_quantity - released_quantity,
+                f"plan {plan_id} cancelled quantity does not cover the unreleased remainder",
+            )
+    elif status == PLAN_ACTIVE:
         _require(released < slice_count, f"plan {plan_id} is ACTIVE with no slices left")
         _require(cancelled_quantity == 0, f"plan {plan_id} is ACTIVE but carries cancellations")
     elif status == PLAN_COMPLETED:
@@ -1708,6 +2096,9 @@ def _parse_plan_entry(entry: dict[str, object]) -> "ExecutionPlan":
     plan.cancelled_quantity = cancelled_quantity
     plan.notional = notional
     plan.status = status
+    plan.participation_bps = participation_bps
+    plan.market_volume = market_volume
+    plan.plan_total = plan_total
     return plan
 
 
@@ -1735,6 +2126,9 @@ _PLAN_KEYS = frozenset(
      "cancelled_quantity", "notional", "status"}
 )
 _VWAP_PLAN_KEYS = _PLAN_KEYS | {"algorithm", "volume_weights"}
+_POV_PLAN_KEYS = _PLAN_KEYS | {
+    "algorithm", "total_quantity", "participation_bps", "market_volume"
+}
 _ENVELOPE_KEYS_SNAPSHOT = frozenset(
     {"format_version", "engine_version", "config", "config_digest",
      "content", "content_digest"}
@@ -1794,7 +2188,7 @@ def _engine_from_json(
 
     # Partition the accepted events into baseline engine events and
     # replay-only events: the engine journal only knows the former plus the
-    # child orders synthesized for released slices, while every TWAP/VWAP
+    # child orders synthesized for released slices, while every TWAP/VWAP/POV
     # command id and every read-only PORTFOLIO_REPORT id lives solely in the
     # replay log.
     baseline_event_ids: set[str] = set()
@@ -1819,13 +2213,15 @@ def _engine_from_json(
     for entry in plans_raw:
         _require(isinstance(entry, dict), "plan entry must be an object")
         _require(
-            set(entry) == _PLAN_KEYS or set(entry) == _VWAP_PLAN_KEYS,
+            set(entry) == _PLAN_KEYS
+            or set(entry) == _VWAP_PLAN_KEYS
+            or set(entry) == _POV_PLAN_KEYS,
             "plan entry has unknown fields",
         )
         plan = _parse_plan_entry(entry)
         plan_id = plan.plan_id
         _require(plan_id not in plans, f"duplicate execution plan id {plan_id}")
-        for index in range(plan.slice_count):
+        for index in range(plan.child_count):
             child_id = plan.child_order_id(index + 1)
             _require(
                 child_id not in plan_index,
@@ -1993,7 +2389,7 @@ def _engine_from_json(
 
     # The id sets mirror exactly what the baseline engine would hold. The
     # engine only knows baseline events and synthesized child orders;
-    # TWAP/VWAP command ids live solely in the replay layer's event log.
+    # TWAP/VWAP/POV command ids live solely in the replay layer's event log.
     _require(set(order_ids) == set(orders), "order_ids and order records disagree")
     _require(
         set(event_ids) == (baseline_event_ids - set(plan_index)) | released_child_ids,
@@ -2316,7 +2712,8 @@ def replay_events(
         ``"event"`` object that repeats ``event_id`` and ``type``. Supported
         kinds are the baseline ADD/CANCEL/REPLACE events, the TWAP/VWAP
         TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
-        VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands, the
+        VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands, the POV
+        POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT commands, the
         read-only cross-security PORTFOLIO_REPORT query and the intraday
         PRICE_LIMIT_UPDATE adjustment.
     config:

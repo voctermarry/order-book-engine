@@ -245,7 +245,7 @@ IMPACT_REPORT：
 
 ## 多证券有序事件回放
 
-在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT` 与 VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，跨证券只读查询 `PORTFOLIO_REPORT`，以及盘中涨跌停调整 `PRICE_LIMIT_UPDATE`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟，只由各自的 SLICE 事件推进。
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT`，VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，POV 母单命令 `POV_START`、`POV_VOLUME`、`POV_CANCEL`、`POV_REPORT`，跨证券只读查询 `PORTFOLIO_REPORT`，以及盘中涨跌停调整 `PRICE_LIMIT_UPDATE`（不重新定义任何订单类型的撮合规则；`EXECUTION_REPORT`/`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION`/`IMPACT_REPORT` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟：TWAP/VWAP 只由各自的 SLICE 事件推进，POV 只由 `POV_VOLUME` 事件喂入的市场成交量推进。
 
 ### 命令行
 
@@ -270,7 +270,7 @@ response = replay_events(events, config=None, snapshot=None, snapshot_after="las
 - `event_id`：非空字符串，**全流唯一**（跨所有证券）。
 - `symbol`：非空字符串，证券代码；不同证券分别维护序列与簿状态。
 - `sequence`：正整数（布尔值不算整数）；同一证券严格按 `sequence` 递增处理，期望序列为该证券上一成功事件序列加 1。输入顺序即处理顺序，`timestamp`（可选，非负整数或非空字符串）相同或乱序都不得改变输入顺序。
-- 基线订单字段或 TWAP/VWAP 命令字段可**内联**携带（`type` + 对应字段），也可放在嵌套的 `event` 对象中（该对象必须重复相同的 `event_id` 与 `type`）。内联形式只允许信封字段与该 `type` 自身的字段；嵌套形式只允许信封字段加 `event`，任何未知字段按 `INVALID_EVENT` 拒绝。
+- 基线订单字段或 TWAP/VWAP/POV 命令字段可**内联**携带（`type` + 对应字段），也可放在嵌套的 `event` 对象中（该对象必须重复相同的 `event_id` 与 `type`）。内联形式只允许信封字段与该 `type` 自身的字段；嵌套形式只允许信封字段加 `event`，任何未知字段按 `INVALID_EVENT` 拒绝。
 
 ### 逐事件结果
 
@@ -283,7 +283,7 @@ response = replay_events(events, config=None, snapshot=None, snapshot_after="las
 - `trades`：该事件产生的成交，按发生顺序排列，字段与基线完全一致（`trade_id` 在**各证券内**从 1 连续递增）。
 - `book_changes`：本次盘口变更，`bids` 降序、`asks` 升序；仅列出数量发生变化的档位，被移除的档位以 `"quantity": 0` 表示。
 - `bids`/`asks`：该事件处理后的该证券完整盘口（已知证券的拒绝事件回显未变化盘口；未知证券的预分发拒绝为空盘口且不创建证券）。
-- `execution_plan`：仅 TWAP/VWAP 命令的结果出现，字段见下文 TWAP 母单与 VWAP 母单两节。
+- `execution_plan`：仅 TWAP/VWAP/POV 命令的结果出现，字段见下文 TWAP 母单、VWAP 母单与 POV 母单三节。
 - `portfolio_analysis`：仅 `PORTFOLIO_REPORT` 的成功结果出现，字段见下文「跨证券组合报告 PORTFOLIO_REPORT」一节；其他结果不得包含该字段。
 - `active_price_limits`：仅 `PRICE_LIMIT_UPDATE` 的成功结果出现（`{"lower_price": ..., "upper_price": ...}`），回显替换后的活动区间；其他结果不得包含该字段。
 
@@ -369,6 +369,63 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 计划完整状态（算法、权重曲线、各片数量、进度与累计分析）进入快照；快照格式版本保持 `event-replay/2`，恢复后继续执行与不中断回放逐字节一致。
 
+### POV 母单
+
+POV（参与率）母单与 TWAP/VWAP 母单同属**单个证券**的可恢复计划，共用同一 `plan_id` 命名空间、派生标识方案（`plan_id#N`）、生命周期（`ACTIVE`/`COMPLETED`/`CANCELLED`）、拒绝码与幂等/序列语义；差别在于推进方式：POV 没有固定分片表，而是按调用方逐次喂入的市场累计成交量与参与率，动态计算每次应释放的数量，同样不读取墙钟，只由 `POV_VOLUME` 事件推进。
+
+POV_START：
+
+```json
+{"event_id": "e2", "symbol": "AAA", "sequence": 2, "type": "POV_START",
+ "plan_id": "p1", "side": "BUY", "total_quantity": 100, "participation_bps": 2000,
+ "order_type": "LIMIT", "benchmark_price": 99, "price": 100, "account_id": "acct-1"}
+```
+
+- `plan_id`：非空字符串，在该证券内唯一（TWAP/VWAP/POV 共用命名空间）。
+- `side`：`BUY` 或 `SELL`。
+- `total_quantity`：正整数（布尔值不算整数），为参与率公式收敛的目标总量。
+- `participation_bps`：参与率，单位基点，**1 至 10000 的整数**（含边界；布尔、零、负数、10001、浮点、字符串均非法）。
+- `order_type`：`LIMIT` 或 `MARKET`（不含 ICEBERG）。LIMIT 必须带正整数 `price`；MARKET 不得带非空 `price`（可省略或为 `null`）。
+- `benchmark_price`：正整数，用于滑点核算。
+- `account_id`：可选非空字符串，子单继承该账户用于自成交防护。
+- 字段缺失、多出、类型错误、空标识、参与率越界、LIMIT/MARKET 价格规则违反等均按 `INVALID_EVENT` 拒绝，**不占用** `event_id` 与序列。
+- 启动**不撮合**。与 TWAP/VWAP 一样，`POV_START` 接受后即保留全部潜在派生标识 `plan_id#1 … plan_id#total_quantity`（外部 `ADD` 不得占用为 `order_id`，外部事件不得用作 `event_id`）；重复 `plan_id` 返回 `DUPLICATE_EXECUTION_PLAN`，派生标识与既有订单或其他计划冲突返回 `DUPLICATE_ORDER_ID`，二者都占用 `event_id` 并推进序列，但不建立计划、不保留任何标识。
+
+POV_VOLUME：
+
+```json
+{"event_id": "e3", "symbol": "AAA", "sequence": 3, "type": "POV_VOLUME",
+ "plan_id": "p1", "market_volume_increment": 50}
+```
+
+- 载荷只含 `event_id`、`type`、`plan_id`、`market_volume_increment`；增量为正整数（布尔、零、负、浮点、字符串、空值均非法），字段缺失或多出按 `INVALID_EVENT` 拒绝且不占用。
+- 增量累加到计划的**累计市场成交量** `M`。目标累计释放量为 `min(total_quantity, floor(M × participation_bps ÷ 10000))`；本次释放量为目标值减去已释放量。
+- 本次释放量为**零**时事件仍成功：市场量照常累计、占用 `event_id` 并推进序列，但**不创建子单**、不消耗成交编号，响应无 `result` 字段，且 `execution_plan.child_order_id` 为 `null`、不含 `release_number`。
+- 本次释放量**大于零**时按已发生的正数释放次数生成子单标识 `plan_id#N`（N 从 1 开始、只随正数释放递增），提交一笔该数量的子单——LIMIT 计划提交带计划价的 `IOC` 限价单，MARKET 计划提交市价子单；沿用现有撮合、冰山补片与自成交防护规则。
+- 响应保留子单的 `result`、`trades`、`book_changes` 与盘口，并附加 `execution_plan`（含 `release_number` 与 `child_order_id`）。
+- 未知计划返回 `UNKNOWN_EXECUTION_PLAN`；计划已关闭（`COMPLETED`/`CANCELLED`）再喂量返回 `EXECUTION_PLAN_CLOSED`，不撮合、不累计市场量、不改变盘口或成交编号。
+- 释放驱动命令按计划种类区分：`POV_VOLUME` 只能驱动 POV 计划，`TWAP_SLICE`/`VWAP_SLICE` 只能驱动固定分片的 TWAP/VWAP 计划；id 存在但种类不符时返回 `UNKNOWN_EXECUTION_PLAN`（同名的 TWAP/VWAP 分片命令彼此通用）。`POV_CANCEL`/`POV_REPORT` 与 TWAP/VWAP 的对应命令一样对三种计划通用。
+- 当已释放量达到 `total_quantity` 时计划置为 `COMPLETED`（参与率公式已被总量封顶）；完成后继续喂量返回 `EXECUTION_PLAN_CLOSED`。
+
+POV_CANCEL 与 POV_REPORT 均只携带 `event_id`、`type`、`plan_id`：
+
+- `POV_CANCEL`：将**未释放量**（`total_quantity − 已释放量 − 已取消量`）计入取消量并把计划置为 `CANCELLED`；不撤销已释放子单（IOC 子单在释放事件结束时即已终结），不改变盘口、成交编号或历史成交。对已关闭计划返回 `EXECUTION_PLAN_CLOSED`。
+- `POV_REPORT`：只读返回相同的累计汇总，不改变任何状态（包括累计市场量）；关闭后的计划仍可查询。未知计划返回 `UNKNOWN_EXECUTION_PLAN`。
+
+每个 POV 命令响应中的 `execution_plan` 含：
+
+- `status`：`ACTIVE`、`COMPLETED` 或 `CANCELLED`。
+- `released_quantity`：已释放子单的原始数量之和；`filled_quantity`：子单累计成交量；`cancelled_quantity`：取消时计入的未释放量；`unreleased_quantity`：尚未释放也未取消的数量（计划关闭后为 0）。POV 没有固定片表，因此用 `unreleased_quantity` 取代 TWAP/VWAP 的 `remaining_slices`。
+- `executed_notional`：累计成交额（成交价乘数量）。
+- `vwap`：精确分数 `{"numerator": executed_notional, "denominator": filled_quantity}`；无成交时为 `null`。
+- `slippage_notional`：买单为 `executed_notional − benchmark_price × filled_quantity`，卖单取相反数；负值表示相对基准改善。
+- `algorithm`：恒为 `"POV"`。
+- 仅 `POV_VOLUME` 的成功结果额外含 `child_order_id`（本次子单标识；零释放时为 `null`）；当且仅当本次发生正数释放时再额外含 `release_number`（本次正数释放序号，从 1 开始、只随正数释放递增）。
+
+LIMIT POV 计划在每次正数释放**前**按当时的活动涨跌停区间复核计划价：越界返回 `PRICE_LIMIT_EXCEEDED`，占用该 `event_id` 并推进序列，但**不撮合、不消耗成交编号、不累计本次市场量、不改变释放状态**，已保留的派生标识继续保留（喂量前的复核先于市场量累计）。`POV_START` 的价格校验与 TWAP_START/VWAP_START 相同：重复计划、派生标识冲突等既有拒绝码优先于越界。
+
+POV 计划完整状态（参与率、累计市场成交量、总量、每次正数释放的原始数量、进度与累计分析）进入快照；快照格式版本保持 `event-replay/2`，恢复后继续执行的结果、盘口与规范 JSON 与不中断回放逐字节一致。
+
 ### 跨证券组合报告 PORTFOLIO_REPORT
 
 `PORTFOLIO_REPORT` 是属于多证券事件流的只读跨证券查询，在确定时点汇总一个账户跨全部证券的持仓、资金与风险。它沿用事件信封的 `event_id`、`symbol`、`sequence` 顺序与幂等语义：
@@ -378,7 +435,7 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
  "account_id": "acct-1", "mark_prices": {"AAA": 100, "BBB": 50}}
 ```
 
-- `account_id`：非空字符串。账户在**任一证券**上已有携带该 `account_id` 的已接受 ADD（无论订单最终在簿、成交、撤销或被自成交防护取消）即视为已知；已释放的 TWAP/VWAP 子单继承母单账户，同样计入，已接受的 TWAP/VWAP 母单即使尚未释放任何子单也使该账户在该证券上已知；仅出现在被拒绝事件中的账户不算已知。
+- `account_id`：非空字符串。账户在**任一证券**上已有携带该 `account_id` 的已接受 ADD（无论订单最终在簿、成交、撤销或被自成交防护取消）即视为已知；已释放的 TWAP/VWAP/POV 子单继承母单账户，同样计入，已接受的 TWAP/VWAP/POV 母单即使尚未释放任何子单也使该账户在该证券上已知；仅出现在被拒绝事件中的账户不算已知。
 - `mark_prices`：对象，键为非空证券名字符串，值为正整数标记价（布尔值不算整数）。键集合必须**恰好**覆盖该账户出现过的全部证券——既不能缺，也不能多。
 - 字段缺失、多出、类型错误、`account_id` 为空标识、`mark_prices` 不是对象、含空键或非法价格（布尔、零、负、浮点、字符串、空值）均按 `INVALID_EVENT` 拒绝，**不占用** `event_id` 且**不推进** `sequence`。
 - 结构合法但账户未知：`UNKNOWN_ACCOUNT`；账户已知但 `mark_prices` 键集合不符（含空对象）：`MARK_PRICE_MISMATCH`。二者都是业务拒绝：**占用** `event_id`、**推进**信封 `symbol` 的序列，并回显该信封证券的未变盘口；其 `event_id` 只进入重放日志，不进入任何证券的引擎事件集合。
@@ -415,8 +472,8 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 - `EVENT_ID_CONFLICT`：已见 `eventId` 但规范化内容不一致（或用于另一证券）；不再次撮合、不占用序列。
 - `DUPLICATE`：已见 `eventId` 且规范化内容（键排序后的紧凑 JSON）完全一致；不再次撮合、无成交无盘口变更。重试投递携带旧序列时仍识别为重复。
 - 撤单/改单不存在或已终结订单，继续沿用基线拒绝码（如 `UNKNOWN_ORDER`、`DUPLICATE_ORDER_ID`）；这类有效事件与基线一样占用其 `event_id` 并推进该证券序列。
-- TWAP/VWAP 业务拒绝码：`UNKNOWN_EXECUTION_PLAN`（未知计划）、`EXECUTION_PLAN_CLOSED`（对已关闭计划切片或取消）、`DUPLICATE_EXECUTION_PLAN`（同证券重复 `plan_id`，TWAP 与 VWAP 共用命名空间）；派生标识冲突沿用 `DUPLICATE_ORDER_ID`。这些有效命令同样占用 `event_id` 并推进序列，但不改变计划或盘口状态。
-- 跨证券组合报告拒绝码：`UNKNOWN_ACCOUNT`（账户在任一证券上均无已接受 ADD 或已接受 TWAP/VWAP 母单）、`MARK_PRICE_MISMATCH`（已知账户但 `mark_prices` 键集合未恰好覆盖其全部证券）。二者都是结构合法后的业务拒绝，占用 `event_id`、推进信封证券序列并回显未变盘口；结构错误仍为 `INVALID_EVENT`，不占用 `event_id` 与序列。
+- TWAP/VWAP/POV 业务拒绝码：`UNKNOWN_EXECUTION_PLAN`（未知计划）、`EXECUTION_PLAN_CLOSED`（对已关闭计划切片、喂量或取消）、`DUPLICATE_EXECUTION_PLAN`（同证券重复 `plan_id`，三种计划共用命名空间）；派生标识冲突沿用 `DUPLICATE_ORDER_ID`。这些有效命令同样占用 `event_id` 并推进序列，但不改变计划或盘口状态。
+- 跨证券组合报告拒绝码：`UNKNOWN_ACCOUNT`（账户在任一证券上均无已接受 ADD 或已接受 TWAP/VWAP/POV 母单）、`MARK_PRICE_MISMATCH`（已知账户但 `mark_prices` 键集合未恰好覆盖其全部证券）。二者都是结构合法后的业务拒绝，占用 `event_id`、推进信封证券序列并回显未变盘口；结构错误仍为 `INVALID_EVENT`，不占用 `event_id` 与序列。
 - 相同初始状态、配置和事件流产生字段顺序稳定、数值表示一致、可逐字节比较的 JSON（规范化序列化：键排序、紧凑分隔、整数不丢精度、无浮点）。
 - 静态涨跌停越界码：`PRICE_LIMIT_EXCEEDED`，见下文「静态涨跌停 `price_limits`」一节。
 
@@ -438,7 +495,7 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 - LIMIT 与 ICEBERG 的 `ADD`：其 `price` 必须在区间内；`MARKET` 的 ADD 不受校验。
 - `REPLACE`：新 `price` 必须在区间内。越界替换是业务拒绝：**保留原委托及其队列优先级**，不撮合、不改变盘口或成交编号。
-- `TWAP_START`、`VWAP_START`：仅 LIMIT 计划校验其 `price`；MARKET 计划不受校验。越界启动**不创建计划、不保留任何派生标识**（`plan_id#n` 可立即被其他委托或新计划使用）。
+- `TWAP_START`、`VWAP_START`、`POV_START`：仅 LIMIT 计划校验其 `price`；MARKET 计划不受校验。越界启动**不创建计划、不保留任何派生标识**（`plan_id#n` 可立即被其他委托或新计划使用）。
 - 校验时机在现有信封、幂等、序列与标识冲突检查**之后**、撮合与任何状态变更**之前**。因此 `DUPLICATE_ORDER_ID`（含派生标识冲突）、`UNKNOWN_ORDER`、`DUPLICATE_EXECUTION_PLAN` 等既有结果优先于越界；结构非法仍为 `INVALID_EVENT` 且不占用任何标识。
 
 越界事件的结果：`status` 为 `REJECTED`、`rejection_code` 为 `PRICE_LIMIT_EXCEEDED`，`trades` 与 `book_changes` 均为空，并回显未变化盘口。它与其他业务拒绝一样**占用 `event_id` 并推进该证券 `sequence`**，但不留下订单或计划、不消耗成交编号；合法事件的价格时间优先、FOK 原子性、IOC 余量取消、冰山补片与自成交防护规则不变。
@@ -460,7 +517,7 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 - 载荷只含 `event_id`、`type`、`lower_price`、`upper_price`；两个边界均为正整数（布尔值不算整数）且 `lower_price <= upper_price`。字段缺失、多出、类型不符、非正边界或上下界倒置均为 `INVALID_EVENT`，不占用 `event_id` 与序列。
 - 接受后结果为 `status: ACCEPTED`、`result: PRICE_LIMIT_UPDATED`，`trades` 与 `book_changes` 为空、盘口保持不变，并附 `active_price_limits: {"lower_price": ..., "upper_price": ...}` 回显新区间。相同边界的更新仍然成功；重复、冲突与序列错误沿用 `DUPLICATE`、`EVENT_ID_CONFLICT`、`SEQUENCE_GAP`、`OUT_OF_ORDER` 等既有语义。
-- 活动区间约束**之后提交**的限价：LIMIT/ICEBERG `ADD`、`REPLACE`、LIMIT `TWAP_START`/`VWAP_START` 按既有优先级校验（标识冲突等既有拒绝码优先）；已启动的 LIMIT 计划在每次 `SLICE` 释放前按**当时**的活动区间复核。越界统一返回 `PRICE_LIMIT_EXCEEDED`，占用 `event_id` 并推进序列，但不撮合、不消耗成交编号：`ADD` 不建单，`REPLACE` 保留原单及队列位置，`START` 不建计划，`SLICE` 不推进片号与累计量且已保留的派生标识继续保留。市价订单与市价计划不受限制。
+- 活动区间约束**之后提交**的限价：LIMIT/ICEBERG `ADD`、`REPLACE`、LIMIT `TWAP_START`/`VWAP_START`/`POV_START` 按既有优先级校验（标识冲突等既有拒绝码优先）；已启动的 LIMIT 计划在每次 TWAP/VWAP 切片或 POV 正数释放前按**当时**的活动区间复核（POV 的复核先于本次市场量累计：越界时市场量与释放状态均不变）。越界统一返回 `PRICE_LIMIT_EXCEEDED`，占用 `event_id` 并推进序列，但不撮合、不消耗成交编号：`ADD` 不建单，`REPLACE` 保留原单及队列位置，`START` 不建计划，`SLICE`/`POV_VOLUME` 不推进片号/市场量与累计量且已保留的派生标识继续保留。市价订单与市价计划不受限制。
 - 缩窄区间不撤销也不移动既有挂单：区间外旧单仍按原优先级留在队列中并可成为 maker（限制对象是新提交的限价，不是成交价）。
 - 每证券活动区间进入快照（`price_limits`，`null` 表示不限）并受 `content_digest` 保护；恢复后与连续回放逐字节一致。缺少该字段的旧格式快照在恢复时从 `config` 的静态区间初始化。
 
@@ -472,7 +529,7 @@ VWAP 命令响应中的 `execution_plan` 沿用 TWAP 的全部累计指标（`st
 
 - `format_version`：格式版本（当前 `event-replay/2`；较 `event-replay/1` 在每证券状态中增加 `plans`、在引擎状态中增加 `reserved_order_ids`）。
 - `engine_version`、`config`（撮合配置摘要）与 `config_digest`（配置的 SHA-256）。
-- `content`：各证券完整状态——价格时间队列顺序（含每档订单 id 队列）、订单剩余量、冰山当前公开量 `visible` 与补量所需 `display_quantity`、各证券最后序列 `last_sequence`、活动涨跌停区间 `price_limits`（`null` 表示不限；旧格式快照缺少该字段，恢复时从 `config` 静态区间初始化）、已接受事件日志、TWAP/VWAP 计划列表 `plans`（计划参数——VWAP 计划另含 `algorithm` 与 `volume_weights`——各片数量、已释放片数与已释放量、成交量、取消量、成交额、生命周期状态）、引擎保留的未释放派生标识 `reserved_order_ids`、累计成交 `trade_log`、生成后续成交标识所需的 `next_trade_id`、账户集合。
+- `content`：各证券完整状态——价格时间队列顺序（含每档订单 id 队列）、订单剩余量、冰山当前公开量 `visible` 与补量所需 `display_quantity`、各证券最后序列 `last_sequence`、活动涨跌停区间 `price_limits`（`null` 表示不限；旧格式快照缺少该字段，恢复时从 `config` 静态区间初始化）、已接受事件日志、TWAP/VWAP/POV 计划列表 `plans`（计划参数——VWAP 计划另含 `algorithm` 与 `volume_weights`，POV 计划另含 `algorithm`、`total_quantity`、`participation_bps` 与累计市场成交量 `market_volume`——各次正数释放的原始数量、已释放次数与已释放量、成交量、取消量、成交额、生命周期状态）、引擎保留的未释放派生标识 `reserved_order_ids`、累计成交 `trade_log`、生成后续成交标识所需的 `next_trade_id`、账户集合。
 - `content_digest`：基于规范化内容（连同版本与配置）计算的 SHA-256。
 
 恢复（`restore_replayer(snapshot, config=None)` 或在 `replay_events` 中传 `snapshot=`）先验证版本、配置与摘要，再做结构与内部一致性交叉校验，全部通过后才采纳状态：
