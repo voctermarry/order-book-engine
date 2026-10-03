@@ -57,6 +57,7 @@ import copy
 import hashlib
 import json
 from collections import deque
+from typing import NamedTuple
 
 from . import __version__
 from .engine import (
@@ -1101,6 +1102,73 @@ class _SymbolState:
         self.price_limits: tuple[int, int] | None = None
 
 
+class _Outcome(NamedTuple):
+    """The business result of dispatching one structurally valid event.
+
+    A handler only performs the business action and reports what happened; it
+    never advances ``last_sequence``, never writes either idempotency log and
+    never assembles the response envelope. The single commit/assembly stage
+    then occupies the event id and advances the per-symbol sequence exactly
+    once, echoes the post-event book and diffs the changed levels.
+
+    ``result`` carries the engine/query result string of an accepted event
+    (``None`` for plan START/CANCEL/REPORT responses that omit the field);
+    ``rejection_code`` is set only for a business rejection; ``trades`` holds
+    the trades the action produced (empty for every query and rejection); the
+    optional ``extra`` object is the one response-kind-specific field (a plan
+    summary or one of the analysis/reconciliation objects).
+    """
+
+    accepted: bool
+    result: str | None
+    rejection_code: str | None
+    trades: list[dict[str, object]]
+    extra_key: str | None = None
+    extra_value: object = None
+
+    @staticmethod
+    def accepted_report(
+        result: str,
+        extra_key: str,
+        extra_value: object,
+        trades: list[dict[str, object]] | None = None,
+    ) -> "_Outcome":
+        return _Outcome(True, result, None, trades or [], extra_key, extra_value)
+
+    @staticmethod
+    def rejected(code: str) -> "_Outcome":
+        return _Outcome(False, None, code, [])
+
+
+class _Dispatch(NamedTuple):
+    """Everything the unified dispatch stage knows about one committed event.
+
+    The level snapshots are copied once before the business handler runs, so
+    the single book-diff routine sees exactly the pre-event aggregates for
+    every event kind.
+    """
+
+    event_id: str
+    symbol: str
+    sequence: int
+    content: str
+    event_type: str
+    state: _SymbolState
+    before_bids: dict[int, int]
+    before_asks: dict[int, int]
+
+
+#: Response assembly shapes. ``baseline`` keeps the baseline field order with
+#: ``result``/``rejection_code`` immediately after ``status`` and a real
+#: trade/change list; ``plan`` mirrors the plan-command order (the optional
+#: ``result`` and the ``execution_plan`` object follow the echoed book);
+#: ``report`` covers every replay-only accepted event, whose ``result`` and
+#: single analysis object follow the unchanged-book echo.
+_SHAPE_BASELINE = "baseline"
+_SHAPE_PLAN = "plan"
+_SHAPE_REPORT = "report"
+
+
 class EventReplayer:
     """Stateful, resumable multi-symbol replay session.
 
@@ -1345,158 +1413,200 @@ class EventReplayer:
             )
 
         # ---- committed application ---------------------------------------
-        # From here on the event is dispatched: register a brand new symbol
-        # book and commit id/sequence exactly as the baseline does.
+        # From here on the event is structurally valid and in sequence: a
+        # brand new symbol book is registered, and every event kind flows
+        # through the single capture -> business handler -> deterministic
+        # commit -> response assembly path below.
         if not known_symbol:
             self._symbols[symbol] = state
 
+        before_bids, before_asks = state.engine.level_totals()
+        ctx = _Dispatch(
+            event_id=event_id,
+            symbol=symbol,
+            sequence=sequence,
+            content=content,
+            event_type=event_type,
+            state=state,
+            before_bids=dict(before_bids),
+            before_asks=dict(before_asks),
+        )
+        return self._committed(ctx, payload)
+
+    # -- unified committed dispatch -----------------------------------------
+
+    def _committed(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> dict[str, object]:
+        """Run the business handler and route the result through one commit.
+
+        The two identifier/price guards keep their historical precedence over
+        every business rule, but like every other business outcome they only
+        describe the rejection: event-id occupancy, sequence advancement, the
+        book echo and the change expression happen solely in
+        :meth:`_commit`. The plan-index clash never enters the engine journal;
+        the pre-matching price-limit breach enters it for baseline event types
+        only (plan command ids live solely in the replay log).
+        """
         # A derived child id (``plan_id#slice``) is reserved from plan start;
         # it occupies both the order-id and event-id role of the future child,
         # so no external event — baseline or parent-order command — may reuse
         # it as an event id.
-        if event_id in state.plan_index:
-            # Committed like every baseline business rejection: the well-formed
-            # event occupies its id and the sequence, but nothing else moves.
-            state.last_sequence = sequence
-            state.seen[event_id] = content
-            self._events[event_id] = (symbol, content)
-            bids, asks = state.engine.snapshot()
-            return {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": REJECTED,
-                "rejection_code": DUPLICATE_EVENT_ID,
-                "trades": [],
-                "book_changes": {"bids": [], "asks": []},
-                "bids": bids,
-                "asks": asks,
-            }
+        if ctx.event_id in ctx.state.plan_index:
+            return self._commit(ctx, _Outcome.rejected(DUPLICATE_EVENT_ID))
 
-        # ---- active per-security price limits ---------------------------
-        # Enforced after the envelope, idempotency, sequence and identifier
-        # conflict checks, and strictly before matching or any state change.
-        # The identifier clashes the baseline engine would reach first (a
-        # reused order id, a replace against a missing order, a duplicate plan
-        # or a clashing derived id) keep their rejection-code precedence; a
-        # price breach is only reported when none applies. The interval tested
-        # here is the security's *active* one: the static config interval as
-        # last replaced by any accepted PRICE_LIMIT_UPDATE.
-        price_rejection = self._price_limit_rejection(payload, event_type, state)
+        # Active per-security price limits are enforced after the envelope,
+        # idempotency, sequence and identifier-conflict checks, and strictly
+        # before matching or any state change. The identifier clashes the
+        # baseline engine would reach first (a reused order id, a replace
+        # against a missing order, a duplicate plan or a clashing derived id)
+        # keep their rejection-code precedence; a price breach is only
+        # reported when none applies. The interval tested here is the
+        # security's *active* one: the static config interval as last replaced
+        # by an accepted PRICE_LIMIT_UPDATE.
+        price_rejection = self._price_limit_rejection(
+            payload, ctx.event_type, ctx.state
+        )
         if price_rejection is not None:
             # A committed business rejection: it occupies the event id and
-            # advances the symbol sequence, but performs no matching, leaves
-            # no order or plan behind and spends no trade id. Baseline event
-            # ids also occupy the per-symbol engine journal, exactly as an
+            # advances the symbol sequence, but performs no matching, leaves no
+            # order or plan behind and spends no trade id. Baseline event ids
+            # also occupy the per-symbol engine journal, exactly as an
             # engine-side business rejection would; plan commands live solely
             # in the replay log.
-            state.last_sequence = sequence
-            state.seen[event_id] = content
-            self._events[event_id] = (symbol, content)
-            if event_type not in _PLAN_TYPES:
-                state.engine.occupy_event_id(event_id)
-            bids, asks = state.engine.snapshot()
-            return {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": REJECTED,
-                "rejection_code": price_rejection,
-                "trades": [],
-                "book_changes": {"bids": [], "asks": []},
-                "bids": bids,
-                "asks": asks,
-            }
+            return self._commit(
+                ctx,
+                _Outcome.rejected(price_rejection),
+                occupy_engine=ctx.event_type not in _PLAN_TYPES,
+            )
 
+        shape, outcome = self._run_handler(ctx, payload)
+        return self._commit(ctx, outcome, shape)
+
+    def _run_handler(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> tuple[str, _Outcome]:
+        """Select and run the pure business handler for one event kind."""
+        event_type = ctx.event_type
         if event_type == PRICE_LIMIT_UPDATE:
-            return self._dispatch_price_limit_update(
-                event_id, payload, state, symbol, sequence, content
-            )
-
+            return _SHAPE_REPORT, self._handle_price_limit_update(ctx, payload)
         if event_type == PORTFOLIO_REPORT:
-            return self._dispatch_portfolio_report(
-                event_id, payload, state, symbol, sequence, content
-            )
-
+            return _SHAPE_REPORT, self._handle_portfolio_report(ctx, payload)
         if event_type == PORTFOLIO_STRESS_REPORT:
-            return self._dispatch_portfolio_stress_report(
-                event_id, payload, state, symbol, sequence, content
-            )
-
+            return _SHAPE_REPORT, self._handle_portfolio_stress_report(ctx, payload)
         if event_type == SESSION_RECONCILIATION:
-            return self._dispatch_session_reconciliation(
-                event_id, payload, state, symbol, sequence, content
-            )
-
+            return _SHAPE_REPORT, self._handle_session_reconciliation(ctx, payload)
         if event_type == PLAN_TCA_REPORT:
-            return self._dispatch_plan_tca_report(
-                event_id, payload, state, symbol, sequence, content
-            )
-
+            return _SHAPE_REPORT, self._handle_plan_tca_report(ctx, payload)
         if event_type == BOOK_RECONSTRUCTION_REPORT:
-            return self._dispatch_book_reconstruction_report(
-                event_id, payload, state, symbol, sequence, content
-            )
-
+            return _SHAPE_REPORT, self._handle_book_reconstruction(ctx, payload)
         if event_type == EXECUTION_REPORT:
-            return self._dispatch_execution_report(
-                event_id, payload, state, symbol, sequence, content
-            )
-
+            return _SHAPE_REPORT, self._handle_execution_report(ctx, payload)
         if event_type == IMPACT_REPORT:
-            return self._dispatch_impact_report(
-                event_id, payload, state, symbol, sequence, content
-            )
-
+            return _SHAPE_REPORT, self._handle_impact_report(ctx, payload)
         if event_type in _PLAN_TYPES:
-            out = self._dispatch_plan(
-                event, payload, event_type, state, symbol, sequence, content
-            )
-            return out
+            return _SHAPE_PLAN, self._handle_plan(ctx, payload)
+        return _SHAPE_BASELINE, self._handle_baseline(ctx, payload)
 
-        before_bids, before_asks = state.engine.level_totals()
-        before_bids = dict(before_bids)
-        before_asks = dict(before_asks)
-        _eid, engine_result, reason, trades, _stp, _analysis, _position = (
-            state.engine.handle_object_position(payload)
-        )
+    def _commit(
+        self,
+        ctx: _Dispatch,
+        outcome: _Outcome,
+        shape: str = _SHAPE_BASELINE,
+        *,
+        occupy_engine: bool = False,
+    ) -> dict[str, object]:
+        """Deterministically commit one dispatched event and assemble it.
 
-        # Dispatched: the well-formed event occupies its id however the
-        # business outcome ends, and the symbol's sequence advances exactly as
-        # the input did. This mirrors the baseline's id-occupancy rule.
-        state.last_sequence = sequence
-        state.seen[event_id] = content
-        self._events[event_id] = (symbol, content)
+        This is the only place a dispatched event advances the symbol sequence
+        and writes the per-symbol and global idempotency logs; the engine
+        journal receives the id only when the business action did not already
+        place it there (baseline dispatch occupies it itself). The post-event
+        book is snapshotted here for every kind, and an accepted event carries
+        the level diff while every business rejection echoes unchanged books
+        with empty change lists — matching the historical per-kind responses
+        byte for byte.
+        """
+        state = ctx.state
+        state.last_sequence = ctx.sequence
+        state.seen[ctx.event_id] = ctx.content
+        self._events[ctx.event_id] = (ctx.symbol, ctx.content)
+        if occupy_engine:
+            state.engine.occupy_event_id(ctx.event_id)
 
         bids, asks = state.engine.snapshot()
-        book_changes = self._book_changes(state.engine, before_bids, before_asks)
-        if reason is None:
-            out: dict[str, object] = {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": ACCEPTED,
-                "result": engine_result,
-                "trades": trades,
-                "book_changes": book_changes,
-                "bids": bids,
-                "asks": asks,
-            }
+        if outcome.accepted:
+            book_changes = self._book_changes(
+                state.engine, ctx.before_bids, ctx.before_asks
+            )
         else:
-            out = {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": REJECTED,
-                # Baseline business rejection codes (UNKNOWN_ORDER,
-                # DUPLICATE_ORDER_ID, ...) are preserved verbatim.
-                "rejection_code": reason,
-                "trades": trades,
-                "book_changes": book_changes,
-                "bids": bids,
-                "asks": asks,
-            }
+            book_changes = {"bids": [], "asks": []}
+        return self._assemble(ctx, outcome, shape, bids, asks, book_changes)
+
+    @staticmethod
+    def _assemble(
+        ctx: _Dispatch,
+        outcome: _Outcome,
+        shape: str,
+        bids: list[dict[str, int]],
+        asks: list[dict[str, int]],
+        book_changes: dict[str, list[dict[str, int]]],
+    ) -> dict[str, object]:
+        """Build the response envelope in each kind's historical key order."""
+        out: dict[str, object] = {
+            "event_id": ctx.event_id,
+            "symbol": ctx.symbol,
+            "sequence": ctx.sequence,
+        }
+        if not outcome.accepted:
+            out["status"] = REJECTED
+            out["rejection_code"] = outcome.rejection_code
+            out["trades"] = []
+            out["book_changes"] = {"bids": [], "asks": []}
+            out["bids"] = bids
+            out["asks"] = asks
+            return out
+        out["status"] = ACCEPTED
+        if shape == _SHAPE_PLAN:
+            # START/CANCEL/REPORT and zero-release POV_VOLUME events omit the
+            # engine result field; it is present only for a released slice.
+            if outcome.result is not None:
+                out["result"] = outcome.result
+            out["trades"] = outcome.trades
+            out["book_changes"] = book_changes
+            out["bids"] = bids
+            out["asks"] = asks
+            out["execution_plan"] = outcome.extra_value
+            return out
+        # Baseline events and every replay-only report carry the result string
+        # immediately after the status and their single analysis object (if
+        # any) after the echoed book.
+        out["result"] = outcome.result
+        out["trades"] = outcome.trades
+        out["book_changes"] = book_changes
+        out["bids"] = bids
+        out["asks"] = asks
+        if outcome.extra_key is not None:
+            out[outcome.extra_key] = outcome.extra_value
         return out
+
+    def _handle_baseline(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
+        """Dispatch an ADD/CANCEL/REPLACE through the baseline engine.
+
+        The engine occupies the event id in its own journal as soon as the
+        well-formed event reaches it (a business rejection included), so this
+        handler never asks the commit stage to occupy it.
+        """
+        _eid, engine_result, reason, trades, _stp, _analysis, _position = (
+            ctx.state.engine.handle_object_position(payload)
+        )
+        if reason is not None:
+            # Baseline business rejection codes (UNKNOWN_ORDER,
+            # DUPLICATE_ORDER_ID, ...) are preserved verbatim.
+            return _Outcome(False, None, reason, trades)
+        return _Outcome(True, engine_result, None, trades)
 
     def _price_limit_rejection(
         self,
@@ -1606,28 +1716,19 @@ class EventReplayer:
 
     # -- parent-order plan handling ------------------------------------------
 
-    def _dispatch_plan(
-        self,
-        event: dict[str, object],
-        payload: dict[str, object],
-        event_type: str,
-        state: _SymbolState,
-        symbol: str,
-        sequence: int,
-        content: str,
-    ) -> dict[str, object]:
-        """Dispatch a structurally valid, in-sequence parent-order command.
+    def _handle_plan(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
+        """Apply a structurally valid, in-sequence parent-order command.
 
-        Every branch commits the well-formed event id and advances the symbol
-        sequence, including business rejections: this matches the baseline
-        rule that a valid event occupies its id whatever the business result.
+        The handler only mutates plan/book state and reports the business
+        outcome; the well-formed command occupies its event id and advances the
+        symbol sequence whatever that outcome is, through the shared commit
+        stage. Only a released slice can move the book, and the change set is
+        diffed there with the same level routine the baseline path uses.
         """
-        event_id: str = event["event_id"]
-
-        before_bids, before_asks = state.engine.level_totals()
-        before_bids = dict(before_bids)
-        before_asks = dict(before_asks)
-
+        event_type = ctx.event_type
+        state = ctx.state
         if event_type == TWAP_START:
             result_out = self._twap_start(payload, state)
         elif event_type == VWAP_START:
@@ -1643,18 +1744,30 @@ class EventReplayer:
         else:
             result_out = self._plan_report(payload, state)
 
-        # The structurally valid command occupies its event id and the symbol
-        # sequence whatever its business outcome.
-        state.last_sequence = sequence
-        state.seen[event_id] = content
-        self._events[event_id] = (symbol, content)
-
-        # Only a released slice can move the book; compute the change set with
-        # the same level-diff routine the baseline path uses, so drained
-        # levels and iceberg replenishment are reported identically.
-        book_changes = self._book_changes(state.engine, before_bids, before_asks)
-        return self._plan_response(
-            event_id, symbol, sequence, state, result_out, book_changes
+        status, code, plan, slice_info = result_out
+        if status != ACCEPTED:
+            return _Outcome.rejected(code)
+        if slice_info is None:
+            # START, CANCEL and REPORT never move the book and omit the engine
+            # result field.
+            return _Outcome(
+                True, None, None, [], "execution_plan", plan.summary()
+            )
+        summary = plan.summary(
+            slice_number=slice_info.get("slice_number"),
+            child_order_id=slice_info["child_order_id"],
+            target_weight=slice_info.get("target_weight"),
+            scheduled_quantity=slice_info.get("scheduled_quantity"),
+            release_number=slice_info.get("release_number"),
+            pov_volume=slice_info.get("pov_volume", False),
+        )
+        return _Outcome(
+            True,
+            slice_info["engine_result"],
+            None,
+            slice_info["trades"],
+            "execution_plan",
+            summary,
         )
 
     def _twap_start(
@@ -1936,137 +2049,47 @@ class EventReplayer:
             return REJECTED, UNKNOWN_EXECUTION_PLAN, None, None
         return ACCEPTED, None, plan, None
 
-    @staticmethod
-    def _plan_response(
-        event_id: str,
-        symbol: str,
-        sequence: int,
-        state: _SymbolState,
-        result_out: tuple[str, str | None, ExecutionPlan | None, dict[str, object] | None],
-        book_changes: dict[str, list[dict[str, int]]],
-    ) -> dict[str, object]:
-        """Assemble the plan command result, including book and plan summary."""
-        status, code, plan, slice_info = result_out
-        bids, asks = state.engine.snapshot()
-        if status == ACCEPTED:
-            if slice_info is None:
-                # START, CANCEL and REPORT never move the book.
-                trades: list[dict[str, object]] = []
-                result: str | None = None
-                slice_number = child_order_id = None
-                target_weight = scheduled_quantity = None
-                release_number = None
-                pov_volume = False
-            else:
-                trades = slice_info["trades"]
-                result = slice_info["engine_result"]
-                slice_number = slice_info.get("slice_number")
-                child_order_id = slice_info["child_order_id"]
-                target_weight = slice_info.get("target_weight")
-                scheduled_quantity = slice_info.get("scheduled_quantity")
-                release_number = slice_info.get("release_number")
-                pov_volume = slice_info.get("pov_volume", False)
-            out: dict[str, object] = {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": ACCEPTED,
-                "trades": trades,
-                "book_changes": book_changes,
-                "bids": bids,
-                "asks": asks,
-            }
-            if result is not None:
-                out["result"] = result
-            out["execution_plan"] = plan.summary(
-                slice_number=slice_number,
-                child_order_id=child_order_id,
-                target_weight=target_weight,
-                scheduled_quantity=scheduled_quantity,
-                release_number=release_number,
-                pov_volume=pov_volume,
-            ) if plan is not None else None
-            return out
-        # Business rejection: the book is untouched by the command itself.
-        return {
-            "event_id": event_id,
-            "symbol": symbol,
-            "sequence": sequence,
-            "status": REJECTED,
-            "rejection_code": code,
-            "trades": [],
-            "book_changes": {"bids": [], "asks": []},
-            "bids": bids,
-            "asks": asks,
-        }
-
     # -- intraday price-limit adjustment -------------------------------------
 
-    def _dispatch_price_limit_update(
-        self,
-        event_id: str,
-        payload: dict[str, object],
-        state: _SymbolState,
-        symbol: str,
-        sequence: int,
-        content: str,
-    ) -> dict[str, object]:
+    def _handle_price_limit_update(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
         """Replace the security's active price-limit interval wholesale.
 
         Purely a replay-layer state change: no order, trade, plan or book is
         touched, resting orders outside the new interval keep their queue
-        priority and may still become makers, and no trade id is spent. Like
-        every other structurally valid event the command occupies its event
-        id and advances the symbol sequence; its id lives solely in the
-        replay log, exactly like a parent-order command id. Re-applying the
-        current bounds is a successful update, not a conflict.
+        priority and may still become makers, and no trade id is spent. The
+        command occupies its event id and advances the symbol sequence through
+        the shared commit stage, where its id lives solely in the replay log,
+        exactly like a parent-order command id. Re-applying the current bounds
+        is a successful update, not a conflict.
         """
         lower_price: int = payload["lower_price"]
         upper_price: int = payload["upper_price"]
-        state.price_limits = (lower_price, upper_price)
-        state.last_sequence = sequence
-        state.seen[event_id] = content
-        self._events[event_id] = (symbol, content)
-        bids, asks = state.engine.snapshot()
-        return {
-            "event_id": event_id,
-            "symbol": symbol,
-            "sequence": sequence,
-            "status": ACCEPTED,
-            "result": PRICE_LIMIT_UPDATED,
-            "trades": [],
-            "book_changes": {"bids": [], "asks": []},
-            "bids": bids,
-            "asks": asks,
-            "active_price_limits": {
-                "lower_price": lower_price,
-                "upper_price": upper_price,
-            },
-        }
+        ctx.state.price_limits = (lower_price, upper_price)
+        return _Outcome.accepted_report(
+            PRICE_LIMIT_UPDATED,
+            "active_price_limits",
+            {"lower_price": lower_price, "upper_price": upper_price},
+        )
 
     # -- per-order execution report ------------------------------------------
 
-    def _dispatch_execution_report(
-        self,
-        event_id: str,
-        payload: dict[str, object],
-        state: _SymbolState,
-        symbol: str,
-        sequence: int,
-        content: str,
-    ) -> dict[str, object]:
+    def _handle_execution_report(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
         """Answer a read-only cumulative execution query for one order.
 
         The query only reads this security's order records and trade journal:
-        it never matches, never replenishes an iceberg slice, never releases
-        a plan slice and never moves an order, a queue, the trade log, an
-        account set, a plan or the next trade id. Every accepted order id of
-        this security is queryable — resting, filled or cancelled, including
+        it never matches, never replenishes an iceberg slice, never releases a
+        plan slice and never moves an order, a queue, the trade log, an account
+        set, a plan or the next trade id. Every accepted order id of this
+        security is queryable — resting, filled or cancelled, including
         iceberg orders, orders replaced under the same id and released
         TWAP/VWAP/POV child orders; parent plan ids and not-yet-released
         derived ids are not orders, and an id accepted on another security
-        never resolves here. Like every other structurally valid event the
-        query occupies its event id and advances the symbol sequence,
+        never resolves here. The structurally valid query occupies its event
+        id and advances the symbol sequence through the shared commit stage,
         including the ``UNKNOWN_ORDER`` business rejection; its id lives
         solely in the replay log, exactly like a PORTFOLIO_REPORT id. The
         analysis itself is produced by the baseline engine's own report
@@ -2074,49 +2097,18 @@ class EventReplayer:
         exactly.
         """
         _eid, result, reason, _trades, _stp, analysis = (
-            state.engine._execution_report(event_id, payload)
+            ctx.state.engine._execution_report(ctx.event_id, payload)
         )
-        state.last_sequence = sequence
-        state.seen[event_id] = content
-        self._events[event_id] = (symbol, content)
-        bids, asks = state.engine.snapshot()
         if reason is not None:
             # Business rejection (UNKNOWN_ORDER): the book is untouched.
-            return {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": REJECTED,
-                "rejection_code": reason,
-                "trades": [],
-                "book_changes": {"bids": [], "asks": []},
-                "bids": bids,
-                "asks": asks,
-            }
-        return {
-            "event_id": event_id,
-            "symbol": symbol,
-            "sequence": sequence,
-            "status": ACCEPTED,
-            "result": result,
-            "trades": [],
-            "book_changes": {"bids": [], "asks": []},
-            "bids": bids,
-            "asks": asks,
-            "execution_analysis": analysis,
-        }
+            return _Outcome.rejected(reason)
+        return _Outcome.accepted_report(result, "execution_analysis", analysis)
 
     # -- per-symbol book-impact what-if report -------------------------------
 
-    def _dispatch_impact_report(
-        self,
-        event_id: str,
-        payload: dict[str, object],
-        state: _SymbolState,
-        symbol: str,
-        sequence: int,
-        content: str,
-    ) -> dict[str, object]:
+    def _handle_impact_report(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
         """Answer a read-only what-if market-order impact query for one book.
 
         The analysis is produced by the baseline engine's own impact routine,
@@ -2127,30 +2119,15 @@ class EventReplayer:
         never mutates anything. The simulated order is anonymous, so
         self-trade prevention never applies, and the active price-limit
         interval never blocks it. A first-seen symbol answers against its
-        empty book successfully. Like every other structurally valid event
-        the query occupies its event id and advances the symbol sequence;
-        its id lives solely in the replay log, exactly like an
+        empty book successfully. The structurally valid query occupies its
+        event id and advances the symbol sequence through the shared commit
+        stage; its id lives solely in the replay log, exactly like an
         EXECUTION_REPORT id, and never enters the engine journal.
         """
-        _eid, result, _reason, _trades, analysis = state.engine._impact_report(
-            event_id, payload
+        _eid, result, _reason, _trades, analysis = ctx.state.engine._impact_report(
+            ctx.event_id, payload
         )
-        state.last_sequence = sequence
-        state.seen[event_id] = content
-        self._events[event_id] = (symbol, content)
-        bids, asks = state.engine.snapshot()
-        return {
-            "event_id": event_id,
-            "symbol": symbol,
-            "sequence": sequence,
-            "status": ACCEPTED,
-            "result": result,
-            "trades": [],
-            "book_changes": {"bids": [], "asks": []},
-            "bids": bids,
-            "asks": asks,
-            "impact_analysis": analysis,
-        }
+        return _Outcome.accepted_report(result, "impact_analysis", analysis)
 
     # -- cross-security portfolio report -------------------------------------
 
@@ -2175,53 +2152,30 @@ class EventReplayer:
                     break
         return symbols
 
-    def _dispatch_portfolio_report(
-        self,
-        event_id: str,
-        payload: dict[str, object],
-        state: _SymbolState,
-        symbol: str,
-        sequence: int,
-        content: str,
-    ) -> dict[str, object]:
+    def _handle_portfolio_report(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
         """Answer a read-only cross-security portfolio query.
 
         The query only reads trades produced by earlier accepted events: it
         never matches, never releases a plan slice and never moves a book, a
-        trade id, a plan or an account set. Like every other structurally
-        valid event it occupies its event id and advances the envelope
-        symbol's sequence, including the ``UNKNOWN_ACCOUNT`` and
-        ``MARK_PRICE_MISMATCH`` business rejections. Its id lives solely in
+        trade id, a plan or an account set. The structurally valid query
+        occupies its event id and advances the envelope symbol's sequence
+        through the shared commit stage, including the ``UNKNOWN_ACCOUNT`` and
+        ``MARK_PRICE_MISMATCH`` business rejections; its id lives solely in
         the replay log, exactly like a parent-order command id.
         """
         account_id: str = payload["account_id"]
         mark_prices: dict[str, object] = payload["mark_prices"]
 
-        def reject(code: str) -> dict[str, object]:
-            state.last_sequence = sequence
-            state.seen[event_id] = content
-            self._events[event_id] = (symbol, content)
-            bids, asks = state.engine.snapshot()
-            return {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": REJECTED,
-                "rejection_code": code,
-                "trades": [],
-                "book_changes": {"bids": [], "asks": []},
-                "bids": bids,
-                "asks": asks,
-            }
-
         known_symbols = self._account_symbols(account_id)
         if not known_symbols:
-            return reject(UNKNOWN_ACCOUNT)
+            return _Outcome.rejected(UNKNOWN_ACCOUNT)
         # The mark map must name exactly the securities the account ever
         # appeared on: one missing or one extra is a business rejection, not a
         # schema error, and still consumes the id and the sequence.
         if set(mark_prices) != known_symbols:
-            return reject(MARK_PRICE_MISMATCH)
+            return _Outcome.rejected(MARK_PRICE_MISMATCH)
 
         positions: list[dict[str, object]] = []
         total_buy_notional = 0
@@ -2284,83 +2238,48 @@ class EventReplayer:
                 "mark_to_market_pnl": total_pnl,
             },
         }
-
-        state.last_sequence = sequence
-        state.seen[event_id] = content
-        self._events[event_id] = (symbol, content)
-        bids, asks = state.engine.snapshot()
-        return {
-            "event_id": event_id,
-            "symbol": symbol,
-            "sequence": sequence,
-            "status": ACCEPTED,
-            "result": REPORTED,
-            "trades": [],
-            "book_changes": {"bids": [], "asks": []},
-            "bids": bids,
-            "asks": asks,
-            "portfolio_analysis": analysis,
-        }
+        return _Outcome.accepted_report(
+            REPORTED, "portfolio_analysis", analysis
+        )
 
     # -- cross-security portfolio stress report ------------------------------
 
-    def _dispatch_portfolio_stress_report(
-        self,
-        event_id: str,
-        payload: dict[str, object],
-        state: _SymbolState,
-        symbol: str,
-        sequence: int,
-        content: str,
-    ) -> dict[str, object]:
+    def _handle_portfolio_stress_report(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
         """Answer a read-only cross-security portfolio stress query.
 
         The query re-prices one account's existing positions under each
         caller-supplied scenario: it only reads trades produced by earlier
         accepted events, so it never matches, never releases a plan slice and
         never moves a book, a plan, an account set, the trade log, a trade id
-        or a price-limit interval. Like every other structurally valid event
-        it occupies its event id and advances the envelope symbol's sequence,
-        including the ``UNKNOWN_ACCOUNT`` and ``MARK_PRICE_MISMATCH`` business
-        rejections. Its id lives solely in the replay log, exactly like a
-        PORTFOLIO_REPORT id. Account attribution follows the portfolio
-        report's rule exactly: maker, taker, REPLACE-inherited, iceberg
-        replenishment and released TWAP/VWAP/POV child-order fills all count
-        under their order's account. Every figure is a plain integer.
+        or a price-limit interval. The structurally valid query occupies its
+        event id and advances the envelope symbol's sequence through the
+        shared commit stage, including the ``UNKNOWN_ACCOUNT`` and
+        ``MARK_PRICE_MISMATCH`` business rejections; its id lives solely in
+        the replay log, exactly like a PORTFOLIO_REPORT id. Account
+        attribution follows the portfolio report's rule exactly: maker,
+        taker, REPLACE-inherited, iceberg replenishment and released
+        TWAP/VWAP/POV child-order fills all count under their order's account.
+        Every figure is a plain integer.
         """
         account_id: str = payload["account_id"]
         mark_prices: dict[str, int] = payload["mark_prices"]
         scenarios: list[dict[str, object]] = payload["scenarios"]
 
-        def reject(code: str) -> dict[str, object]:
-            state.last_sequence = sequence
-            state.seen[event_id] = content
-            self._events[event_id] = (symbol, content)
-            bids, asks = state.engine.snapshot()
-            return {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": REJECTED,
-                "rejection_code": code,
-                "trades": [],
-                "book_changes": {"bids": [], "asks": []},
-                "bids": bids,
-                "asks": asks,
-            }
-
         known_symbols = self._account_symbols(account_id)
         if not known_symbols:
-            return reject(UNKNOWN_ACCOUNT)
+            return _Outcome.rejected(UNKNOWN_ACCOUNT)
         # Every price object — the baseline marks and each scenario's prices —
         # must name exactly the securities the account ever appeared on: one
         # missing or one extra is a business rejection, not a schema error,
-        # and still consumes the id and the sequence.
+        # and still consumes the id and the sequence. The first mismatching
+        # scenario in input order decides the rejection, as before.
         if set(mark_prices) != known_symbols:
-            return reject(MARK_PRICE_MISMATCH)
+            return _Outcome.rejected(MARK_PRICE_MISMATCH)
         for scenario in scenarios:
             if set(scenario["prices"]) != known_symbols:
-                return reject(MARK_PRICE_MISMATCH)
+                return _Outcome.rejected(MARK_PRICE_MISMATCH)
 
         ordered_symbols = sorted(known_symbols)
         net_positions: dict[str, int] = {}
@@ -2425,23 +2344,9 @@ class EventReplayer:
             "scenarios": scenario_reports,
             "worst_scenario": worst_scenario,
         }
-
-        state.last_sequence = sequence
-        state.seen[event_id] = content
-        self._events[event_id] = (symbol, content)
-        bids, asks = state.engine.snapshot()
-        return {
-            "event_id": event_id,
-            "symbol": symbol,
-            "sequence": sequence,
-            "status": ACCEPTED,
-            "result": REPORTED,
-            "trades": [],
-            "book_changes": {"bids": [], "asks": []},
-            "bids": bids,
-            "asks": asks,
-            "portfolio_stress_analysis": analysis,
-        }
+        return _Outcome.accepted_report(
+            REPORTED, "portfolio_stress_analysis", analysis
+        )
 
     # -- whole-session reconciliation ----------------------------------------
 
@@ -2537,26 +2442,21 @@ class EventReplayer:
             )
         return breaks
 
-    def _dispatch_session_reconciliation(
-        self,
-        event_id: str,
-        payload: dict[str, object],
-        state: _SymbolState,
-        symbol: str,
-        sequence: int,
-        content: str,
-    ) -> dict[str, object]:
+    def _handle_session_reconciliation(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
         """Answer a read-only whole-session reconciliation query.
 
         The query compares the caller's external trade and account records
         against the full history of every security in the session at once: it
         never matches, never releases a plan slice and never moves an order, a
         plan, an account set, a book, the trade journal, a trade id counter or
-        a price-limit interval. Like every other structurally valid event it
-        occupies its event id and advances the envelope symbol's sequence; its
-        id lives solely in the replay log, exactly like a PORTFOLIO_REPORT id.
-        A perfect match reports ``RECONCILED``; any difference reports
-        ``BREAKS_FOUND`` with the two sorted break arrays.
+        a price-limit interval. The structurally valid query occupies its
+        event id and advances the envelope symbol's sequence through the
+        shared commit stage; its id lives solely in the replay log, exactly
+        like a PORTFOLIO_REPORT id. A perfect match reports ``RECONCILED``;
+        any difference reports ``BREAKS_FOUND`` with the two sorted break
+        arrays.
         """
         expected_trades: dict[tuple[str, int], dict[str, object]] = {}
         for item in payload["expected_trades"]:
@@ -2583,25 +2483,11 @@ class EventReplayer:
         account_breaks = self._session_breaks(expected_accounts, actual_accounts)
         result = RECONCILED if not trade_breaks and not account_breaks else BREAKS_FOUND
 
-        state.last_sequence = sequence
-        state.seen[event_id] = content
-        self._events[event_id] = (symbol, content)
-        bids, asks = state.engine.snapshot()
-        return {
-            "event_id": event_id,
-            "symbol": symbol,
-            "sequence": sequence,
-            "status": ACCEPTED,
-            "result": result,
-            "trades": [],
-            "book_changes": {"bids": [], "asks": []},
-            "bids": bids,
-            "asks": asks,
-            "reconciliation": {
-                "trade_breaks": trade_breaks,
-                "account_breaks": account_breaks,
-            },
-        }
+        return _Outcome.accepted_report(
+            result,
+            "reconciliation",
+            {"trade_breaks": trade_breaks, "account_breaks": account_breaks},
+        )
 
     # -- per-plan implementation-shortfall report ----------------------------
 
@@ -2660,15 +2546,9 @@ class EventReplayer:
             ),
         }
 
-    def _dispatch_plan_tca_report(
-        self,
-        event_id: str,
-        payload: dict[str, object],
-        state: _SymbolState,
-        symbol: str,
-        sequence: int,
-        content: str,
-    ) -> dict[str, object]:
+    def _handle_plan_tca_report(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
         """Answer a read-only implementation-shortfall query for one plan.
 
         The query only reads this security's plan state: it never matches,
@@ -2678,43 +2558,21 @@ class EventReplayer:
         accepted under the envelope symbol is queryable — ACTIVE, COMPLETED
         and CANCELLED alike; a plan id that is unknown under this symbol,
         including one that only exists on another security, is an
-        ``UNKNOWN_EXECUTION_PLAN`` business rejection. Like every other
-        structurally valid event the query occupies its event id and advances
-        the symbol sequence, including that rejection; its id lives solely in
-        the replay log, exactly like a SESSION_RECONCILIATION id.
+        ``UNKNOWN_EXECUTION_PLAN`` business rejection. The structurally valid
+        query occupies its event id and advances the symbol sequence through
+        the shared commit stage, including that rejection; its id lives
+        solely in the replay log, exactly like a SESSION_RECONCILIATION id.
         """
         plan_id: str = payload["plan_id"]
         mark_price: int = payload["mark_price"]
-        plan = state.plans.get(plan_id)
-
-        state.last_sequence = sequence
-        state.seen[event_id] = content
-        self._events[event_id] = (symbol, content)
-        bids, asks = state.engine.snapshot()
+        plan = ctx.state.plans.get(plan_id)
         if plan is None:
-            return {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": REJECTED,
-                "rejection_code": UNKNOWN_EXECUTION_PLAN,
-                "trades": [],
-                "book_changes": {"bids": [], "asks": []},
-                "bids": bids,
-                "asks": asks,
-            }
-        return {
-            "event_id": event_id,
-            "symbol": symbol,
-            "sequence": sequence,
-            "status": ACCEPTED,
-            "result": REPORTED,
-            "trades": [],
-            "book_changes": {"bids": [], "asks": []},
-            "bids": bids,
-            "asks": asks,
-            "plan_tca_analysis": self._plan_tca_analysis(plan, mark_price),
-        }
+            return _Outcome.rejected(UNKNOWN_EXECUTION_PLAN)
+        return _Outcome.accepted_report(
+            REPORTED,
+            "plan_tca_analysis",
+            self._plan_tca_analysis(plan, mark_price),
+        )
 
     # -- historical book reconstruction report -------------------------------
 
@@ -2784,15 +2642,9 @@ class EventReplayer:
         bid_queues, ask_queues = scratch_state.engine.book_queue_view()
         return bid_queues, ask_queues, scratch_state.price_limits
 
-    def _dispatch_book_reconstruction_report(
-        self,
-        event_id: str,
-        payload: dict[str, object],
-        state: _SymbolState,
-        symbol: str,
-        sequence: int,
-        content: str,
-    ) -> dict[str, object]:
+    def _handle_book_reconstruction(
+        self, ctx: _Dispatch, payload: dict[str, object]
+    ) -> _Outcome:
         """Answer a read-only historical book-queue query for one security.
 
         The query rebuilds the envelope security's resting queues as of
@@ -2806,34 +2658,19 @@ class EventReplayer:
         throwaway session and never matches, never releases a plan slice and
         never moves an order, a queue, the trade log, an account set, a
         plan, the active interval or the next trade id of the live session.
-        Like every other structurally valid event the query occupies its
-        event id and advances the symbol sequence, including the business
-        rejection; its id lives solely in the replay log, exactly like a
-        PLAN_TCA_REPORT id.
+        This handler runs before the shared commit, so ``last_sequence`` and
+        the committed log it reads describe exactly the events before the
+        query; the well-formed query then occupies its event id and advances
+        the symbol sequence once, on either outcome, with its id solely in
+        the replay log like a PLAN_TCA_REPORT id.
         """
         target_sequence: int = payload["target_sequence"]
+        state = ctx.state
 
-        def commit() -> None:
-            state.last_sequence = sequence
-            state.seen[event_id] = content
-            self._events[event_id] = (symbol, content)
-
-        bids, asks = state.engine.snapshot()
         if target_sequence > state.last_sequence:
             # A committed business rejection: id and envelope sequence move,
             # the book and every other trading state do not.
-            commit()
-            return {
-                "event_id": event_id,
-                "symbol": symbol,
-                "sequence": sequence,
-                "status": REJECTED,
-                "rejection_code": TARGET_SEQUENCE_NOT_FOUND,
-                "trades": [],
-                "book_changes": {"bids": [], "asks": []},
-                "bids": bids,
-                "asks": asks,
-            }
+            return _Outcome.rejected(TARGET_SEQUENCE_NOT_FOUND)
 
         if target_sequence == 0:
             # The book before the first event is always empty; the active
@@ -2841,31 +2678,23 @@ class EventReplayer:
             # configuration, whether or not the security has traded yet.
             bid_queues: list[dict[str, object]] = []
             ask_queues: list[dict[str, object]] = []
-            target_limits = self.price_limits.get(symbol)
+            target_limits = self.price_limits.get(ctx.symbol)
         else:
             bid_queues, ask_queues, target_limits = self._reconstruct_book(
-                symbol, target_sequence
+                ctx.symbol, target_sequence
             )
 
-        commit()
-        return {
-            "event_id": event_id,
-            "symbol": symbol,
-            "sequence": sequence,
-            "status": ACCEPTED,
-            "result": REPORTED,
-            "trades": [],
-            "book_changes": {"bids": [], "asks": []},
-            "bids": bids,
-            "asks": asks,
-            "book_reconstruction": {
-                "symbol": symbol,
+        return _Outcome.accepted_report(
+            REPORTED,
+            "book_reconstruction",
+            {
+                "symbol": ctx.symbol,
                 "target_sequence": target_sequence,
                 "active_price_limits": self._price_limits_view(target_limits),
                 "bid_queues": bid_queues,
                 "ask_queues": ask_queues,
             },
-        }
+        )
 
 
 # ---------------------------------------------------------------------------
