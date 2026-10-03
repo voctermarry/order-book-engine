@@ -7,7 +7,7 @@ import json
 
 from order_book_engine import replay as replay_cli
 from order_book_engine.engine import Engine
-from order_book_engine.event_replay import INVALID_EVENT, replay_events
+from order_book_engine.event_replay import replay_events
 
 
 def add(event_id, order_id, side, order_type, quantity, price=None, **extra):
@@ -438,11 +438,11 @@ def test_cli_serializes_impact_analysis_between_result_and_trades():
 
 
 # --------------------------------------------------------------------------
-# The events (multi-symbol replay) entry point does not know the query
+# The events (multi-symbol replay) entry point accepts the query too
 # --------------------------------------------------------------------------
 
 
-def test_events_entry_rejects_impact_report_without_consuming_sequence():
+def test_events_entry_reports_impact_and_consumes_sequence():
     events = [
         {
             "event_id": "e1", "symbol": "AAA", "sequence": 1,
@@ -458,17 +458,15 @@ def test_events_entry_rejects_impact_report_without_consuming_sequence():
     out = replay_events(events)
     results = out["results"]
     assert results[0]["status"] == "ACCEPTED"
-    assert (results[1]["status"], results[1]["rejection_code"]) == (
-        "REJECTED", INVALID_EVENT
+    assert (results[1]["status"], results[1]["result"]) == (
+        "ACCEPTED", "REPORTED"
     )
-    # A structural rejection consumed neither the id nor the sequence, and no
-    # impact analysis leaked into the events response.
-    assert "impact_analysis" not in results[1]
+    assert results[1]["impact_analysis"]["executable_quantity"] == 1
     follow_up = replay_events(
         events
         + [
             {
-                "event_id": "e3", "symbol": "AAA", "sequence": 2,
+                "event_id": "e3", "symbol": "AAA", "sequence": 3,
                 "type": "CANCEL", "order_id": "s1",
             }
         ],
