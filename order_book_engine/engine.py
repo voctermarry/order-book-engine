@@ -1059,6 +1059,26 @@ class Engine:
         """
         return account_id in self._accounts
 
+    def known_accounts(self) -> list[str]:
+        """Every account an accepted ADD on this security ever named.
+
+        The set is independent of later order outcomes: an account whose
+        orders were cancelled or never traded is still known. Used by the
+        multi-symbol replay layer's whole-session reconciliation, which also
+        reports accounts with zero trades.
+        """
+        return list(self._accounts)
+
+    def trade_history(self) -> list[dict[str, object]]:
+        """Every trade ever executed on this security, in trade_id order.
+
+        Each entry carries the internal ``event_id`` tag in addition to the
+        public trade fields; the replay-layer reconciliation projects the
+        public fields out when comparing against external records. The
+        returned list is a deep copy, so callers can never mutate the journal.
+        """
+        return copy.deepcopy(self._trade_log)
+
     def account_aggregates(
         self, account_id: str
     ) -> tuple[int, int, int, int]:

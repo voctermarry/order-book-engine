@@ -13,7 +13,9 @@ matching rules, priorities, rejection semantics or trade record shapes:
   VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT), resumable POV parent
   orders (POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT), the read-only
   per-order EXECUTION_REPORT query, the read-only cross-security
-  PORTFOLIO_REPORT query and the intraday PRICE_LIMIT_UPDATE
+  PORTFOLIO_REPORT query, the read-only whole-session
+  SESSION_RECONCILIATION query (which reconciles every security's
+  trades and account books at once) and the intraday PRICE_LIMIT_UPDATE
   adjustment, which replaces one security's active price-limit interval
   (seeded from the static ``price_limits`` configuration) for all
   subsequently submitted limit prices; plans never read a wall clock and
@@ -49,15 +51,20 @@ from collections import deque
 from . import __version__
 from .engine import (
     ADD,
+    BREAKS_FOUND,
     BUY,
     CANCEL,
     DUPLICATE_EVENT_ID,
     DUPLICATE_ORDER_ID,
     EXECUTION_REPORT,
+    FIELD_MISMATCH,
     ICEBERG,
     IOC,
     LIMIT,
     MARKET,
+    MISSING_ACTUAL,
+    MISSING_EXPECTED,
+    RECONCILED,
     REPLACE,
     REPORTED,
     SELL,
@@ -103,6 +110,12 @@ PRICE_LIMIT_UPDATED = "PRICE_LIMIT_UPDATED"
 PORTFOLIO_REPORT = "PORTFOLIO_REPORT"
 MARK_PRICE_MISMATCH = "MARK_PRICE_MISMATCH"
 
+# Read-only whole-session reconciliation event. Unlike the baseline
+# single-security DAY_END_RECONCILIATION (which stays exclusive to the JSON
+# Lines entry point), this query reconciles every security of the session at
+# once; external records name their security explicitly.
+SESSION_RECONCILIATION = "SESSION_RECONCILIATION"
+
 # TWAP event types.
 TWAP_START = "TWAP_START"
 TWAP_SLICE = "TWAP_SLICE"
@@ -143,14 +156,15 @@ CONFIG_MISMATCH = "CONFIG_MISMATCH"
 #: read-only reports only the per-order EXECUTION_REPORT query joins them
 #: here (ACCOUNT_REPORT, DAY_END_RECONCILIATION and IMPACT_REPORT stay
 #: exclusive to the JSON Lines entry point), while the cross-security
-#: PORTFOLIO_REPORT query and the intraday PRICE_LIMIT_UPDATE adjustment are
-#: exclusive to this layer.
+#: PORTFOLIO_REPORT query, the whole-session SESSION_RECONCILIATION query and
+#: the intraday PRICE_LIMIT_UPDATE adjustment are exclusive to this layer.
 SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
      TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
      VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
      POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT,
-     EXECUTION_REPORT, PORTFOLIO_REPORT, PRICE_LIMIT_UPDATE}
+     EXECUTION_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
+     PRICE_LIMIT_UPDATE}
 )
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
@@ -160,6 +174,15 @@ _BASELINE_KEYS = frozenset(
 )
 _PORTFOLIO_REPORT_KEYS = frozenset(
     {"event_id", "type", "account_id", "mark_prices"}
+)
+_SESSION_RECONCILIATION_KEYS = frozenset(
+    {"event_id", "type", "expected_trades", "expected_accounts"}
+)
+_SESSION_EXPECTED_TRADE_KEYS = frozenset(
+    {"symbol", "trade_id", "maker_order_id", "taker_order_id", "price", "quantity"}
+)
+_SESSION_EXPECTED_ACCOUNT_KEYS = frozenset(
+    {"symbol", "account_id", "net_position", "cash_balance"}
 )
 _EXECUTION_REPORT_KEYS = frozenset(
     {"event_id", "type", "order_id", "benchmark_price"}
@@ -202,12 +225,13 @@ _POV_TYPES = frozenset({POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT})
 #: Every parent-order command type, across algorithms.
 _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES | _POV_TYPES
 #: Event types whose ids live solely in the replay log: parent-order commands
-#: never touch the engine journal, the per-order execution query and the
-#: cross-security portfolio query are read-only and matched by no engine, and
-#: a price-limit adjustment only rewrites replay-layer state. Baseline
-#: ADD/CANCEL/REPLACE ids occupy the per-symbol engine journal instead.
+#: never touch the engine journal, the per-order execution query, the
+#: cross-security portfolio query and the whole-session reconciliation are
+#: read-only and matched by no engine, and a price-limit adjustment only
+#: rewrites replay-layer state. Baseline ADD/CANCEL/REPLACE ids occupy the
+#: per-symbol engine journal instead.
 _REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset(
-    {EXECUTION_REPORT, PORTFOLIO_REPORT, PRICE_LIMIT_UPDATE}
+    {EXECUTION_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION, PRICE_LIMIT_UPDATE}
 )
 
 
@@ -425,6 +449,69 @@ def _portfolio_report_schema_error(payload: dict[str, object]) -> str | None:
         if not _is_non_empty_str(symbol):
             return INVALID_EVENT
         if not _is_positive_int(mark_price):
+            return INVALID_EVENT
+    return None
+
+
+def _session_reconciliation_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a SESSION_RECONCILIATION query payload.
+
+    The query carries exactly ``event_id``, ``type``, ``expected_trades`` and
+    ``expected_accounts``; both records are arrays. A trade item holds exactly
+    ``symbol`` and ``trade_id`` (its composite key), ``maker_order_id`` and
+    ``taker_order_id`` (non-empty strings) and positive-integer ``price`` and
+    ``quantity``; an account item holds exactly ``symbol`` and ``account_id``
+    (its composite key) and integer ``net_position`` and ``cash_balance``.
+    Symbols are non-empty strings, trade ids are positive integers (booleans
+    do not count as integers anywhere), and the composite keys must be unique
+    within their array. Any field problem — missing or extra fields, empty or
+    duplicate identifiers, a non-array or non-object member, a non-positive
+    trade value, a boolean masquerading as an integer — is an
+    ``INVALID_EVENT`` and consumes neither the event id nor the sequence.
+    """
+    if set(payload) != _SESSION_RECONCILIATION_KEYS:
+        return INVALID_EVENT
+    expected_trades = payload.get("expected_trades")
+    expected_accounts = payload.get("expected_accounts")
+    if not isinstance(expected_trades, list) or not isinstance(expected_accounts, list):
+        return INVALID_EVENT
+    seen_trade_keys: set[tuple[str, int]] = set()
+    for item in expected_trades:
+        if not isinstance(item, dict) or set(item) != _SESSION_EXPECTED_TRADE_KEYS:
+            return INVALID_EVENT
+        symbol = item.get("symbol")
+        trade_id = item.get("trade_id")
+        if not _is_non_empty_str(symbol):
+            return INVALID_EVENT
+        if not _is_positive_int(trade_id):
+            return INVALID_EVENT
+        key = (symbol, trade_id)
+        if key in seen_trade_keys:
+            return INVALID_EVENT
+        seen_trade_keys.add(key)
+        if not _is_non_empty_str(item.get("maker_order_id")):
+            return INVALID_EVENT
+        if not _is_non_empty_str(item.get("taker_order_id")):
+            return INVALID_EVENT
+        if not _is_positive_int(item.get("price")):
+            return INVALID_EVENT
+        if not _is_positive_int(item.get("quantity")):
+            return INVALID_EVENT
+    seen_account_keys: set[tuple[str, str]] = set()
+    for item in expected_accounts:
+        if not isinstance(item, dict) or set(item) != _SESSION_EXPECTED_ACCOUNT_KEYS:
+            return INVALID_EVENT
+        symbol = item.get("symbol")
+        account_id = item.get("account_id")
+        if not _is_non_empty_str(symbol) or not _is_non_empty_str(account_id):
+            return INVALID_EVENT
+        key = (symbol, account_id)
+        if key in seen_account_keys:
+            return INVALID_EVENT
+        seen_account_keys.add(key)
+        if not _is_int(item.get("net_position")):
+            return INVALID_EVENT
+        if not _is_int(item.get("cash_balance")):
             return INVALID_EVENT
     return None
 
@@ -1004,6 +1091,8 @@ class EventReplayer:
             schema_error = _pov_schema_error(payload)
         elif event_type == PORTFOLIO_REPORT:
             schema_error = _portfolio_report_schema_error(payload)
+        elif event_type == SESSION_RECONCILIATION:
+            schema_error = _session_reconciliation_schema_error(payload)
         elif event_type == EXECUTION_REPORT:
             schema_error = _execution_report_schema_error(payload)
         elif event_type == PRICE_LIMIT_UPDATE:
@@ -1131,6 +1220,11 @@ class EventReplayer:
 
         if event_type == PORTFOLIO_REPORT:
             return self._dispatch_portfolio_report(
+                event_id, payload, state, symbol, sequence, content
+            )
+
+        if event_type == SESSION_RECONCILIATION:
+            return self._dispatch_session_reconciliation(
                 event_id, payload, state, symbol, sequence, content
             )
 
@@ -1279,6 +1373,8 @@ class EventReplayer:
             return _TWAP_PLAN_REF_KEYS
         if inline_type == PORTFOLIO_REPORT:
             return _PORTFOLIO_REPORT_KEYS
+        if inline_type == SESSION_RECONCILIATION:
+            return _SESSION_RECONCILIATION_KEYS
         if inline_type == EXECUTION_REPORT:
             return _EXECUTION_REPORT_KEYS
         if inline_type == PRICE_LIMIT_UPDATE:
@@ -1935,6 +2031,166 @@ class EventReplayer:
             "bids": bids,
             "asks": asks,
             "portfolio_analysis": analysis,
+        }
+
+    # -- whole-session reconciliation ----------------------------------------
+
+    def _actual_session_trades(
+        self,
+    ) -> dict[tuple[str, int], dict[str, object]]:
+        """Every historical trade of every security, keyed by (symbol, id).
+
+        Trade ids are per symbol, so the composite key is unique across the
+        session. The public record shape mirrors the external trade items:
+        the internal ``event_id`` tag the engine journal carries is not part
+        of it. Securities are visited in sorted order; within one security the
+        journal already runs in trade_id order.
+        """
+        actual: dict[tuple[str, int], dict[str, object]] = {}
+        for sym in sorted(self._symbols):
+            for trade in self._symbols[sym].engine.trade_history():
+                key = (sym, trade["trade_id"])
+                actual[key] = {
+                    "symbol": sym,
+                    "trade_id": trade["trade_id"],
+                    "maker_order_id": trade["maker_order_id"],
+                    "taker_order_id": trade["taker_order_id"],
+                    "price": trade["price"],
+                    "quantity": trade["quantity"],
+                }
+        return actual
+
+    def _actual_session_accounts(
+        self,
+    ) -> dict[tuple[str, str], dict[str, object]]:
+        """The actual book of every account on every security.
+
+        An account is known on a security once either an accepted ADD carried
+        it or an accepted TWAP/VWAP/POV plan carried it, including accounts
+        whose orders or plans never traded (they reconcile at zero) — the same
+        knownness rule the cross-security portfolio query uses. Positions and
+        cash come from the engine's own per-account journal aggregation
+        (replacements keep the account and iceberg slices keep the maker id):
+        net position is bought quantity minus sold quantity, cash is sell
+        notional minus buy notional.
+        """
+        actual: dict[tuple[str, str], dict[str, object]] = {}
+        for sym in sorted(self._symbols):
+            symbol_state = self._symbols[sym]
+            account_ids: set[str] = set(symbol_state.engine.known_accounts())
+            for plan in symbol_state.plans.values():
+                if plan.account_id is not None:
+                    account_ids.add(plan.account_id)
+            for account_id in sorted(account_ids):
+                buy_quantity, sell_quantity, buy_notional, sell_notional = (
+                    symbol_state.engine.account_aggregates(account_id)
+                )
+                actual[(sym, account_id)] = {
+                    "symbol": sym,
+                    "account_id": account_id,
+                    "net_position": buy_quantity - sell_quantity,
+                    "cash_balance": sell_notional - buy_notional,
+                }
+        return actual
+
+    @staticmethod
+    def _session_breaks(
+        expected: dict[tuple[object, ...], dict[str, object]],
+        actual: dict[tuple[object, ...], dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Full outer comparison of composite-keyed session record sets.
+
+        Breaks are emitted in ascending composite-key order, so trade breaks
+        sort by (symbol, trade_id) and account breaks by (symbol,
+        account_id); the identifier is the key itself and the missing side is
+        reported as ``None``.
+        """
+        breaks: list[dict[str, object]] = []
+        for identifier_tuple in sorted(expected.keys() | actual.keys()):
+            exp = expected.get(identifier_tuple)
+            act = actual.get(identifier_tuple)
+            if exp is None:
+                reason = MISSING_EXPECTED
+            elif act is None:
+                reason = MISSING_ACTUAL
+            elif exp != act:
+                reason = FIELD_MISMATCH
+            else:
+                continue
+            breaks.append(
+                {
+                    "identifier": list(identifier_tuple),
+                    "expected": exp,
+                    "actual": act,
+                    "reason": reason,
+                }
+            )
+        return breaks
+
+    def _dispatch_session_reconciliation(
+        self,
+        event_id: str,
+        payload: dict[str, object],
+        state: _SymbolState,
+        symbol: str,
+        sequence: int,
+        content: str,
+    ) -> dict[str, object]:
+        """Answer a read-only whole-session reconciliation query.
+
+        The query compares the caller's external trade and account records
+        against the full history of every security in the session at once: it
+        never matches, never releases a plan slice and never moves an order, a
+        plan, an account set, a book, the trade journal, a trade id counter or
+        a price-limit interval. Like every other structurally valid event it
+        occupies its event id and advances the envelope symbol's sequence; its
+        id lives solely in the replay log, exactly like a PORTFOLIO_REPORT id.
+        A perfect match reports ``RECONCILED``; any difference reports
+        ``BREAKS_FOUND`` with the two sorted break arrays.
+        """
+        expected_trades: dict[tuple[str, int], dict[str, object]] = {}
+        for item in payload["expected_trades"]:
+            expected_trades[(item["symbol"], item["trade_id"])] = {
+                "symbol": item["symbol"],
+                "trade_id": item["trade_id"],
+                "maker_order_id": item["maker_order_id"],
+                "taker_order_id": item["taker_order_id"],
+                "price": item["price"],
+                "quantity": item["quantity"],
+            }
+        expected_accounts: dict[tuple[str, str], dict[str, object]] = {}
+        for item in payload["expected_accounts"]:
+            expected_accounts[(item["symbol"], item["account_id"])] = {
+                "symbol": item["symbol"],
+                "account_id": item["account_id"],
+                "net_position": item["net_position"],
+                "cash_balance": item["cash_balance"],
+            }
+
+        actual_trades = self._actual_session_trades()
+        actual_accounts = self._actual_session_accounts()
+        trade_breaks = self._session_breaks(expected_trades, actual_trades)
+        account_breaks = self._session_breaks(expected_accounts, actual_accounts)
+        result = RECONCILED if not trade_breaks and not account_breaks else BREAKS_FOUND
+
+        state.last_sequence = sequence
+        state.seen[event_id] = content
+        self._events[event_id] = (symbol, content)
+        bids, asks = state.engine.snapshot()
+        return {
+            "event_id": event_id,
+            "symbol": symbol,
+            "sequence": sequence,
+            "status": ACCEPTED,
+            "result": result,
+            "trades": [],
+            "book_changes": {"bids": [], "asks": []},
+            "bids": bids,
+            "asks": asks,
+            "reconciliation": {
+                "trade_breaks": trade_breaks,
+                "account_breaks": account_breaks,
+            },
         }
 
 
@@ -2814,7 +3070,9 @@ def replay_events(
         VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands, the POV
         POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT commands, the read-only
         per-order EXECUTION_REPORT query, the read-only cross-security
-        PORTFOLIO_REPORT query and the intraday PRICE_LIMIT_UPDATE adjustment.
+        PORTFOLIO_REPORT query, the read-only whole-session
+        SESSION_RECONCILIATION query and the intraday PRICE_LIMIT_UPDATE
+        adjustment.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
         a resumed run must pass the same configuration the snapshot carries.
