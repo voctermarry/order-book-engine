@@ -4,6 +4,7 @@ __version__ = "0.1.0"
 
 from .event_replay import (
     ACCEPTED,
+    BOOK_RECONSTRUCTION_REPORT,
     CONFIG_MISMATCH,
     DUPLICATE,
     DUPLICATE_EXECUTION_PLAN,
@@ -34,6 +35,7 @@ from .event_replay import (
     SNAPSHOT_CORRUPT,
     SNAPSHOT_VERSION_UNSUPPORTED,
     SnapshotError,
+    TARGET_SEQUENCE_NOT_FOUND,
     TWAP_CANCEL,
     TWAP_REPORT,
     TWAP_SLICE,
