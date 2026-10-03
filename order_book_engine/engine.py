@@ -1289,6 +1289,49 @@ class Engine:
         ]
         return bids, asks
 
+    def book_queue_view(
+        self,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Project the current resting book into ordered queue levels.
+
+        Bids are returned in descending price order and asks in ascending
+        order; within a level orders keep their price-time queue priority.
+        Each level carries its ``price``, the aggregate
+        ``visible_quantity`` at that price and the queued ``orders``; every
+        order carries its ``order_id``, ``order_type`` (``LIMIT`` or
+        ``ICEBERG`` — only GTC limit and iceberg orders ever rest), its
+        ``remaining_quantity`` (an iceberg's remainder still includes its
+        hidden reserve) and its public ``visible_quantity`` (an iceberg's
+        current slice only; a plain limit's whole remainder). Filled,
+        cancelled or replaced orders are absent because they are not queued.
+        Used solely by the replay layer's historical reconstruction query;
+        it never mutates anything.
+        """
+        def project(book: dict[int, deque[str]], descending: bool):
+            levels: list[dict[str, object]] = []
+            for price in sorted(book, reverse=descending):
+                orders: list[dict[str, object]] = []
+                visible_quantity = 0
+                for order_id in book[price]:
+                    record = self._orders[order_id]
+                    is_iceberg = record.get("visible") is not None
+                    visible = record["visible"] if is_iceberg else record["remaining"]
+                    visible_quantity += visible
+                    orders.append({
+                        "order_id": order_id,
+                        "order_type": ICEBERG if is_iceberg else LIMIT,
+                        "remaining_quantity": record["remaining"],
+                        "visible_quantity": visible,
+                    })
+                levels.append({
+                    "price": price,
+                    "visible_quantity": visible_quantity,
+                    "orders": orders,
+                })
+            return levels
+
+        return project(self._bids, True), project(self._asks, False)
+
     def has_order_id(self, order_id: str) -> bool:
         """Whether an id is already spent or reserved by any accepted order."""
         return order_id in self._order_ids or order_id in self._reserved_order_ids

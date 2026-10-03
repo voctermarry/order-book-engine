@@ -20,7 +20,9 @@ matching rules, priorities, rejection semantics or trade record shapes:
   gap against a caller-supplied evaluation price), the read-only
   per-symbol IMPACT_REPORT what-if query (which estimates an anonymous
   market order's executable quantity and cost against one security's
-  current book) and the intraday
+  current book), the read-only historical BOOK_RECONSTRUCTION_REPORT
+  query (which rebuilds one security's price-time queues as of a
+  previously committed sequence) and the intraday
   PRICE_LIMIT_UPDATE adjustment, which replaces one security's active price-limit interval
   (seeded from the static ``price_limits`` configuration) for all
   subsequently submitted limit prices; plans never read a wall clock and
@@ -127,6 +129,13 @@ SESSION_RECONCILIATION = "SESSION_RECONCILIATION"
 # never accept it.
 PLAN_TCA_REPORT = "PLAN_TCA_REPORT"
 
+# Read-only historical book reconstruction query and its single business
+# rejection code. Like the other replay-only reports it never reaches the
+# baseline engine or the JSON Lines entry point; the baseline rejects the
+# type as INVALID_SCHEMA.
+BOOK_RECONSTRUCTION_REPORT = "BOOK_RECONSTRUCTION_REPORT"
+TARGET_SEQUENCE_NOT_FOUND = "TARGET_SEQUENCE_NOT_FOUND"
+
 # TWAP event types.
 TWAP_START = "TWAP_START"
 TWAP_SLICE = "TWAP_SLICE"
@@ -169,7 +178,8 @@ CONFIG_MISMATCH = "CONFIG_MISMATCH"
 #: DAY_END_RECONCILIATION stay exclusive to the JSON Lines entry point),
 #: while the cross-security
 #: PORTFOLIO_REPORT query, the whole-session SESSION_RECONCILIATION query,
-#: the per-plan PLAN_TCA_REPORT query and the intraday PRICE_LIMIT_UPDATE
+#: the per-plan PLAN_TCA_REPORT query, the historical
+#: BOOK_RECONSTRUCTION_REPORT query and the intraday PRICE_LIMIT_UPDATE
 #: adjustment are exclusive to this layer.
 SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
@@ -177,7 +187,7 @@ SUPPORTED_TYPES = frozenset(
      VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
      POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT,
      EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
-     PLAN_TCA_REPORT, PRICE_LIMIT_UPDATE}
+     PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT, PRICE_LIMIT_UPDATE}
 )
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
@@ -199,6 +209,9 @@ _SESSION_EXPECTED_ACCOUNT_KEYS = frozenset(
 )
 _PLAN_TCA_REPORT_KEYS = frozenset(
     {"event_id", "type", "plan_id", "mark_price"}
+)
+_BOOK_RECONSTRUCTION_REPORT_KEYS = frozenset(
+    {"event_id", "type", "target_sequence"}
 )
 _EXECUTION_REPORT_KEYS = frozenset(
     {"event_id", "type", "order_id", "benchmark_price"}
@@ -252,7 +265,16 @@ _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES | _POV_TYPES
 #: instead.
 _REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset(
     {EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
-     PLAN_TCA_REPORT, PRICE_LIMIT_UPDATE}
+     PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT, PRICE_LIMIT_UPDATE}
+)
+#: Accepted replay-only events that never move any state themselves: every
+#: read-only report. A historical reconstruction rebuild replays the logged
+#: stream and skips these, since they occupied a sequence but changed
+#: nothing. PRICE_LIMIT_UPDATE is intentionally absent: it rewrites the
+#: active interval and must be replayed up to the target point.
+_REPLAY_NOOP_TYPES = frozenset(
+    {EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
+     PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT}
 )
 
 
@@ -594,6 +616,27 @@ def _plan_tca_report_schema_error(payload: dict[str, object]) -> str | None:
     if not _is_non_empty_str(payload.get("plan_id")):
         return INVALID_EVENT
     if not _is_positive_int(payload.get("mark_price")):
+        return INVALID_EVENT
+    return None
+
+
+def _book_reconstruction_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a BOOK_RECONSTRUCTION_REPORT query payload.
+
+    The query carries exactly ``event_id``, ``type`` and
+    ``target_sequence``; the target is a non-negative integer that is not a
+    boolean (``True``/``False`` must not masquerade as ``1``/``0``). Any
+    field problem — missing or extra field, a boolean, float, string, null
+    or negative target — is an ``INVALID_EVENT`` and consumes neither the
+    event id nor the sequence. Whether the target names a sequence this
+    security has actually committed is a business check
+    (``TARGET_SEQUENCE_NOT_FOUND``), so it consumes the id and the sequence
+    instead.
+    """
+    if set(payload) != _BOOK_RECONSTRUCTION_REPORT_KEYS:
+        return INVALID_EVENT
+    target = payload.get("target_sequence")
+    if not (_is_int(target) and target >= 0):
         return INVALID_EVENT
     return None
 
@@ -1163,6 +1206,8 @@ class EventReplayer:
             schema_error = _impact_report_schema_error(payload)
         elif event_type == PLAN_TCA_REPORT:
             schema_error = _plan_tca_report_schema_error(payload)
+        elif event_type == BOOK_RECONSTRUCTION_REPORT:
+            schema_error = _book_reconstruction_schema_error(payload)
         elif event_type == PRICE_LIMIT_UPDATE:
             schema_error = _price_limit_update_schema_error(payload)
         else:
@@ -1298,6 +1343,11 @@ class EventReplayer:
 
         if event_type == PLAN_TCA_REPORT:
             return self._dispatch_plan_tca_report(
+                event_id, payload, state, symbol, sequence, content
+            )
+
+        if event_type == BOOK_RECONSTRUCTION_REPORT:
+            return self._dispatch_book_reconstruction_report(
                 event_id, payload, state, symbol, sequence, content
             )
 
@@ -1455,6 +1505,8 @@ class EventReplayer:
             return _SESSION_RECONCILIATION_KEYS
         if inline_type == PLAN_TCA_REPORT:
             return _PLAN_TCA_REPORT_KEYS
+        if inline_type == BOOK_RECONSTRUCTION_REPORT:
+            return _BOOK_RECONSTRUCTION_REPORT_KEYS
         if inline_type == EXECUTION_REPORT:
             return _EXECUTION_REPORT_KEYS
         if inline_type == IMPACT_REPORT:
@@ -2434,6 +2486,156 @@ class EventReplayer:
             "plan_tca_analysis": self._plan_tca_analysis(plan, mark_price),
         }
 
+    # -- historical book reconstruction report -------------------------------
+
+    @staticmethod
+    def _price_limits_view(
+        limits: tuple[int, int] | None,
+    ) -> dict[str, object] | None:
+        """The public ``active_price_limits`` shape (``None`` when unlimited)."""
+        if limits is None:
+            return None
+        return {"lower_price": limits[0], "upper_price": limits[1]}
+
+    def _reconstruct_book(
+        self,
+        symbol: str,
+        target_sequence: int,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], tuple[int, int] | None]:
+        """Rebuild one security's book as of a previously committed sequence.
+
+        A fresh throwaway session with the same matching configuration is
+        advanced by replaying this security's committed event log in
+        sequence order — every entry of ``state.seen`` is one committed
+        sequence, in first-seen order. The accepted read-only reports
+        (EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT,
+        SESSION_RECONCILIATION, PLAN_TCA_REPORT and earlier
+        BOOK_RECONSTRUCTION_REPORT queries) occupied a sequence without
+        moving anything, so they are committed to the scratch session as
+        pure id/sequence markers and never re-dispatched (which also keeps a
+        historical reconstruction query from recursing); every baseline
+        event, every parent-order command and every PRICE_LIMIT_UPDATE is
+        re-dispatched through the ordinary code path, so matching, iceberg
+        replenishment, replacement queue loss, plan child orders, price
+        rejections and the active interval all reproduce exactly. The
+        scratch session is discarded afterwards, so the live session never
+        matches, releases a plan slice or moves any trading state.
+        """
+        scratch = EventReplayer(self.config)
+        for index, (logged_id, content_str) in enumerate(
+            self._symbols[symbol].seen.items(), start=1
+        ):
+            stored_payload = json.loads(content_str)
+            stored_type = stored_payload.get("type")
+            if stored_type in _REPLAY_NOOP_TYPES:
+                # A read-only report occupied the sequence but changed
+                # nothing: mirror only its id/sequence commit, without ever
+                # re-running the query.
+                scratch_state = scratch._symbols.get(symbol)
+                if scratch_state is None:
+                    scratch_state = _SymbolState()
+                    scratch_state.price_limits = scratch.price_limits.get(symbol)
+                    scratch._symbols[symbol] = scratch_state
+                scratch_state.last_sequence = index
+                scratch_state.seen[logged_id] = content_str
+                scratch._events[logged_id] = (symbol, content_str)
+            else:
+                # The inline envelope form: payload fields plus the envelope
+                # symbol and the sequence the log position implies.
+                synthetic_event: dict[str, object] = {
+                    **stored_payload, "symbol": symbol, "sequence": index
+                }
+                scratch._submit_one(synthetic_event)
+            if index == target_sequence:
+                break
+
+        scratch_state = scratch._symbols[symbol]
+        bid_queues, ask_queues = scratch_state.engine.book_queue_view()
+        return bid_queues, ask_queues, scratch_state.price_limits
+
+    def _dispatch_book_reconstruction_report(
+        self,
+        event_id: str,
+        payload: dict[str, object],
+        state: _SymbolState,
+        symbol: str,
+        sequence: int,
+        content: str,
+    ) -> dict[str, object]:
+        """Answer a read-only historical book-queue query for one security.
+
+        The query rebuilds the envelope security's resting queues as of
+        ``target_sequence``: target ``0`` denotes the empty book and the
+        session-initial price-limit interval before the first event; a
+        positive target must be a sequence this security has already
+        committed before the query. A target later than the security's last
+        committed sequence is a ``TARGET_SEQUENCE_NOT_FOUND`` business
+        rejection — unknown securities answer target ``0`` against the
+        empty book and reject every positive target. The rebuild runs on a
+        throwaway session and never matches, never releases a plan slice and
+        never moves an order, a queue, the trade log, an account set, a
+        plan, the active interval or the next trade id of the live session.
+        Like every other structurally valid event the query occupies its
+        event id and advances the symbol sequence, including the business
+        rejection; its id lives solely in the replay log, exactly like a
+        PLAN_TCA_REPORT id.
+        """
+        target_sequence: int = payload["target_sequence"]
+
+        def commit() -> None:
+            state.last_sequence = sequence
+            state.seen[event_id] = content
+            self._events[event_id] = (symbol, content)
+
+        bids, asks = state.engine.snapshot()
+        if target_sequence > state.last_sequence:
+            # A committed business rejection: id and envelope sequence move,
+            # the book and every other trading state do not.
+            commit()
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": REJECTED,
+                "rejection_code": TARGET_SEQUENCE_NOT_FOUND,
+                "trades": [],
+                "book_changes": {"bids": [], "asks": []},
+                "bids": bids,
+                "asks": asks,
+            }
+
+        if target_sequence == 0:
+            # The book before the first event is always empty; the active
+            # interval is the session-initial one seeded from the static
+            # configuration, whether or not the security has traded yet.
+            bid_queues: list[dict[str, object]] = []
+            ask_queues: list[dict[str, object]] = []
+            target_limits = self.price_limits.get(symbol)
+        else:
+            bid_queues, ask_queues, target_limits = self._reconstruct_book(
+                symbol, target_sequence
+            )
+
+        commit()
+        return {
+            "event_id": event_id,
+            "symbol": symbol,
+            "sequence": sequence,
+            "status": ACCEPTED,
+            "result": REPORTED,
+            "trades": [],
+            "book_changes": {"bids": [], "asks": []},
+            "bids": bids,
+            "asks": asks,
+            "book_reconstruction": {
+                "symbol": symbol,
+                "target_sequence": target_sequence,
+                "active_price_limits": self._price_limits_view(target_limits),
+                "bid_queues": bid_queues,
+                "ask_queues": ask_queues,
+            },
+        }
+
 
 # ---------------------------------------------------------------------------
 # Snapshot export / restoration
@@ -3314,7 +3516,8 @@ def replay_events(
         IMPACT_REPORT what-if query, the read-only cross-security
         PORTFOLIO_REPORT query, the read-only whole-session
         SESSION_RECONCILIATION query, the read-only per-plan
-        PLAN_TCA_REPORT query and the intraday PRICE_LIMIT_UPDATE
+        PLAN_TCA_REPORT query, the read-only historical
+        BOOK_RECONSTRUCTION_REPORT query and the intraday PRICE_LIMIT_UPDATE
         adjustment.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
