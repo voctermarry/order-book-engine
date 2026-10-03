@@ -15,8 +15,10 @@ matching rules, priorities, rejection semantics or trade record shapes:
   per-order EXECUTION_REPORT query, the read-only cross-security
   PORTFOLIO_REPORT query, the read-only whole-session
   SESSION_RECONCILIATION query (which reconciles every security's
-  trades and account books at once) and the intraday PRICE_LIMIT_UPDATE
-  adjustment, which replaces one security's active price-limit interval
+  trades and account books at once), the read-only per-plan
+  PLAN_TCA_REPORT query (which prices a plan's implementation shortfall
+  gap against a caller-supplied evaluation price) and the intraday
+  PRICE_LIMIT_UPDATE adjustment, which replaces one security's active price-limit interval
   (seeded from the static ``price_limits`` configuration) for all
   subsequently submitted limit prices; plans never read a wall clock and
   are advanced solely by their command events. TWAP slices divide
@@ -116,6 +118,11 @@ MARK_PRICE_MISMATCH = "MARK_PRICE_MISMATCH"
 # once; external records name their security explicitly.
 SESSION_RECONCILIATION = "SESSION_RECONCILIATION"
 
+# Read-only per-plan implementation-shortfall query. A replay-only event like
+# SESSION_RECONCILIATION: the baseline engine and the JSON Lines entry point
+# never accept it.
+PLAN_TCA_REPORT = "PLAN_TCA_REPORT"
+
 # TWAP event types.
 TWAP_START = "TWAP_START"
 TWAP_SLICE = "TWAP_SLICE"
@@ -156,15 +163,16 @@ CONFIG_MISMATCH = "CONFIG_MISMATCH"
 #: read-only reports only the per-order EXECUTION_REPORT query joins them
 #: here (ACCOUNT_REPORT, DAY_END_RECONCILIATION and IMPACT_REPORT stay
 #: exclusive to the JSON Lines entry point), while the cross-security
-#: PORTFOLIO_REPORT query, the whole-session SESSION_RECONCILIATION query and
-#: the intraday PRICE_LIMIT_UPDATE adjustment are exclusive to this layer.
+#: PORTFOLIO_REPORT query, the whole-session SESSION_RECONCILIATION query,
+#: the per-plan PLAN_TCA_REPORT query and the intraday PRICE_LIMIT_UPDATE
+#: adjustment are exclusive to this layer.
 SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
      TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
      VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
      POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT,
      EXECUTION_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
-     PRICE_LIMIT_UPDATE}
+     PLAN_TCA_REPORT, PRICE_LIMIT_UPDATE}
 )
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
@@ -183,6 +191,9 @@ _SESSION_EXPECTED_TRADE_KEYS = frozenset(
 )
 _SESSION_EXPECTED_ACCOUNT_KEYS = frozenset(
     {"symbol", "account_id", "net_position", "cash_balance"}
+)
+_PLAN_TCA_REPORT_KEYS = frozenset(
+    {"event_id", "type", "plan_id", "mark_price"}
 )
 _EXECUTION_REPORT_KEYS = frozenset(
     {"event_id", "type", "order_id", "benchmark_price"}
@@ -231,7 +242,8 @@ _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES | _POV_TYPES
 #: rewrites replay-layer state. Baseline ADD/CANCEL/REPLACE ids occupy the
 #: per-symbol engine journal instead.
 _REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset(
-    {EXECUTION_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION, PRICE_LIMIT_UPDATE}
+    {EXECUTION_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
+     PLAN_TCA_REPORT, PRICE_LIMIT_UPDATE}
 )
 
 
@@ -530,6 +542,27 @@ def _execution_report_schema_error(payload: dict[str, object]) -> str | None:
     if not _is_non_empty_str(payload.get("order_id")):
         return INVALID_EVENT
     if not _is_positive_int(payload.get("benchmark_price")):
+        return INVALID_EVENT
+    return None
+
+
+def _plan_tca_report_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a PLAN_TCA_REPORT query payload.
+
+    The query carries exactly ``event_id``, ``type``, ``plan_id`` and
+    ``mark_price``; the plan id is a non-empty string and the evaluation
+    price is a positive integer (booleans do not count). Any field
+    problem (missing or extra field, wrong type, an empty plan id) is an
+    ``INVALID_EVENT`` and consumes neither the event id nor the sequence.
+    Whether the envelope symbol actually owns such a plan is a business
+    check (``UNKNOWN_EXECUTION_PLAN``), so it consumes the id and the
+    sequence instead.
+    """
+    if set(payload) != _PLAN_TCA_REPORT_KEYS:
+        return INVALID_EVENT
+    if not _is_non_empty_str(payload.get("plan_id")):
+        return INVALID_EVENT
+    if not _is_positive_int(payload.get("mark_price")):
         return INVALID_EVENT
     return None
 
@@ -1095,6 +1128,8 @@ class EventReplayer:
             schema_error = _session_reconciliation_schema_error(payload)
         elif event_type == EXECUTION_REPORT:
             schema_error = _execution_report_schema_error(payload)
+        elif event_type == PLAN_TCA_REPORT:
+            schema_error = _plan_tca_report_schema_error(payload)
         elif event_type == PRICE_LIMIT_UPDATE:
             schema_error = _price_limit_update_schema_error(payload)
         else:
@@ -1225,6 +1260,11 @@ class EventReplayer:
 
         if event_type == SESSION_RECONCILIATION:
             return self._dispatch_session_reconciliation(
+                event_id, payload, state, symbol, sequence, content
+            )
+
+        if event_type == PLAN_TCA_REPORT:
+            return self._dispatch_plan_tca_report(
                 event_id, payload, state, symbol, sequence, content
             )
 
@@ -1375,6 +1415,8 @@ class EventReplayer:
             return _PORTFOLIO_REPORT_KEYS
         if inline_type == SESSION_RECONCILIATION:
             return _SESSION_RECONCILIATION_KEYS
+        if inline_type == PLAN_TCA_REPORT:
+            return _PLAN_TCA_REPORT_KEYS
         if inline_type == EXECUTION_REPORT:
             return _EXECUTION_REPORT_KEYS
         if inline_type == PRICE_LIMIT_UPDATE:
@@ -2191,6 +2233,119 @@ class EventReplayer:
                 "trade_breaks": trade_breaks,
                 "account_breaks": account_breaks,
             },
+        }
+
+    # -- per-plan implementation-shortfall report ----------------------------
+
+    @staticmethod
+    def _plan_tca_analysis(plan: ExecutionPlan, mark_price: int) -> dict[str, object]:
+        """Build the read-only ``plan_tca_analysis`` object for one plan.
+
+        The identifiers, algorithm, side, lifecycle status, benchmark price,
+        total quantity, executed notional and the exact-fraction ``vwap`` are
+        the same values the plan's own cumulative report carries; ``vwap`` is
+        ``None`` until the plan has a fill. Every derived figure uses plain
+        integers and the existing fraction only — no float, no rounding:
+
+        * ``opportunity_quantity`` is the total minus the filled quantity;
+        * ``execution_slippage_notional`` is
+          ``executed_notional - benchmark_price * filled_quantity`` for a buy
+          and its negation for a sell;
+        * ``opportunity_cost_notional`` is
+          ``(mark_price - benchmark_price) * opportunity_quantity`` for a buy
+          and its negation for a sell;
+        * ``implementation_shortfall_notional`` is the sum of the two, so a
+          negative value means improvement.
+        """
+        total_quantity = plan.total_quantity
+        filled_quantity = plan.filled_quantity
+        notional = plan.notional
+        vwap = (
+            {"numerator": notional, "denominator": filled_quantity}
+            if filled_quantity
+            else None
+        )
+        opportunity_quantity = total_quantity - filled_quantity
+        execution_slippage = notional - plan.benchmark_price * filled_quantity
+        opportunity_cost = (
+            (mark_price - plan.benchmark_price) * opportunity_quantity
+        )
+        if plan.side == SELL:
+            # Mirror the buy formulas: negative always means improvement.
+            execution_slippage = -execution_slippage
+            opportunity_cost = -opportunity_cost
+        return {
+            "plan_id": plan.plan_id,
+            "algorithm": plan.algorithm,
+            "side": plan.side,
+            "status": plan.status,
+            "benchmark_price": plan.benchmark_price,
+            "total_quantity": total_quantity,
+            "executed_notional": notional,
+            "vwap": vwap,
+            "mark_price": mark_price,
+            "opportunity_quantity": opportunity_quantity,
+            "execution_slippage_notional": execution_slippage,
+            "opportunity_cost_notional": opportunity_cost,
+            "implementation_shortfall_notional": (
+                execution_slippage + opportunity_cost
+            ),
+        }
+
+    def _dispatch_plan_tca_report(
+        self,
+        event_id: str,
+        payload: dict[str, object],
+        state: _SymbolState,
+        symbol: str,
+        sequence: int,
+        content: str,
+    ) -> dict[str, object]:
+        """Answer a read-only implementation-shortfall query for one plan.
+
+        The query only reads this security's plan state: it never matches,
+        never releases a slice, never feeds POV market volume and never moves
+        an order, a queue, the trade log, an account set, a plan, the active
+        price-limit interval or the next trade id. Every TWAP/VWAP/POV plan
+        accepted under the envelope symbol is queryable — ACTIVE, COMPLETED
+        and CANCELLED alike; a plan id that is unknown under this symbol,
+        including one that only exists on another security, is an
+        ``UNKNOWN_EXECUTION_PLAN`` business rejection. Like every other
+        structurally valid event the query occupies its event id and advances
+        the symbol sequence, including that rejection; its id lives solely in
+        the replay log, exactly like a SESSION_RECONCILIATION id.
+        """
+        plan_id: str = payload["plan_id"]
+        mark_price: int = payload["mark_price"]
+        plan = state.plans.get(plan_id)
+
+        state.last_sequence = sequence
+        state.seen[event_id] = content
+        self._events[event_id] = (symbol, content)
+        bids, asks = state.engine.snapshot()
+        if plan is None:
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": REJECTED,
+                "rejection_code": UNKNOWN_EXECUTION_PLAN,
+                "trades": [],
+                "book_changes": {"bids": [], "asks": []},
+                "bids": bids,
+                "asks": asks,
+            }
+        return {
+            "event_id": event_id,
+            "symbol": symbol,
+            "sequence": sequence,
+            "status": ACCEPTED,
+            "result": REPORTED,
+            "trades": [],
+            "book_changes": {"bids": [], "asks": []},
+            "bids": bids,
+            "asks": asks,
+            "plan_tca_analysis": self._plan_tca_analysis(plan, mark_price),
         }
 
 
@@ -3071,7 +3226,8 @@ def replay_events(
         POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT commands, the read-only
         per-order EXECUTION_REPORT query, the read-only cross-security
         PORTFOLIO_REPORT query, the read-only whole-session
-        SESSION_RECONCILIATION query and the intraday PRICE_LIMIT_UPDATE
+        SESSION_RECONCILIATION query, the read-only per-plan
+        PLAN_TCA_REPORT query and the intraday PRICE_LIMIT_UPDATE
         adjustment.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
