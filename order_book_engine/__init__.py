@@ -4,6 +4,7 @@ __version__ = "0.1.0"
 
 from .event_replay import (
     ACCEPTED,
+    BREAKS_FOUND,
     CONFIG_MISMATCH,
     DUPLICATE,
     DUPLICATE_EXECUTION_PLAN,
@@ -26,8 +27,10 @@ from .event_replay import (
     PRICE_LIMIT_EXCEEDED,
     PRICE_LIMIT_UPDATE,
     PRICE_LIMIT_UPDATED,
+    RECONCILED,
     REJECTED,
     SEQUENCE_GAP,
+    SESSION_RECONCILIATION,
     SNAPSHOT_CORRUPT,
     SNAPSHOT_VERSION_UNSUPPORTED,
     SnapshotError,
@@ -50,6 +53,7 @@ from .event_replay import (
 
 __all__ = [
     "ACCEPTED",
+    "BREAKS_FOUND",
     "CONFIG_MISMATCH",
     "DUPLICATE",
     "DUPLICATE_EXECUTION_PLAN",
@@ -72,8 +76,10 @@ __all__ = [
     "PRICE_LIMIT_EXCEEDED",
     "PRICE_LIMIT_UPDATE",
     "PRICE_LIMIT_UPDATED",
+    "RECONCILED",
     "REJECTED",
     "SEQUENCE_GAP",
+    "SESSION_RECONCILIATION",
     "SNAPSHOT_CORRUPT",
     "SNAPSHOT_VERSION_UNSUPPORTED",
     "SnapshotError",

@@ -1059,6 +1059,25 @@ class Engine:
         """
         return account_id in self._accounts
 
+    def known_accounts(self) -> set[str]:
+        """Every account id an accepted ADD ever named (a copy).
+
+        Used by the multi-symbol replay layer's session reconciliation,
+        which reports every known account of every security, traded or not.
+        """
+        return set(self._accounts)
+
+    def trade_journal(self) -> list[dict[str, object]]:
+        """Every trade ever executed, in trade_id order (copies).
+
+        Each entry carries ``trade_id``, ``maker_order_id``,
+        ``taker_order_id``, ``price``, ``quantity`` and the producing
+        ``event_id``. Used by the multi-symbol replay layer's session
+        reconciliation; the engine's own reports keep reading the journal
+        directly.
+        """
+        return [dict(trade) for trade in self._trade_log]
+
     def account_aggregates(
         self, account_id: str
     ) -> tuple[int, int, int, int]:
