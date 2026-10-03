@@ -17,7 +17,10 @@ matching rules, priorities, rejection semantics or trade record shapes:
   SESSION_RECONCILIATION query (which reconciles every security's
   trades and account books at once), the read-only per-plan
   PLAN_TCA_REPORT query (which prices a plan's implementation shortfall
-  gap against a caller-supplied evaluation price) and the intraday
+  gap against a caller-supplied evaluation price), the read-only
+  per-symbol IMPACT_REPORT what-if query (which estimates an anonymous
+  market order's executable quantity and cost against one security's
+  current book) and the intraday
   PRICE_LIMIT_UPDATE adjustment, which replaces one security's active price-limit interval
   (seeded from the static ``price_limits`` configuration) for all
   subsequently submitted limit prices; plans never read a wall clock and
@@ -61,6 +64,7 @@ from .engine import (
     EXECUTION_REPORT,
     FIELD_MISMATCH,
     ICEBERG,
+    IMPACT_REPORT,
     IOC,
     LIMIT,
     MARKET,
@@ -160,9 +164,10 @@ CONFIG_MISMATCH = "CONFIG_MISMATCH"
 
 #: Event types this replay layer accepts. The TWAP/VWAP parent-order commands
 #: join the baseline mutating behaviours; of the baseline single-security
-#: read-only reports only the per-order EXECUTION_REPORT query joins them
-#: here (ACCOUNT_REPORT, DAY_END_RECONCILIATION and IMPACT_REPORT stay
-#: exclusive to the JSON Lines entry point), while the cross-security
+#: read-only reports the per-order EXECUTION_REPORT query and the
+#: what-if IMPACT_REPORT query join them here (ACCOUNT_REPORT and
+#: DAY_END_RECONCILIATION stay exclusive to the JSON Lines entry point),
+#: while the cross-security
 #: PORTFOLIO_REPORT query, the whole-session SESSION_RECONCILIATION query,
 #: the per-plan PLAN_TCA_REPORT query and the intraday PRICE_LIMIT_UPDATE
 #: adjustment are exclusive to this layer.
@@ -171,7 +176,7 @@ SUPPORTED_TYPES = frozenset(
      TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
      VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
      POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT,
-     EXECUTION_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
+     EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
      PLAN_TCA_REPORT, PRICE_LIMIT_UPDATE}
 )
 
@@ -197,6 +202,9 @@ _PLAN_TCA_REPORT_KEYS = frozenset(
 )
 _EXECUTION_REPORT_KEYS = frozenset(
     {"event_id", "type", "order_id", "benchmark_price"}
+)
+_IMPACT_REPORT_KEYS = frozenset(
+    {"event_id", "type", "side", "quantity", "benchmark_price"}
 )
 _PRICE_LIMIT_UPDATE_KEYS = frozenset(
     {"event_id", "type", "lower_price", "upper_price"}
@@ -237,12 +245,13 @@ _POV_TYPES = frozenset({POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT})
 _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES | _POV_TYPES
 #: Event types whose ids live solely in the replay log: parent-order commands
 #: never touch the engine journal, the per-order execution query, the
-#: cross-security portfolio query and the whole-session reconciliation are
-#: read-only and matched by no engine, and a price-limit adjustment only
-#: rewrites replay-layer state. Baseline ADD/CANCEL/REPLACE ids occupy the
-#: per-symbol engine journal instead.
+#: per-symbol book-impact what-if query, the cross-security portfolio query
+#: and the whole-session reconciliation are read-only and matched by no
+#: engine, and a price-limit adjustment only rewrites replay-layer state.
+#: Baseline ADD/CANCEL/REPLACE ids occupy the per-symbol engine journal
+#: instead.
 _REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset(
-    {EXECUTION_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
+    {EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
      PLAN_TCA_REPORT, PRICE_LIMIT_UPDATE}
 )
 
@@ -540,6 +549,28 @@ def _execution_report_schema_error(payload: dict[str, object]) -> str | None:
     if set(payload) != _EXECUTION_REPORT_KEYS:
         return INVALID_EVENT
     if not _is_non_empty_str(payload.get("order_id")):
+        return INVALID_EVENT
+    if not _is_positive_int(payload.get("benchmark_price")):
+        return INVALID_EVENT
+    return None
+
+
+def _impact_report_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of an IMPACT_REPORT query payload.
+
+    The query carries exactly ``event_id``, ``type``, ``side``,
+    ``quantity`` and ``benchmark_price``; ``side`` is ``BUY`` or
+    ``SELL`` and the quantity and benchmark are positive integers
+    (booleans do not count). Any field problem (missing or extra field,
+    a non-string side, a non-positive quantity or benchmark) is an
+    ``INVALID_EVENT`` and consumes neither the event id nor the
+    sequence, exactly matching the baseline single-security contract.
+    """
+    if set(payload) != _IMPACT_REPORT_KEYS:
+        return INVALID_EVENT
+    if payload.get("side") not in (BUY, SELL):
+        return INVALID_EVENT
+    if not _is_positive_int(payload.get("quantity")):
         return INVALID_EVENT
     if not _is_positive_int(payload.get("benchmark_price")):
         return INVALID_EVENT
@@ -1128,6 +1159,8 @@ class EventReplayer:
             schema_error = _session_reconciliation_schema_error(payload)
         elif event_type == EXECUTION_REPORT:
             schema_error = _execution_report_schema_error(payload)
+        elif event_type == IMPACT_REPORT:
+            schema_error = _impact_report_schema_error(payload)
         elif event_type == PLAN_TCA_REPORT:
             schema_error = _plan_tca_report_schema_error(payload)
         elif event_type == PRICE_LIMIT_UPDATE:
@@ -1270,6 +1303,11 @@ class EventReplayer:
 
         if event_type == EXECUTION_REPORT:
             return self._dispatch_execution_report(
+                event_id, payload, state, symbol, sequence, content
+            )
+
+        if event_type == IMPACT_REPORT:
+            return self._dispatch_impact_report(
                 event_id, payload, state, symbol, sequence, content
             )
 
@@ -1419,6 +1457,8 @@ class EventReplayer:
             return _PLAN_TCA_REPORT_KEYS
         if inline_type == EXECUTION_REPORT:
             return _EXECUTION_REPORT_KEYS
+        if inline_type == IMPACT_REPORT:
+            return _IMPACT_REPORT_KEYS
         if inline_type == PRICE_LIMIT_UPDATE:
             return _PRICE_LIMIT_UPDATE_KEYS
         return None
@@ -1923,6 +1963,52 @@ class EventReplayer:
             "bids": bids,
             "asks": asks,
             "execution_analysis": analysis,
+        }
+
+    # -- per-symbol book-impact what-if report -------------------------------
+
+    def _dispatch_impact_report(
+        self,
+        event_id: str,
+        payload: dict[str, object],
+        state: _SymbolState,
+        symbol: str,
+        sequence: int,
+        content: str,
+    ) -> dict[str, object]:
+        """Answer a read-only what-if market-order impact query for one book.
+
+        The analysis is produced by the baseline engine's own impact routine,
+        so its content matches the single-security JSON Lines entry point
+        exactly: the walk follows price-time priority at maker prices, uses
+        only an iceberg's current visible slice and requeues a replenished
+        slice at its level tail, reports the precise fraction figures and
+        never mutates anything. The simulated order is anonymous, so
+        self-trade prevention never applies, and the active price-limit
+        interval never blocks it. A first-seen symbol answers against its
+        empty book successfully. Like every other structurally valid event
+        the query occupies its event id and advances the symbol sequence;
+        its id lives solely in the replay log, exactly like an
+        EXECUTION_REPORT id, and never enters the engine journal.
+        """
+        _eid, result, _reason, _trades, analysis = state.engine._impact_report(
+            event_id, payload
+        )
+        state.last_sequence = sequence
+        state.seen[event_id] = content
+        self._events[event_id] = (symbol, content)
+        bids, asks = state.engine.snapshot()
+        return {
+            "event_id": event_id,
+            "symbol": symbol,
+            "sequence": sequence,
+            "status": ACCEPTED,
+            "result": result,
+            "trades": [],
+            "book_changes": {"bids": [], "asks": []},
+            "bids": bids,
+            "asks": asks,
+            "impact_analysis": analysis,
         }
 
     # -- cross-security portfolio report -------------------------------------
@@ -2699,8 +2785,8 @@ def _engine_from_json(
     # Partition the accepted events into baseline engine events and
     # replay-only events: the engine journal only knows the former plus the
     # child orders synthesized for released slices, while every TWAP/VWAP/POV
-    # command id and every read-only EXECUTION_REPORT / PORTFOLIO_REPORT id
-    # lives solely in the replay log.
+    # command id, every read-only EXECUTION_REPORT / IMPACT_REPORT id and
+    # every PORTFOLIO_REPORT id lives solely in the replay log.
     baseline_event_ids: set[str] = set()
     replay_only_event_ids: set[str] = set()
     for event_id, content in seen.items():
@@ -3224,7 +3310,8 @@ def replay_events(
         TWAP_START/TWAP_SLICE/TWAP_CANCEL/TWAP_REPORT and
         VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT commands, the POV
         POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT commands, the read-only
-        per-order EXECUTION_REPORT query, the read-only cross-security
+        per-order EXECUTION_REPORT query, the read-only per-symbol
+        IMPACT_REPORT what-if query, the read-only cross-security
         PORTFOLIO_REPORT query, the read-only whole-session
         SESSION_RECONCILIATION query, the read-only per-plan
         PLAN_TCA_REPORT query and the intraday PRICE_LIMIT_UPDATE

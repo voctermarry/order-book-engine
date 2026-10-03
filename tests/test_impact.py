@@ -1,13 +1,35 @@
-"""Tests for the read-only IMPACT_REPORT what-if query (JSON Lines replay)."""
+"""Tests for the read-only IMPACT_REPORT what-if query.
+
+Covers both the single-security JSON Lines replay entry point and the
+ordered multi-symbol event stream (``replay_events`` / ``EventReplayer``).
+"""
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 
+import pytest
+
+from order_book_engine import (
+    ACCEPTED,
+    DUPLICATE,
+    EVENT_ID_CONFLICT,
+    FORMAT_VERSION,
+    IMPACT_REPORT,
+    OUT_OF_ORDER,
+    REJECTED,
+    SEQUENCE_GAP,
+    canonical_json,
+    export_snapshot,
+    replay_events,
+    restore_replayer,
+)
+from order_book_engine import event_cli
 from order_book_engine import replay as replay_cli
 from order_book_engine.engine import Engine
-from order_book_engine.event_replay import INVALID_EVENT, replay_events
+from order_book_engine.event_replay import INVALID_EVENT
 
 
 def add(event_id, order_id, side, order_type, quantity, price=None, **extra):
@@ -438,40 +460,571 @@ def test_cli_serializes_impact_analysis_between_result_and_trades():
 
 
 # --------------------------------------------------------------------------
-# The events (multi-symbol replay) entry point does not know the query
+# Multi-symbol ordered event stream (replay_events / EventReplayer)
 # --------------------------------------------------------------------------
 
 
-def test_events_entry_rejects_impact_report_without_consuming_sequence():
-    events = [
-        {
-            "event_id": "e1", "symbol": "AAA", "sequence": 1,
-            "type": "ADD", "order_id": "s1", "side": "SELL",
-            "order_type": "LIMIT", "quantity": 2, "price": 100,
+def m_add(event_id, symbol, sequence, order_id, side, order_type, quantity, price=None, **extra):
+    event = {
+        "event_id": event_id, "symbol": symbol, "sequence": sequence,
+        "type": "ADD", "order_id": order_id, "side": side,
+        "order_type": order_type, "quantity": quantity,
+    }
+    if price is not None:
+        event["price"] = price
+    event.update(extra)
+    return event
+
+
+def m_iceberg(event_id, symbol, sequence, order_id, side, quantity, price, display, **extra):
+    return m_add(event_id, symbol, sequence, order_id, side, "ICEBERG",
+                 quantity, price, display_quantity=display, **extra)
+
+
+def m_impact(event_id, symbol, sequence, side, quantity, benchmark_price, **extra):
+    event = {
+        "event_id": event_id, "symbol": symbol, "sequence": sequence,
+        "type": IMPACT_REPORT, "side": side, "quantity": quantity,
+        "benchmark_price": benchmark_price,
+    }
+    event.update(extra)
+    return event
+
+
+def m_impact_nested(event_id, symbol, sequence, side, quantity, benchmark_price):
+    return {
+        "event_id": event_id, "symbol": symbol, "sequence": sequence,
+        "event": {
+            "event_id": event_id, "type": IMPACT_REPORT, "side": side,
+            "quantity": quantity, "benchmark_price": benchmark_price,
         },
-        {
-            "event_id": "e2", "symbol": "AAA", "sequence": 2,
-            "type": "IMPACT_REPORT", "side": "BUY",
-            "quantity": 1, "benchmark_price": 100,
-        },
+    }
+
+
+def _ask_book_stream(prefix="AAA"):
+    return [
+        m_add("e1", prefix, 1, "s1", "SELL", "LIMIT", 5, 100),
+        m_add("e2", prefix, 2, "s2", "SELL", "LIMIT", 3, 101),
     ]
-    out = replay_events(events)
-    results = out["results"]
-    assert results[0]["status"] == "ACCEPTED"
-    assert (results[1]["status"], results[1]["rejection_code"]) == (
-        "REJECTED", INVALID_EVENT
+
+
+# -- success shape ----------------------------------------------------------
+
+
+def test_stream_impact_success_shape():
+    out = replay_events(
+        _ask_book_stream()
+        + [m_impact("q1", "AAA", 3, "BUY", 6, 99)],
+        snapshot_after=None,
     )
-    # A structural rejection consumed neither the id nor the sequence, and no
-    # impact analysis leaked into the events response.
-    assert "impact_analysis" not in results[1]
-    follow_up = replay_events(
-        events
-        + [
-            {
-                "event_id": "e3", "symbol": "AAA", "sequence": 2,
-                "type": "CANCEL", "order_id": "s1",
-            }
+    r = out["results"][2]
+    assert (r["status"], r["result"]) == (ACCEPTED, "REPORTED")
+    assert r["trades"] == []
+    assert r["book_changes"] == {"bids": [], "asks": []}
+    assert r["bids"] == []
+    assert r["asks"] == [
+        {"price": 100, "quantity": 5},
+        {"price": 101, "quantity": 3},
+    ]
+    assert r["impact_analysis"] == {
+        "side": "BUY",
+        "requested_quantity": 6,
+        "benchmark_price": 99,
+        "executable_quantity": 6,
+        "unfilled_quantity": 0,
+        "executed_notional": 601,
+        "best_price": 100,
+        "vwap": {"numerator": 601, "denominator": 6},
+        "slippage_notional": 7,
+        "impact_notional": 1,
+        "price_breakdown": [
+            {"price": 100, "quantity": 5},
+            {"price": 101, "quantity": 1},
         ],
-        snapshot=out["snapshot"],
+    }
+
+
+def test_stream_impact_sell_side_mirrors_costs():
+    out = replay_events(
+        [
+            m_add("e1", "AAA", 1, "b1", "BUY", "LIMIT", 3, 100),
+            m_add("e2", "AAA", 2, "b2", "BUY", "LIMIT", 4, 99),
+            m_impact("q1", "AAA", 3, "SELL", 5, 101),
+        ],
+        snapshot_after=None,
     )
-    assert follow_up["results"][-1]["status"] == "ACCEPTED"
+    analysis = out["results"][2]["impact_analysis"]
+    assert analysis["price_breakdown"] == [
+        {"price": 100, "quantity": 3},
+        {"price": 99, "quantity": 2},
+    ]
+    assert analysis["vwap"] == {"numerator": 498, "denominator": 5}
+    assert analysis["slippage_notional"] == 7
+    assert analysis["impact_notional"] == 2
+
+
+def test_stream_impact_nested_payload_form():
+    out = replay_events(
+        _ask_book_stream()
+        + [m_impact_nested("q1", "AAA", 3, "BUY", 6, 99)],
+        snapshot_after=None,
+    )
+    r = out["results"][2]
+    assert (r["status"], r["result"]) == (ACCEPTED, "REPORTED")
+    assert r["impact_analysis"]["executable_quantity"] == 6
+
+
+def test_stream_impact_matches_single_security_entry_point_exactly():
+    # Differential check: the stream analysis is byte-identical to the
+    # baseline single-security engine's own impact analysis on an equal book.
+    stream = [
+        m_iceberg("e1", "AAA", 1, "i1", "SELL", 9, 100, 2),
+        m_add("e2", "AAA", 2, "s2", "SELL", "LIMIT", 3, 100),
+        m_add("e3", "AAA", 3, "s3", "SELL", "LIMIT", 4, 101),
+        m_add("e4", "AAA", 4, "s4", "SELL", "LIMIT", 2, 102),
+        m_impact("q1", "AAA", 5, "BUY", 15, 100),
+    ]
+    out = replay_events(copy.deepcopy(stream), snapshot_after=None)
+    stream_analysis = out["results"][4]["impact_analysis"]
+
+    engine = Engine()
+    engine.handle_line(add("e1", "i1", "SELL", "ICEBERG", 9, 100, display_quantity=2))
+    engine.handle_line(add("e2", "s2", "SELL", "LIMIT", 3, 100))
+    engine.handle_line(add("e3", "s3", "SELL", "LIMIT", 4, 101))
+    engine.handle_line(add("e4", "s4", "SELL", "LIMIT", 2, 102))
+    *_, engine_analysis = query(engine, impact_line("q1", "BUY", 15, 100))
+    assert stream_analysis == engine_analysis
+
+
+def test_stream_impact_iceberg_replenishes_at_level_tail():
+    out = replay_events(
+        [
+            m_iceberg("e1", "AAA", 1, "i1", "SELL", 4, 100, 2),
+            m_add("e2", "AAA", 2, "s2", "SELL", "LIMIT", 3, 100),
+            m_add("e3", "AAA", 3, "s3", "SELL", "LIMIT", 3, 101),
+            m_impact("q1", "AAA", 4, "BUY", 8, 100),
+        ],
+        snapshot_after=None,
+    )
+    assert out["results"][3]["impact_analysis"]["price_breakdown"] == [
+        {"price": 100, "quantity": 2},
+        {"price": 100, "quantity": 3},
+        {"price": 100, "quantity": 2},
+        {"price": 101, "quantity": 1},
+    ]
+
+
+def test_stream_impact_partial_fill_and_empty_book():
+    out = replay_events(
+        _ask_book_stream()
+        + [m_impact("q1", "AAA", 3, "BUY", 100, 100)],
+        snapshot_after=None,
+    )
+    analysis = out["results"][2]["impact_analysis"]
+    assert (analysis["executable_quantity"], analysis["unfilled_quantity"]) == (8, 92)
+    assert analysis["executed_notional"] == 803
+    assert analysis["vwap"] == {"numerator": 803, "denominator": 8}
+    assert analysis["impact_notional"] == 3
+
+    # A sell finds no bids in the ask-only book.
+    out = replay_events(
+        _ask_book_stream("BBB")
+        + [m_impact("q2", "BBB", 3, "SELL", 4, 102)],
+        snapshot_after=None,
+    )
+    analysis = out["results"][2]["impact_analysis"]
+    assert analysis == {
+        "side": "SELL",
+        "requested_quantity": 4,
+        "benchmark_price": 102,
+        "executable_quantity": 0,
+        "unfilled_quantity": 4,
+        "executed_notional": 0,
+        "best_price": None,
+        "vwap": None,
+        "slippage_notional": 0,
+        "impact_notional": 0,
+        "price_breakdown": [],
+    }
+
+
+def test_stream_impact_on_first_seen_symbol_succeeds_against_empty_book():
+    out = replay_events(
+        [m_impact("q1", "ZZZ", 1, "BUY", 7, 50)]
+    )
+    r = out["results"][0]
+    assert (r["status"], r["result"]) == (ACCEPTED, "REPORTED")
+    assert r["bids"] == [] and r["asks"] == []
+    analysis = r["impact_analysis"]
+    assert analysis["executable_quantity"] == 0
+    assert analysis["unfilled_quantity"] == 7
+    assert analysis["best_price"] is None and analysis["vwap"] is None
+    # The well-formed query registered the symbol and advanced its sequence.
+    follow = replay_events(
+        [m_impact("q2", "ZZZ", 2, "SELL", 1, 60)],
+        snapshot=out["snapshot"],
+        snapshot_after=None,
+    )
+    assert follow["results"][0]["status"] == ACCEPTED
+
+
+def test_stream_impact_uses_envelope_symbol_book_only():
+    out = replay_events(
+        [
+            m_add("e1", "AAA", 1, "s1", "SELL", "LIMIT", 5, 100),
+            m_add("e2", "BBB", 1, "w1", "SELL", "LIMIT", 2, 50),
+            m_impact("q1", "AAA", 2, "BUY", 9, 100),
+            m_impact("q2", "BBB", 2, "BUY", 9, 50),
+        ],
+        snapshot_after=None,
+    )
+    aaa = out["results"][2]["impact_analysis"]
+    bbb = out["results"][3]["impact_analysis"]
+    assert (aaa["executable_quantity"], aaa["executed_notional"]) == (5, 500)
+    assert (bbb["executable_quantity"], bbb["executed_notional"]) == (2, 100)
+    assert out["results"][2]["asks"] == [{"price": 100, "quantity": 5}]
+    assert out["results"][3]["asks"] == [{"price": 50, "quantity": 2}]
+
+
+# -- read-only guarantees ----------------------------------------------------
+
+
+def test_stream_impact_changes_no_matching_state():
+    stream = [
+        m_iceberg("e1", "AAA", 1, "i1", "SELL", 9, 100, 2),
+        m_add("e2", "AAA", 2, "s2", "SELL", "LIMIT", 3, 100),
+        m_add("e3", "AAA", 3, "s3", "SELL", "LIMIT", 4, 101),
+        m_add("e4", "BBB", 1, "w1", "BUY", "LIMIT", 6, 40),
+    ]
+    queries = [
+        m_impact("q1", "AAA", 4, "BUY", 20, 100),
+        m_impact("q2", "AAA", 5, "SELL", 20, 100),
+        m_impact("q3", "BBB", 2, "SELL", 20, 40),
+    ]
+    before = replay_events(copy.deepcopy(stream))
+    after = replay_events(copy.deepcopy(stream) + queries)
+
+    def strip_query_records(snapshot):
+        doc = copy.deepcopy(snapshot)
+        doc["content"]["events"] = []
+        for symbol in doc["content"]["symbols"]:
+            symbol["state"]["event_log"] = []
+            symbol["state"]["last_sequence"] = 0
+        doc["content_digest"] = ""
+        return doc
+
+    assert canonical_json(strip_query_records(after["snapshot"])) == canonical_json(
+        strip_query_records(before["snapshot"])
+    )
+
+    # The queries' own ids live solely in the replay log, never in the engine
+    # journal; the trade id counter did not move.
+    snap = after["snapshot"]["content"]["symbols"]
+    for symbol in snap:
+        engine = symbol["state"]["engine"]
+        assert set(engine["event_ids"]).isdisjoint({"q1", "q2", "q3"})
+        assert engine["next_trade_id"] == 1
+
+
+def test_stream_impact_ignores_self_trade_prevention():
+    out = replay_events(
+        [
+            m_add("e1", "AAA", 1, "s1", "SELL", "LIMIT", 4, 100, account_id="A"),
+            m_impact("q1", "AAA", 2, "BUY", 4, 100),
+        ],
+        snapshot_after=None,
+    )
+    r = out["results"][1]
+    assert (r["status"], r["result"]) == (ACCEPTED, "REPORTED")
+    assert "self_trade_prevention" not in r
+    assert r["impact_analysis"]["executable_quantity"] == 4
+    assert r["trades"] == []
+    # The tagged resting order is untouched and still visible.
+    assert r["asks"] == [{"price": 100, "quantity": 4}]
+
+
+def test_stream_impact_is_not_blocked_by_active_price_limits():
+    # Rest the book first, then narrow the active band below its prices:
+    # new priced orders would be rejected, the read-only query is not.
+    out = replay_events(
+        [
+            m_add("e1", "AAA", 1, "s1", "SELL", "LIMIT", 3, 100),
+            m_add("e2", "AAA", 2, "s2", "SELL", "LIMIT", 2, 101),
+            {
+                "event_id": "u1", "symbol": "AAA", "sequence": 3,
+                "type": "PRICE_LIMIT_UPDATE", "lower_price": 500, "upper_price": 600,
+            },
+            m_impact("q1", "AAA", 4, "BUY", 5, 100),
+            # Sanity: a priced order at the book's prices is now blocked, so
+            # the accepted impact is demonstrably exempt from the band.
+            m_add("e3", "AAA", 5, "s3", "SELL", "LIMIT", 1, 100),
+        ],
+        snapshot_after=None,
+    )
+    assert out["results"][3]["status"] == ACCEPTED
+    assert out["results"][3]["impact_analysis"]["executable_quantity"] == 5
+    assert out["results"][4]["rejection_code"] == "PRICE_LIMIT_EXCEEDED"
+    assert out["results"][3]["asks"] == [
+        {"price": 100, "quantity": 3},
+        {"price": 101, "quantity": 2},
+    ]
+
+
+# -- schema validation -------------------------------------------------------
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda e: e.pop("side"),
+    lambda e: e.pop("quantity"),
+    lambda e: e.pop("benchmark_price"),
+    lambda e: e.pop("type"),
+    lambda e: e.update(side="LONG"),
+    lambda e: e.update(side="buy"),
+    lambda e: e.update(side=1),
+    lambda e: e.update(side=None),
+    lambda e: e.update(quantity=True),
+    lambda e: e.update(quantity=False),
+    lambda e: e.update(quantity=0),
+    lambda e: e.update(quantity=-2),
+    lambda e: e.update(quantity=1.5),
+    lambda e: e.update(quantity="3"),
+    lambda e: e.update(quantity=None),
+    lambda e: e.update(benchmark_price=True),
+    lambda e: e.update(benchmark_price=0),
+    lambda e: e.update(benchmark_price=-1),
+    lambda e: e.update(benchmark_price=1.5),
+    lambda e: e.update(benchmark_price="100"),
+    lambda e: e.update(benchmark_price=None),
+    lambda e: e.update(order_id="o1"),
+])
+def test_stream_malformed_inline_impact_is_invalid(mutation):
+    event = m_impact("q1", "AAA", 2, "BUY", 3, 100)
+    mutation(event)
+    out = replay_events(
+        _ask_book_stream() + [event],
+        snapshot_after=None,
+    )
+    r = out["results"][2]
+    assert (r["status"], r["rejection_code"]) == (REJECTED, INVALID_EVENT)
+    assert "impact_analysis" not in r
+    # The untouched book is echoed and no id/sequence was consumed.
+    assert r["asks"] == [
+        {"price": 100, "quantity": 5},
+        {"price": 101, "quantity": 3},
+    ]
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda e: e["event"].pop("side"),
+    lambda e: e["event"].update(quantity=0),
+    lambda e: e["event"].update(benchmark_price="100"),
+    lambda e: e["event"].update(extra=1),
+    lambda e: e.update(extra=1),
+])
+def test_stream_malformed_nested_impact_is_invalid(mutation):
+    event = m_impact_nested("q1", "AAA", 2, "BUY", 3, 100)
+    mutation(event)
+    out = replay_events(_ask_book_stream() + [event], snapshot_after=None)
+    assert out["results"][2]["rejection_code"] == INVALID_EVENT
+
+
+def test_stream_nested_impact_event_id_mismatch_is_invalid():
+    event = m_impact_nested("q1", "AAA", 2, "BUY", 3, 100)
+    event["event"]["event_id"] = "other"
+    out = replay_events(_ask_book_stream() + [event], snapshot_after=None)
+    assert out["results"][2]["rejection_code"] == INVALID_EVENT
+
+
+def test_stream_invalid_impact_consumes_neither_id_nor_sequence():
+    out = replay_events(
+        _ask_book_stream()
+        + [
+            m_impact("q1", "AAA", 3, "LONG", 3, 100),
+            m_impact("q1", "AAA", 3, "BUY", 3, 100),
+        ],
+        snapshot_after=None,
+    )
+    assert out["results"][2]["rejection_code"] == INVALID_EVENT
+    assert out["results"][3]["status"] == ACCEPTED
+
+
+def test_stream_invalid_impact_on_unknown_symbol_does_not_create_it():
+    invalid = m_impact("q1", "ZZZ", 1, "BUY", 3, 100)
+    invalid["side"] = "LONG"
+    out = replay_events(
+        [
+            invalid,
+            m_impact("q2", "ZZZ", 1, "BUY", 3, 100),
+        ],
+        snapshot_after=None,
+    )
+    assert out["results"][0]["rejection_code"] == INVALID_EVENT
+    # Sequence 1 was not consumed and the symbol was not created...
+    assert out["results"][0]["bids"] == [] and out["results"][0]["asks"] == []
+    assert out["results"][1]["status"] == ACCEPTED
+
+
+# -- idempotency, conflicts and ordering -------------------------------------
+
+
+def test_stream_impact_duplicate_is_idempotent_with_stale_sequence():
+    query = m_impact("q1", "AAA", 3, "BUY", 6, 99)
+    out = replay_events(_ask_book_stream() + [query])
+    repeat = replay_events([query], snapshot=out["snapshot"], snapshot_after=None)
+    r = repeat["results"][0]
+    assert r["status"] == DUPLICATE
+    assert r["trades"] == []
+    assert r["book_changes"] == {"bids": [], "asks": []}
+    assert "impact_analysis" not in r
+    assert r["asks"] == [
+        {"price": 100, "quantity": 5},
+        {"price": 101, "quantity": 3},
+    ]
+    # Sequence stayed at 3: the next in-sequence event is accepted.
+    follow = replay_events(
+        [m_impact("q2", "AAA", 4, "BUY", 1, 100)],
+        snapshot=out["snapshot"],
+        snapshot_after=None,
+    )
+    assert follow["results"][0]["status"] == ACCEPTED
+
+
+def test_stream_impact_same_id_different_content_or_symbol_conflicts():
+    out = replay_events(
+        _ask_book_stream()
+        + [
+            m_impact("q1", "AAA", 3, "BUY", 6, 99),
+            m_impact("q1", "AAA", 4, "BUY", 6, 100),
+            m_impact("q1", "BBB", 1, "BUY", 6, 99),
+            m_impact("q2", "AAA", 4, "BUY", 1, 100),
+        ],
+        snapshot_after=None,
+    )
+    assert out["results"][3]["rejection_code"] == EVENT_ID_CONFLICT
+    assert out["results"][4]["rejection_code"] == EVENT_ID_CONFLICT
+    # Conflicts consume neither the id nor the sequence.
+    assert out["results"][5]["status"] == ACCEPTED
+
+
+def test_stream_impact_sequence_gap_and_out_of_order():
+    out = replay_events(
+        _ask_book_stream()
+        + [
+            m_impact("q1", "AAA", 5, "BUY", 1, 100),
+            m_impact("q2", "AAA", 2, "BUY", 1, 100),
+            m_impact("q3", "AAA", 3, "BUY", 1, 100),
+        ],
+        snapshot_after=None,
+    )
+    assert out["results"][2]["rejection_code"] == SEQUENCE_GAP
+    assert out["results"][2]["expected_sequence"] == 3
+    assert out["results"][3]["rejection_code"] == OUT_OF_ORDER
+    assert out["results"][3]["expected_sequence"] == 3
+    # Neither consumed its slot.
+    assert out["results"][4]["status"] == ACCEPTED
+
+
+# -- determinism, snapshots and the events CLI -------------------------------
+
+
+def _impact_rich_stream():
+    return [
+        m_iceberg("e1", "AAA", 1, "i1", "SELL", 9, 100, 2),
+        m_add("e2", "AAA", 2, "s2", "SELL", "LIMIT", 3, 100, account_id="fund"),
+        m_add("e3", "AAA", 3, "s3", "SELL", "LIMIT", 4, 101),
+        m_add("b1", "BBB", 1, "w1", "SELL", "LIMIT", 3, 50),
+        m_impact("q1", "AAA", 4, "BUY", 15, 100),
+        m_impact("q2", "AAA", 5, "SELL", 2, 102),
+        m_impact("q3", "BBB", 2, "BUY", 9, 50),
+        m_impact("q4", "CCC", 1, "BUY", 1, 70),
+    ]
+
+
+def test_stream_impact_output_is_byte_for_byte_deterministic():
+    a = canonical_json(replay_events(_impact_rich_stream()))
+    b = canonical_json(replay_events(copy.deepcopy(_impact_rich_stream())))
+    assert a == b
+    parsed = json.loads(a)
+
+    def no_floats(value):
+        if isinstance(value, float):
+            raise AssertionError("float leaked into output")
+        if isinstance(value, dict):
+            for item in value.values():
+                no_floats(item)
+        elif isinstance(value, list):
+            for item in value:
+                no_floats(item)
+
+    no_floats(parsed)
+
+
+def test_stream_impact_resumed_replay_matches_one_shot():
+    stream = _impact_rich_stream()
+    one_shot = replay_events(copy.deepcopy(stream))
+    # Split right after the first impact query.
+    snapshot = replay_events(copy.deepcopy(stream[:5]))["snapshot"]
+    segmented = replay_events(copy.deepcopy(stream[5:]), snapshot=snapshot)
+    assert canonical_json(segmented["results"]) == canonical_json(
+        one_shot["results"][5:]
+    )
+    assert canonical_json(segmented["snapshot"]) == canonical_json(
+        one_shot["snapshot"]
+    )
+
+
+def test_stream_impact_snapshot_roundtrip_and_post_restore_duplicate():
+    stream = _impact_rich_stream()
+    out = replay_events(copy.deepcopy(stream))
+    restored = restore_replayer(copy.deepcopy(out["snapshot"]))
+    assert canonical_json(export_snapshot(restored)) == canonical_json(out["snapshot"])
+    # The already-seen query stays a duplicate after restore.
+    duplicate = restored.submit([copy.deepcopy(stream[4])])[0]
+    assert duplicate["status"] == DUPLICATE
+    fresh = restored.submit([m_impact("q9", "AAA", 6, "BUY", 1, 100)])[0]
+    assert (fresh["status"], fresh["result"]) == (ACCEPTED, "REPORTED")
+
+
+def test_stream_impact_snapshot_after_named_query_event():
+    out = replay_events(
+        _impact_rich_stream(),
+        snapshot_after={"symbol": "AAA", "sequence": 4},
+    )
+    assert out["snapshot"]["format_version"] == FORMAT_VERSION
+    resumed = replay_events(
+        [m_impact("qx", "AAA", 5, "SELL", 1, 102)],
+        snapshot=out["snapshot"],
+        snapshot_after=None,
+    )
+    assert resumed["results"][0]["status"] == ACCEPTED
+
+
+def _run_events_cli(request_obj):
+    text = json.dumps(request_obj, ensure_ascii=False)
+    stdin = io.TextIOWrapper(io.BytesIO(text.encode("utf-8")))
+    stdout = io.TextIOWrapper(io.BytesIO())
+    stderr = io.StringIO()
+    code = event_cli.serve_events(stdin, stdout, stderr)
+    stdout.flush()
+    body = stdout.buffer.getvalue().decode("utf-8")
+    parsed = json.loads(body) if body else None
+    return code, parsed, stderr.getvalue()
+
+
+def test_cli_events_supports_impact_report_end_to_end():
+    code, out, err = _run_events_cli({
+        "events": _ask_book_stream()
+        + [
+            m_impact("q1", "AAA", 3, "BUY", 6, 99),
+            m_impact("q1", "AAA", 4, "BUY", 6, 99),
+        ]
+    })
+    assert code == 0
+    assert err == ""
+    reported, duplicate = out["results"][2], out["results"][3]
+    assert reported["status"] == ACCEPTED
+    assert reported["result"] == "REPORTED"
+    assert reported["impact_analysis"]["executable_quantity"] == 6
+    assert duplicate["status"] == DUPLICATE
+    assert "impact_analysis" not in duplicate
+    assert out["snapshot"]["format_version"] == FORMAT_VERSION
