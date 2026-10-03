@@ -13,7 +13,8 @@ matching rules, priorities, rejection semantics or trade record shapes:
   VWAP_START/VWAP_SLICE/VWAP_CANCEL/VWAP_REPORT), resumable POV parent
   orders (POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT), the read-only
   per-order EXECUTION_REPORT query, the read-only cross-security
-  PORTFOLIO_REPORT query, the read-only whole-session
+  PORTFOLIO_REPORT query, the read-only cross-security
+  PORTFOLIO_STRESS_REPORT scenario query, the read-only whole-session
   SESSION_RECONCILIATION query (which reconciles every security's
   trades and account books at once), the read-only per-plan
   PLAN_TCA_REPORT query (which prices a plan's implementation shortfall
@@ -118,6 +119,12 @@ PRICE_LIMIT_UPDATED = "PRICE_LIMIT_UPDATED"
 PORTFOLIO_REPORT = "PORTFOLIO_REPORT"
 MARK_PRICE_MISMATCH = "MARK_PRICE_MISMATCH"
 
+# Cross-security portfolio stress report event: a replay-only read-only query
+# that re-prices one account's existing fills under several caller-supplied
+# price scenarios. It shares PORTFOLIO_REPORT's account-knownness and
+# MARK_PRICE_MISMATCH / UNKNOWN_ACCOUNT business rules.
+PORTFOLIO_STRESS_REPORT = "PORTFOLIO_STRESS_REPORT"
+
 # Read-only whole-session reconciliation event. Unlike the baseline
 # single-security DAY_END_RECONCILIATION (which stays exclusive to the JSON
 # Lines entry point), this query reconciles every security of the session at
@@ -177,16 +184,19 @@ CONFIG_MISMATCH = "CONFIG_MISMATCH"
 #: what-if IMPACT_REPORT query join them here (ACCOUNT_REPORT and
 #: DAY_END_RECONCILIATION stay exclusive to the JSON Lines entry point),
 #: while the cross-security
-#: PORTFOLIO_REPORT query, the whole-session SESSION_RECONCILIATION query,
-#: the per-plan PLAN_TCA_REPORT query, the historical
-#: BOOK_RECONSTRUCTION_REPORT query and the intraday PRICE_LIMIT_UPDATE
-#: adjustment are exclusive to this layer.
+#: PORTFOLIO_REPORT query, the cross-security
+#: PORTFOLIO_STRESS_REPORT scenario query, the whole-session
+#: SESSION_RECONCILIATION query, the per-plan PLAN_TCA_REPORT query,
+#: the historical BOOK_RECONSTRUCTION_REPORT query and the intraday
+#: PRICE_LIMIT_UPDATE adjustment are exclusive to this layer.
 SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
      TWAP_START, TWAP_SLICE, TWAP_CANCEL, TWAP_REPORT,
      VWAP_START, VWAP_SLICE, VWAP_CANCEL, VWAP_REPORT,
      POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT,
-     EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
+     EXECUTION_REPORT, IMPACT_REPORT,
+     PORTFOLIO_REPORT, PORTFOLIO_STRESS_REPORT,
+     SESSION_RECONCILIATION,
      PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT, PRICE_LIMIT_UPDATE}
 )
 
@@ -198,6 +208,10 @@ _BASELINE_KEYS = frozenset(
 _PORTFOLIO_REPORT_KEYS = frozenset(
     {"event_id", "type", "account_id", "mark_prices"}
 )
+_PORTFOLIO_STRESS_REPORT_KEYS = frozenset(
+    {"event_id", "type", "account_id", "mark_prices", "scenarios"}
+)
+_STRESS_SCENARIO_KEYS = frozenset({"name", "prices"})
 _SESSION_RECONCILIATION_KEYS = frozenset(
     {"event_id", "type", "expected_trades", "expected_accounts"}
 )
@@ -259,12 +273,15 @@ _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES | _POV_TYPES
 #: Event types whose ids live solely in the replay log: parent-order commands
 #: never touch the engine journal, the per-order execution query, the
 #: per-symbol book-impact what-if query, the cross-security portfolio query
-#: and the whole-session reconciliation are read-only and matched by no
+#: and its scenario-based stress twin are read-only and matched by no
+#: engine, the whole-session reconciliation is read-only and matched by no
 #: engine, and a price-limit adjustment only rewrites replay-layer state.
 #: Baseline ADD/CANCEL/REPLACE ids occupy the per-symbol engine journal
 #: instead.
 _REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset(
-    {EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
+    {EXECUTION_REPORT, IMPACT_REPORT,
+     PORTFOLIO_REPORT, PORTFOLIO_STRESS_REPORT,
+     SESSION_RECONCILIATION,
      PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT, PRICE_LIMIT_UPDATE}
 )
 #: Accepted replay-only events that never move any state themselves: every
@@ -273,7 +290,9 @@ _REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset(
 #: nothing. PRICE_LIMIT_UPDATE is intentionally absent: it rewrites the
 #: active interval and must be replayed up to the target point.
 _REPLAY_NOOP_TYPES = frozenset(
-    {EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, SESSION_RECONCILIATION,
+    {EXECUTION_REPORT, IMPACT_REPORT,
+     PORTFOLIO_REPORT, PORTFOLIO_STRESS_REPORT,
+     SESSION_RECONCILIATION,
      PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT}
 )
 
@@ -492,6 +511,61 @@ def _portfolio_report_schema_error(payload: dict[str, object]) -> str | None:
         if not _is_non_empty_str(symbol):
             return INVALID_EVENT
         if not _is_positive_int(mark_price):
+            return INVALID_EVENT
+    return None
+
+
+def _portfolio_stress_report_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a PORTFOLIO_STRESS_REPORT query payload.
+
+    The query carries exactly ``event_id``, ``type``, ``account_id``,
+    ``mark_prices`` and ``scenarios``. The account id is a non-empty string.
+    Both price objects (``mark_prices`` and each scenario's ``prices``) map
+    non-empty symbol strings to positive integers (booleans do not count);
+    like PORTFOLIO_REPORT an empty price map is structurally legal and only
+    fails the later business check, since a known account always names at
+    least one security. ``scenarios`` is a non-empty array of objects holding
+    exactly a unique non-empty-string ``name`` and a ``prices`` object; an
+    empty array, a non-array, a non-object member, a missing or extra member
+    field, an empty or duplicated name or a malformed price is an
+    ``INVALID_EVENT``. Whether the account is known and whether the two price
+    objects' key sets actually cover exactly its securities remain business
+    checks (``UNKNOWN_ACCOUNT`` / ``MARK_PRICE_MISMATCH``): an INVALID_EVENT
+    consumes neither the event id nor the sequence, while the business
+    rejections do.
+    """
+    if set(payload) != _PORTFOLIO_STRESS_REPORT_KEYS:
+        return INVALID_EVENT
+    if not _is_non_empty_str(payload.get("account_id")):
+        return INVALID_EVENT
+
+    def price_map_error(price_map: object) -> str | None:
+        if not isinstance(price_map, dict):
+            return INVALID_EVENT
+        for symbol, price in price_map.items():
+            if not _is_non_empty_str(symbol):
+                return INVALID_EVENT
+            if not _is_positive_int(price):
+                return INVALID_EVENT
+        return None
+
+    mark_error = price_map_error(payload.get("mark_prices"))
+    if mark_error is not None:
+        return mark_error
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        return INVALID_EVENT
+    seen_names: set[str] = set()
+    for scenario in scenarios:
+        if not isinstance(scenario, dict) or set(scenario) != _STRESS_SCENARIO_KEYS:
+            return INVALID_EVENT
+        name = scenario.get("name")
+        if not _is_non_empty_str(name):
+            return INVALID_EVENT
+        if name in seen_names:
+            return INVALID_EVENT
+        seen_names.add(name)
+        if price_map_error(scenario.get("prices")) is not None:
             return INVALID_EVENT
     return None
 
@@ -1198,6 +1272,8 @@ class EventReplayer:
             schema_error = _pov_schema_error(payload)
         elif event_type == PORTFOLIO_REPORT:
             schema_error = _portfolio_report_schema_error(payload)
+        elif event_type == PORTFOLIO_STRESS_REPORT:
+            schema_error = _portfolio_stress_report_schema_error(payload)
         elif event_type == SESSION_RECONCILIATION:
             schema_error = _session_reconciliation_schema_error(payload)
         elif event_type == EXECUTION_REPORT:
@@ -1333,6 +1409,11 @@ class EventReplayer:
 
         if event_type == PORTFOLIO_REPORT:
             return self._dispatch_portfolio_report(
+                event_id, payload, state, symbol, sequence, content
+            )
+
+        if event_type == PORTFOLIO_STRESS_REPORT:
+            return self._dispatch_portfolio_stress_report(
                 event_id, payload, state, symbol, sequence, content
             )
 
@@ -1501,6 +1582,8 @@ class EventReplayer:
             return _TWAP_PLAN_REF_KEYS
         if inline_type == PORTFOLIO_REPORT:
             return _PORTFOLIO_REPORT_KEYS
+        if inline_type == PORTFOLIO_STRESS_REPORT:
+            return _PORTFOLIO_STRESS_REPORT_KEYS
         if inline_type == SESSION_RECONCILIATION:
             return _SESSION_RECONCILIATION_KEYS
         if inline_type == PLAN_TCA_REPORT:
@@ -2213,6 +2296,168 @@ class EventReplayer:
             "portfolio_analysis": analysis,
         }
 
+    # -- cross-security portfolio stress report -----------------------------
+
+    def _dispatch_portfolio_stress_report(
+        self,
+        event_id: str,
+        payload: dict[str, object],
+        state: _SymbolState,
+        symbol: str,
+        sequence: int,
+        content: str,
+    ) -> dict[str, object]:
+        """Answer a read-only multi-scenario portfolio stress query.
+
+        Like PORTFOLIO_REPORT the query only reads trades produced by earlier
+        accepted events: it never matches, never releases a plan slice and
+        never moves a book, a trade id, a plan or an account set. It values
+        the account's existing positions once at the caller-supplied baseline
+        ``mark_prices`` and then once per scenario price object; every figure
+        is an integer. Account-knownness and the business rejection rules are
+        exactly those of PORTFOLIO_REPORT, except that *every* price object —
+        ``mark_prices`` and each scenario's ``prices`` — must name exactly the
+        securities the account ever appeared on. Like every other structurally
+        valid event it occupies its event id and advances the envelope
+        symbol's sequence, including the ``UNKNOWN_ACCOUNT`` and
+        ``MARK_PRICE_MISMATCH`` business rejections. Its id lives solely in
+        the replay log, exactly like a PORTFOLIO_REPORT id.
+        """
+        account_id: str = payload["account_id"]
+        mark_prices: dict[str, object] = payload["mark_prices"]
+        scenarios: list[dict[str, object]] = payload["scenarios"]
+
+        def reject(code: str) -> dict[str, object]:
+            state.last_sequence = sequence
+            state.seen[event_id] = content
+            self._events[event_id] = (symbol, content)
+            bids, asks = state.engine.snapshot()
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "sequence": sequence,
+                "status": REJECTED,
+                "rejection_code": code,
+                "trades": [],
+                "book_changes": {"bids": [], "asks": []},
+                "bids": bids,
+                "asks": asks,
+            }
+
+        known_symbols = self._account_symbols(account_id)
+        if not known_symbols:
+            return reject(UNKNOWN_ACCOUNT)
+        # Both price objects must name exactly the securities the account ever
+        # appeared on: one missing or one extra key, in the baseline map or in
+        # any scenario, is the same business rejection as the plain portfolio
+        # query and still consumes the id and the sequence.
+        if set(mark_prices) != known_symbols:
+            return reject(MARK_PRICE_MISMATCH)
+        for scenario in scenarios:
+            if set(scenario["prices"]) != known_symbols:
+                return reject(MARK_PRICE_MISMATCH)
+
+        # Per-security baseline figures from the existing fills; the same
+        # account attribution as PORTFOLIO_REPORT (maker, taker, replaced and
+        # iceberg-replenished trades, plus released plan child fills).
+        books: dict[str, dict[str, int]] = {}
+        for sym in sorted(known_symbols):
+            engine = self._symbols[sym].engine
+            buy_quantity, sell_quantity, buy_notional, sell_notional = (
+                engine.account_aggregates(account_id)
+            )
+            net_position = buy_quantity - sell_quantity
+            cash_balance = sell_notional - buy_notional
+            base_price = mark_prices[sym]
+            books[sym] = {
+                "net_position": net_position,
+                "cash_balance": cash_balance,
+                "base_price": base_price,
+            }
+
+        baseline_positions: list[dict[str, object]] = []
+        baseline_pnl = 0
+        baseline_exposure = 0
+        for sym in sorted(known_symbols):
+            book = books[sym]
+            net_position = book["net_position"]
+            cash_balance = book["cash_balance"]
+            base_price = book["base_price"]
+            market_value = net_position * base_price
+            pnl = cash_balance + market_value
+            baseline_positions.append({
+                "symbol": sym,
+                "mark_price": base_price,
+                "net_position": net_position,
+                "cash_balance": cash_balance,
+                "position_market_value": market_value,
+                "mark_to_market_pnl": pnl,
+            })
+            baseline_pnl += pnl
+            baseline_exposure += abs(net_position) * base_price
+
+        scenario_results: list[dict[str, object]] = []
+        for scenario in scenarios:
+            name: str = scenario["name"]
+            prices: dict[str, object] = scenario["prices"]
+            positions: list[dict[str, object]] = []
+            total_pnl_change = 0
+            stressed_exposure = 0
+            for sym in sorted(known_symbols):
+                book = books[sym]
+                net_position = book["net_position"]
+                shocked_price = prices[sym]
+                pnl_change = net_position * (shocked_price - book["base_price"])
+                positions.append({
+                    "symbol": sym,
+                    "shocked_price": shocked_price,
+                    "net_position": net_position,
+                    "pnl_change": pnl_change,
+                })
+                total_pnl_change += pnl_change
+                stressed_exposure += abs(net_position) * shocked_price
+            scenario_results.append({
+                "name": name,
+                "positions": positions,
+                "stressed_mark_to_market_pnl": baseline_pnl + total_pnl_change,
+                "risk_exposure": stressed_exposure,
+                "total_pnl_change": total_pnl_change,
+            })
+
+        # The worst scenario has the smallest total pnl change; an exact tie
+        # resolves on the scenario name in lexicographic order.
+        worst_name = min(
+            scenario_results, key=lambda item: (item["total_pnl_change"], item["name"])
+        )["name"]
+
+        analysis: dict[str, object] = {
+            "account_id": account_id,
+            "baseline": {
+                "positions": baseline_positions,
+                "mark_to_market_pnl": baseline_pnl,
+                "risk_exposure": baseline_exposure,
+            },
+            "scenarios": scenario_results,
+            "worst_scenario": worst_name,
+        }
+
+        state.last_sequence = sequence
+        state.seen[event_id] = content
+        self._events[event_id] = (symbol, content)
+        bids, asks = state.engine.snapshot()
+        return {
+            "event_id": event_id,
+            "symbol": symbol,
+            "sequence": sequence,
+            "status": ACCEPTED,
+            "result": REPORTED,
+            "trades": [],
+            "book_changes": {"bids": [], "asks": []},
+            "bids": bids,
+            "asks": asks,
+            "portfolio_stress_analysis": analysis,
+        }
+
     # -- whole-session reconciliation ----------------------------------------
 
     def _actual_session_trades(
@@ -2509,7 +2754,8 @@ class EventReplayer:
         sequence order — every entry of ``state.seen`` is one committed
         sequence, in first-seen order. The accepted read-only reports
         (EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT,
-        SESSION_RECONCILIATION, PLAN_TCA_REPORT and earlier
+        PORTFOLIO_STRESS_REPORT, SESSION_RECONCILIATION,
+        PLAN_TCA_REPORT and earlier
         BOOK_RECONSTRUCTION_REPORT queries) occupied a sequence without
         moving anything, so they are committed to the scratch session as
         pure id/sequence markers and never re-dispatched (which also keeps a
@@ -2988,7 +3234,8 @@ def _engine_from_json(
     # replay-only events: the engine journal only knows the former plus the
     # child orders synthesized for released slices, while every TWAP/VWAP/POV
     # command id, every read-only EXECUTION_REPORT / IMPACT_REPORT id and
-    # every PORTFOLIO_REPORT id lives solely in the replay log.
+    # every PORTFOLIO_REPORT / PORTFOLIO_STRESS_REPORT id lives solely in the
+    # replay log.
     baseline_event_ids: set[str] = set()
     replay_only_event_ids: set[str] = set()
     for event_id, content in seen.items():
@@ -3514,7 +3761,8 @@ def replay_events(
         POV_START/POV_VOLUME/POV_CANCEL/POV_REPORT commands, the read-only
         per-order EXECUTION_REPORT query, the read-only per-symbol
         IMPACT_REPORT what-if query, the read-only cross-security
-        PORTFOLIO_REPORT query, the read-only whole-session
+        PORTFOLIO_REPORT query, the read-only cross-security
+        PORTFOLIO_STRESS_REPORT scenario query, the read-only whole-session
         SESSION_RECONCILIATION query, the read-only per-plan
         PLAN_TCA_REPORT query, the read-only historical
         BOOK_RECONSTRUCTION_REPORT query and the intraday PRICE_LIMIT_UPDATE
