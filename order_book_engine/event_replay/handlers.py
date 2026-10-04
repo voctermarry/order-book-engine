@@ -20,6 +20,7 @@ from ..engine import (
     ICEBERG,
     IOC,
     LIMIT,
+    INVALID_SCHEMA,
     MISSING_ACTUAL,
     MISSING_EXPECTED,
     RECONCILED,
@@ -75,8 +76,24 @@ def apply_baseline(
     if reason is None:
         return _Applied(ACCEPTED, result=engine_result, trades=trades)
     # Baseline business rejection codes (UNKNOWN_ORDER, DUPLICATE_ORDER_ID,
-    # ...) are preserved verbatim.
-    return _Applied(REJECTED, code=reason, trades=trades)
+    # ...) are preserved verbatim. The replay log commit occupying the id and
+    # sequence already happened; the per-symbol engine journal must name
+    # exactly the same baseline events for an exported snapshot to restore.
+    # Almost every business rejection occupies its engine event id through the
+    # regular engine path (the id is spent before the business rule runs). The
+    # single pre-commit exception is the REPLACE rule that forbids
+    # display_quantity on a plain resting target: the baseline engine rejects
+    # it before spending its own journal id, so the replay layer occupies that
+    # journal id here, exactly as it does for a pre-matching price-limit
+    # rejection. The replay-only id/sequence commit is unaffected either way.
+    occupy_engine_id = (
+        ctx.event_type == REPLACE
+        and reason == INVALID_SCHEMA
+        and "display_quantity" in payload
+        and state.engine.replace_target_kind(payload["order_id"]) == "plain"
+    )
+    return _Applied(REJECTED, code=reason, trades=trades,
+                    occupy_engine_id=occupy_engine_id)
 
 
 # -- active per-security price limits ------------------------------------------
