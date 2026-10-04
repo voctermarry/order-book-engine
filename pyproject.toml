@@ -16,4 +16,4 @@ dev = ["pytest>=8"]
 order-book-engine = "order_book_engine.cli:main"
 
 [tool.setuptools]
-packages = ["order_book_engine"]
+packages = ["order_book_engine", "order_book_engine.event_replay"]
