@@ -23,8 +23,8 @@ band, one without that gets a band intraday):
   then cancelled, a completing market VWAP and a market POV with a positive
   release, a zero release and a cancel;
 * the whole read-only report family (execution, impact, portfolio,
-  portfolio-stress, session reconciliation, plan TCA and historical book
-  reconstruction);
+  portfolio-stress, session reconciliation, plan TCA, historical book
+  reconstruction and current-book liquidity depth);
 * every documented committed and non-committed failure: structurally
   invalid envelopes, a sequence gap, a stale sequence, a verbatim duplicate
   delivery, an event-id conflict, unknown order / plan targets, a duplicate
@@ -63,6 +63,7 @@ import pytest
 
 from order_book_engine import (
     ACCEPTED,
+    BOOK_LIQUIDITY_REPORT,
     BOOK_RECONSTRUCTION_REPORT,
     CONFIG_MISMATCH,
     DUPLICATE,
@@ -691,6 +692,17 @@ class StreamGenerator:
             # One beyond the sequence currently committed: rejected.
             tail_emit({"type": BOOK_RECONSTRUCTION_REPORT,
                        "target_sequence": sg.seq + 1})
+            # Current-book depth summaries: a single touch, the whole visible
+            # depth and a depth beyond the number of resting levels.
+            liquidity_one = tail_emit({"type": BOOK_LIQUIDITY_REPORT,
+                                       "depth": 1})
+            assert liquidity_one["result"] == "REPORTED"
+            assert liquidity_one["liquidity_analysis"]["depth"] == 1
+            liquidity_all = tail_emit({"type": BOOK_LIQUIDITY_REPORT,
+                                       "depth": 20})
+            assert liquidity_all["result"] == "REPORTED"
+            assert len(liquidity_all["liquidity_analysis"]["bid_levels"]) <= 20
+            assert len(liquidity_all["liquidity_analysis"]["ask_levels"]) <= 20
             tail_emit({"type": PLAN_TCA_REPORT, "plan_id": twap_pid,
                        "mark_price": central})
             tail_emit({"type": PLAN_TCA_REPORT,
@@ -966,6 +978,20 @@ def test_generated_stream_hits_every_documented_outcome(seed):
     assert "MARK_PRICE_MISMATCH" in codes
     assert "RECONCILED" in outcomes
     assert "BREAKS_FOUND" in outcomes
+
+    # The current-book liquidity queries in the tail were all accepted and
+    # echoed their requested depth.
+    liquidity_results = [
+        result for event, result in zip(stream.events, results)
+        if event.get("type") == BOOK_LIQUIDITY_REPORT
+    ]
+    assert liquidity_results
+    for result in liquidity_results:
+        assert result["status"] == ACCEPTED
+        assert result["result"] == "REPORTED"
+        assert result["trades"] == []
+        assert result["book_changes"] == {"bids": [], "asks": []}
+        assert result["liquidity_analysis"]["depth"] in (1, 20)
 
     # Every security genuinely trades.
     grouped = trades_by_symbol(results)
@@ -1327,6 +1353,7 @@ READ_ONLY_PROBES = (
     SESSION_RECONCILIATION,
     PLAN_TCA_REPORT,
     BOOK_RECONSTRUCTION_REPORT,
+    BOOK_LIQUIDITY_REPORT,
 )
 
 
@@ -1351,6 +1378,8 @@ def probe_payload(kind, symbol, sequence, counter):
     elif kind == PLAN_TCA_REPORT:
         payload.update(plan_id=f"{symbol}.injected.ghost",
                        mark_price=central)
+    elif kind == BOOK_LIQUIDITY_REPORT:
+        payload.update(depth=3)
     else:
         payload.update(target_sequence=0)
     return payload

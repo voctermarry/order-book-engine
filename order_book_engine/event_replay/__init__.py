@@ -25,7 +25,9 @@ matching rules, priorities, rejection semantics or trade record shapes:
   market order's executable quantity and cost against one security's
   current book), the read-only historical BOOK_RECONSTRUCTION_REPORT
   query (which rebuilds one security's price-time queues as of a
-  previously committed sequence) and the intraday
+  previously committed sequence), the read-only
+  BOOK_LIQUIDITY_REPORT query (which summarizes one security's current
+  public book depth) and the intraday
   PRICE_LIMIT_UPDATE adjustment, which replaces one security's active price-limit interval
   (seeded from the static ``price_limits`` configuration) for all
   subsequently submitted limit prices; plans never read a wall clock and
@@ -103,6 +105,7 @@ from .constants import (  # noqa: F401
     ALGORITHM_POV,
     ALGORITHM_TWAP,
     ALGORITHM_VWAP,
+    BOOK_LIQUIDITY_REPORT,
     BOOK_RECONSTRUCTION_REPORT,
     CONFIG_MISMATCH,
     DEFAULT_CONFIG,
@@ -158,6 +161,7 @@ from .state import (  # noqa: F401
 )
 from .validation import (  # noqa: F401
     _allocate_slices,
+    _book_liquidity_report_schema_error,
     _book_reconstruction_schema_error,
     _execution_report_schema_error,
     _impact_report_schema_error,

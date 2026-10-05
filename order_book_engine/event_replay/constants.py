@@ -78,6 +78,12 @@ PLAN_TCA_REPORT = "PLAN_TCA_REPORT"
 BOOK_RECONSTRUCTION_REPORT = "BOOK_RECONSTRUCTION_REPORT"
 TARGET_SEQUENCE_NOT_FOUND = "TARGET_SEQUENCE_NOT_FOUND"
 
+# Read-only per-symbol book-depth liquidity summary. A replay-only query
+# like BOOK_RECONSTRUCTION_REPORT: it answers against the envelope symbol's
+# current book, never reaches the baseline engine or the JSON Lines entry
+# point, and the baseline rejects the type as INVALID_SCHEMA.
+BOOK_LIQUIDITY_REPORT = "BOOK_LIQUIDITY_REPORT"
+
 # TWAP event types.
 TWAP_START = "TWAP_START"
 TWAP_SLICE = "TWAP_SLICE"
@@ -122,7 +128,8 @@ CONFIG_MISMATCH = "CONFIG_MISMATCH"
 #: PORTFOLIO_REPORT query, the cross-security PORTFOLIO_STRESS_REPORT query,
 #: the whole-session SESSION_RECONCILIATION query,
 #: the per-plan PLAN_TCA_REPORT query, the historical
-#: BOOK_RECONSTRUCTION_REPORT query and the intraday PRICE_LIMIT_UPDATE
+#: BOOK_RECONSTRUCTION_REPORT query, the per-symbol current-book
+#: BOOK_LIQUIDITY_REPORT query and the intraday PRICE_LIMIT_UPDATE
 #: adjustment are exclusive to this layer.
 SUPPORTED_TYPES = frozenset(
     {ADD, CANCEL, REPLACE,
@@ -131,7 +138,8 @@ SUPPORTED_TYPES = frozenset(
      POV_START, POV_VOLUME, POV_CANCEL, POV_REPORT,
      EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, PORTFOLIO_STRESS_REPORT,
      SESSION_RECONCILIATION,
-     PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT, PRICE_LIMIT_UPDATE}
+     PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT, BOOK_LIQUIDITY_REPORT,
+     PRICE_LIMIT_UPDATE}
 )
 
 _ENVELOPE_KEYS = frozenset({"event_id", "symbol", "sequence", "timestamp"})
@@ -160,6 +168,9 @@ _PLAN_TCA_REPORT_KEYS = frozenset(
 )
 _BOOK_RECONSTRUCTION_REPORT_KEYS = frozenset(
     {"event_id", "type", "target_sequence"}
+)
+_BOOK_LIQUIDITY_REPORT_KEYS = frozenset(
+    {"event_id", "type", "depth"}
 )
 _EXECUTION_REPORT_KEYS = frozenset(
     {"event_id", "type", "order_id", "benchmark_price"}
@@ -207,15 +218,17 @@ _PLAN_TYPES = _TWAP_TYPES | _VWAP_TYPES | _POV_TYPES
 #: Event types whose ids live solely in the replay log: parent-order commands
 #: never touch the engine journal, the per-order execution query, the
 #: per-symbol book-impact what-if query, the cross-security portfolio and
-#: portfolio-stress queries
-#: and the whole-session reconciliation are read-only and matched by no
+#: portfolio-stress queries,
+#: the whole-session reconciliation, the historical reconstruction and the
+#: per-symbol liquidity depth summary are read-only and matched by no
 #: engine, and a price-limit adjustment only rewrites replay-layer state.
 #: Baseline ADD/CANCEL/REPLACE ids occupy the per-symbol engine journal
 #: instead.
 _REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset(
     {EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, PORTFOLIO_STRESS_REPORT,
      SESSION_RECONCILIATION,
-     PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT, PRICE_LIMIT_UPDATE}
+     PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT, BOOK_LIQUIDITY_REPORT,
+     PRICE_LIMIT_UPDATE}
 )
 #: Accepted replay-only events that never move any state themselves: every
 #: read-only report. A historical reconstruction rebuild replays the logged
@@ -225,7 +238,7 @@ _REPLAY_ONLY_TYPES = _PLAN_TYPES | frozenset(
 _REPLAY_NOOP_TYPES = frozenset(
     {EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT, PORTFOLIO_STRESS_REPORT,
      SESSION_RECONCILIATION,
-     PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT}
+     PLAN_TCA_REPORT, BOOK_RECONSTRUCTION_REPORT, BOOK_LIQUIDITY_REPORT}
 )
 
 DEFAULT_CONFIG: dict[str, object] = {

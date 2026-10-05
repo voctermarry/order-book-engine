@@ -24,6 +24,7 @@ from ..engine import (
     Engine,
 )
 from .constants import (
+    BOOK_LIQUIDITY_REPORT,
     BOOK_RECONSTRUCTION_REPORT,
     PLAN_TCA_REPORT,
     PORTFOLIO_REPORT,
@@ -44,6 +45,7 @@ from .constants import (
     VWAP_SLICE,
     VWAP_START,
     _BASELINE_KEYS,
+    _BOOK_LIQUIDITY_REPORT_KEYS,
     _BOOK_RECONSTRUCTION_REPORT_KEYS,
     _EXECUTION_REPORT_KEYS,
     _IMPACT_REPORT_KEYS,
@@ -62,6 +64,7 @@ from .constants import (
 )
 from .handlers import (
     apply_baseline,
+    apply_book_liquidity_report,
     apply_execution_report,
     apply_impact_report,
     apply_plan,
@@ -73,6 +76,7 @@ from .handlers import (
 )
 from .history import apply_book_reconstruction_report
 from .validation import (
+    _book_liquidity_report_schema_error,
     _book_reconstruction_schema_error,
     _execution_report_schema_error,
     _impact_report_schema_error,
@@ -189,6 +193,8 @@ KINDS: dict[str, EventKind] = {
          _PLAN_TCA_REPORT_KEYS, apply_plan_tca_report, {}),
         (BOOK_RECONSTRUCTION_REPORT, _book_reconstruction_schema_error,
          _BOOK_RECONSTRUCTION_REPORT_KEYS, apply_book_reconstruction_report, {}),
+        (BOOK_LIQUIDITY_REPORT, _book_liquidity_report_schema_error,
+         _BOOK_LIQUIDITY_REPORT_KEYS, apply_book_liquidity_report, {}),
     )
 }
 

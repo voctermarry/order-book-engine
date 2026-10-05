@@ -622,6 +622,96 @@ def apply_impact_report(
     )
 
 
+# -- per-symbol current-book depth summary ----------------------------------------
+
+
+def _liquidity_levels(
+    queues: list[dict[str, object]],
+    depth: int,
+) -> tuple[list[dict[str, object]], int]:
+    """Project at most ``depth`` levels of one already-ordered book side.
+
+    The input levels are bids in descending price order or asks in ascending
+    order, each carrying the side's public queue content; only the currently
+    visible queue participates, so an iceberg's hidden reserve is never
+    counted while its current slice is one queued order. Each returned level
+    carries its ``price``, the aggregate ``visible_quantity``, the
+    ``cumulative_visible_quantity`` across the returned levels and the
+    ``order_count`` of visible queued orders. Returns the levels and the
+    cumulative public quantity over them.
+    """
+    levels: list[dict[str, object]] = []
+    cumulative = 0
+    for level in queues[:depth]:
+        visible_quantity = level["visible_quantity"]
+        cumulative += visible_quantity
+        levels.append({
+            "price": level["price"],
+            "visible_quantity": visible_quantity,
+            "cumulative_visible_quantity": cumulative,
+            "order_count": len(level["orders"]),
+        })
+    return levels, cumulative
+
+
+def apply_book_liquidity_report(
+    session: object, ctx: _CommitContext, payload: dict[str, object]
+) -> _Applied:
+    """Answer a read-only depth summary of one security's current book.
+
+    The query only reads the envelope symbol's resting queues: it never
+    matches, never replenishes an iceberg slice and never moves an order, a
+    queue, a plan, an account set, the trade journal, a trade id or the
+    active price-limit interval. Only public queue content is summarized —
+    an iceberg's reserve never counts, while its current visible slice
+    counts as one order. The query has no business rejection codes: a
+    first-seen symbol answers against its empty book successfully. The
+    shared commit path occupies the query id and advances the symbol
+    sequence; the id lives solely in the replay log, exactly like an
+    IMPACT_REPORT id, and never enters the engine journal.
+    """
+    depth: int = payload["depth"]
+    bid_queues, ask_queues = ctx.state.engine.book_queue_view()
+    bid_levels, bid_volume = _liquidity_levels(bid_queues, depth)
+    ask_levels, ask_volume = _liquidity_levels(ask_queues, depth)
+
+    best_bid = bid_levels[0]["price"] if bid_levels else None
+    best_ask = ask_levels[0]["price"] if ask_levels else None
+    if best_bid is None or best_ask is None:
+        # With either side empty neither a spread nor a midpoint exists.
+        spread = None
+        midpoint = None
+    else:
+        spread = best_ask - best_bid
+        midpoint = {"numerator": best_bid + best_ask, "denominator": 2}
+
+    imbalance_denominator = bid_volume + ask_volume
+    if imbalance_denominator == 0:
+        imbalance: dict[str, int] | None = None
+    else:
+        # The unreduced exact fraction over the returned levels' cumulative
+        # public quantities: bid volume minus ask volume over their sum.
+        imbalance = {
+            "numerator": bid_volume - ask_volume,
+            "denominator": imbalance_denominator,
+        }
+
+    analysis = {
+        "depth": depth,
+        "bid_levels": bid_levels,
+        "ask_levels": ask_levels,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": spread,
+        "midpoint": midpoint,
+        "imbalance": imbalance,
+    }
+    return _Applied(
+        ACCEPTED, result=REPORTED,
+        analysis_key="liquidity_analysis", analysis=analysis,
+    )
+
+
 # -- cross-security portfolio report ----------------------------------------------
 
 

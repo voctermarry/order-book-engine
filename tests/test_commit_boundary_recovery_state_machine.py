@@ -34,7 +34,8 @@ Every generated track interleaves two securities and visits:
   cancel/replace target, a duplicate order id, an unknown plan command and a
   closed-plan cancel;
 * the read-only report family, including two
-  ``BOOK_RECONSTRUCTION_REPORT`` queries per symbol whose answers must be
+  ``BOOK_RECONSTRUCTION_REPORT`` queries and two
+  ``BOOK_LIQUIDITY_REPORT`` queries per symbol whose answers must be
   identical on the uninterrupted run and every recovery path, and which
   must never move a later trade, book or trade id;
 * the non-committed faults — a structurally invalid event, a sequence gap, a
@@ -56,6 +57,7 @@ import pytest
 
 from order_book_engine import (
     ACCEPTED,
+    BOOK_LIQUIDITY_REPORT,
     BOOK_RECONSTRUCTION_REPORT,
     DUPLICATE,
     EVENT_ID_CONFLICT,
@@ -290,9 +292,10 @@ class _Script:
         self.plan(TWAP_REPORT, twap)
 
         # 8) Read-only reports: execution query (known + unknown order),
-        #    impact what-if and two historical reconstructions (the empty
+        #    impact what-if, two historical reconstructions (the empty
         #    pre-session book and the immediately preceding committed slot;
-        #    the positive target is patched after sequencing).
+        #    the positive target is patched after sequencing) and two
+        #    current-book liquidity summaries (the touch only, and deeper).
         self.put({"type": EXECUTION_REPORT, "order_id": replace_target,
                   "benchmark_price": c})
         self.put({"type": EXECUTION_REPORT,
@@ -301,6 +304,8 @@ class _Script:
                   "benchmark_price": c})
         self.put({"type": BOOK_RECONSTRUCTION_REPORT, "target_sequence": 0})
         self.put({"type": BOOK_RECONSTRUCTION_REPORT, "target_sequence": 0})
+        self.put({"type": BOOK_LIQUIDITY_REPORT, "depth": 1})
+        self.put({"type": BOOK_LIQUIDITY_REPORT, "depth": 5})
 
         # 9) Further committed business rejections: duplicate baseline order
         #    id and an unknown-plan slice command.
@@ -628,11 +633,17 @@ def test_track_covers_every_required_outcome(seed):
     assert {"ADD", "CANCEL", "REPLACE", TWAP_START, TWAP_SLICE, TWAP_CANCEL,
             TWAP_REPORT, PRICE_LIMIT_UPDATE, EXECUTION_REPORT, IMPACT_REPORT,
             PLAN_TCA_REPORT, SESSION_RECONCILIATION,
-            BOOK_RECONSTRUCTION_REPORT} <= types
+            BOOK_RECONSTRUCTION_REPORT, BOOK_LIQUIDITY_REPORT} <= types
     assert any(ev.get("order_type") == ICEBERG for ev in tr.events)
     assert any(ev.get("time_in_force") == IOC for ev in tr.events)
     assert any(ev.get("time_in_force") == FOK for ev in tr.events)
     assert len(recon_answers(results)) == 2 * len(SYMBOLS)
+    liquidity_answers = [
+        r for r in results
+        if r.get("status") == ACCEPTED and "liquidity_analysis" in r
+    ]
+    assert len(liquidity_answers) == 2 * len(SYMBOLS)
+    assert {r["liquidity_analysis"]["depth"] for r in liquidity_answers} == {1, 5}
 
 
 # ---------------------------------------------------------------------------

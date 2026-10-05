@@ -38,8 +38,8 @@ def _reconstruct_book(
     sequence order — every entry of ``state.seen`` is one committed
     sequence, in first-seen order. The accepted read-only reports
     (EXECUTION_REPORT, IMPACT_REPORT, PORTFOLIO_REPORT,
-    PORTFOLIO_STRESS_REPORT, SESSION_RECONCILIATION, PLAN_TCA_REPORT and
-    earlier
+    PORTFOLIO_STRESS_REPORT, SESSION_RECONCILIATION, PLAN_TCA_REPORT,
+    BOOK_LIQUIDITY_REPORT and earlier
     BOOK_RECONSTRUCTION_REPORT queries) occupied a sequence without
     moving anything, so they are committed to the scratch session as
     pure id/sequence markers and never re-dispatched (which also keeps a

@@ -4,6 +4,7 @@ __version__ = "0.1.0"
 
 from .event_replay import (
     ACCEPTED,
+    BOOK_LIQUIDITY_REPORT,
     BOOK_RECONSTRUCTION_REPORT,
     CONFIG_MISMATCH,
     DUPLICATE,
@@ -56,6 +57,7 @@ from .event_replay import (
 
 __all__ = [
     "ACCEPTED",
+    "BOOK_LIQUIDITY_REPORT",
     "BOOK_RECONSTRUCTION_REPORT",
     "CONFIG_MISMATCH",
     "DUPLICATE",
