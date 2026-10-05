@@ -1075,3 +1075,90 @@ def apply_plan_tca_report(
         analysis_key="plan_tca_analysis",
         analysis=_plan_tca_analysis(plan, mark_price),
     )
+
+
+# -- read-only current-book depth summary ------------------------------------------
+
+
+def _liquidity_levels(
+    queued_levels: list[dict[str, object]], depth: int
+) -> tuple[list[dict[str, object]], int]:
+    """Project at most ``depth`` already-ordered queue levels for the report.
+
+    Only public queue quantities are aggregated: an iceberg's hidden reserve
+    never counts and its current visible fragment counts as exactly one
+    order, exactly as the queue projection presents it. Returns the capped
+    level list and the cumulative visible quantity across it.
+    """
+    levels: list[dict[str, object]] = []
+    cumulative = 0
+    for level in queued_levels[:depth]:
+        visible_quantity: int = level["visible_quantity"]
+        cumulative += visible_quantity
+        levels.append({
+            "price": level["price"],
+            "visible_quantity": visible_quantity,
+            "cumulative_visible_quantity": cumulative,
+            "order_count": len(level["orders"]),
+        })
+    return levels, cumulative
+
+
+def apply_book_liquidity_report(
+    session: object, ctx: _CommitContext, payload: dict[str, object]
+) -> _Applied:
+    """Answer a read-only depth-summary query for the current book.
+
+    The query only reads this security's resting queues: it never matches,
+    never replenishes an iceberg slice and never moves an order, a queue, a
+    plan, an account set, the trade journal, the next trade id or the
+    active price-limit interval. Only public queue quantities enter the
+    statistics — an iceberg's reserve stays hidden and its current visible
+    fragment counts as one resting order. A first-seen symbol answers
+    against its empty book successfully. The shared commit path occupies
+    the query id and advances the envelope symbol's sequence; the id lives
+    solely in the replay log, exactly like an IMPACT_REPORT id, and never
+    enters the engine journal.
+    """
+    depth: int = payload["depth"]
+    engine = ctx.state.engine
+    bid_queues, ask_queues = engine.book_queue_view()
+    bid_levels, bid_quantity = _liquidity_levels(bid_queues, depth)
+    ask_levels, ask_quantity = _liquidity_levels(ask_queues, depth)
+
+    best_bid: int | None = bid_queues[0]["price"] if bid_queues else None
+    best_ask: int | None = ask_queues[0]["price"] if ask_queues else None
+    if best_bid is None or best_ask is None:
+        # With one side empty there is no spread and no midpoint; the side
+        # that does exist still keeps its best price and capped levels.
+        spread = None
+        midpoint = None
+    else:
+        spread = best_ask - best_bid
+        midpoint = {"numerator": best_ask + best_bid, "denominator": 2}
+
+    imbalance_denominator = bid_quantity + ask_quantity
+    if imbalance_denominator == 0:
+        imbalance = None
+    else:
+        # The unreduced exact fraction over the returned levels' public
+        # quantities: bids minus asks over their sum.
+        imbalance = {
+            "numerator": bid_quantity - ask_quantity,
+            "denominator": imbalance_denominator,
+        }
+
+    analysis: dict[str, object] = {
+        "depth": depth,
+        "bid_levels": bid_levels,
+        "ask_levels": ask_levels,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": spread,
+        "midpoint": midpoint,
+        "imbalance": imbalance,
+    }
+    return _Applied(
+        ACCEPTED, result=REPORTED,
+        analysis_key="liquidity_analysis", analysis=analysis,
+    )

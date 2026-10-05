@@ -26,6 +26,7 @@ from .constants import (
     TWAP_START,
     VWAP_START,
     _BOOK_RECONSTRUCTION_REPORT_KEYS,
+    _BOOK_LIQUIDITY_REPORT_KEYS,
     _EXECUTION_REPORT_KEYS,
     _IMPACT_REPORT_KEYS,
     _PLAN_TCA_REPORT_KEYS,
@@ -468,6 +469,24 @@ def _book_reconstruction_schema_error(payload: dict[str, object]) -> str | None:
         return INVALID_EVENT
     target = payload.get("target_sequence")
     if not (_is_int(target) and target >= 0):
+        return INVALID_EVENT
+    return None
+
+
+def _book_liquidity_report_schema_error(payload: dict[str, object]) -> str | None:
+    """Structural validation of a BOOK_LIQUIDITY_REPORT query payload.
+
+    The query carries exactly ``event_id``, ``type`` and ``depth``;
+    ``depth`` is a positive integer that is not a boolean
+    (``True``/``False`` must not masquerade as ``1``). Any field problem —
+    a missing or extra field, a boolean, float, string, null, zero or
+    negative depth — is an ``INVALID_EVENT`` and consumes neither the
+    event id nor the sequence. The query itself never has a business
+    rejection: a first-seen symbol answers against its empty book.
+    """
+    if set(payload) != _BOOK_LIQUIDITY_REPORT_KEYS:
+        return INVALID_EVENT
+    if not _is_positive_int(payload.get("depth")):
         return INVALID_EVENT
     return None
 

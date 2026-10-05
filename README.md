@@ -185,7 +185,7 @@ IMPACT_REPORT：
 - `price_breakdown`：按模拟成交顺序排列的明细，每次消耗一个被动可见片段产生一项（粒度与真实成交一致），每项含 `price` 与 `quantity`；同一价位的不同 maker 分别成项，同一冰山的各次补片也按其再次排到队尾后的实际成交次序分别成项。
 - 无流动性时 `executable_quantity` 与 `executed_notional` 为 0、`unfilled_quantity` 等于请求量、`best_price` 与 `vwap` 为 `null`、两项成本均为 0、`price_breakdown` 为空数组；部分成交时两项成本只按实际可执行量计算。
 
-`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 只属于基线 JSON Lines（`replay`）入口；`events` 多证券事件流不接受这两种类型（按 `INVALID_EVENT` 拒绝且不占用 `event_id` 与序列），快照格式也不因其改变。`EXECUTION_REPORT` 与 `IMPACT_REPORT` 则两个入口都接受：多证券事件流中的语义分别见下文「单订单执行报告 EXECUTION_REPORT」与「盘口冲击估算 IMPACT_REPORT」两节。与之对称，跨证券的 `PORTFOLIO_REPORT`、按多价格情景重估账户持仓的 `PORTFOLIO_STRESS_REPORT`、一次核对全部证券的 `SESSION_RECONCILIATION`、按评估价补齐母单实施缺口的 `PLAN_TCA_REPORT` 与按已提交序列重建历史盘口队列的 `BOOK_RECONSTRUCTION_REPORT` 只属于多证券事件流（`events`/`replay_events`/`EventReplayer`），基线单证券 JSON Lines 入口不接受这些类型（按基线 `INVALID_SCHEMA` 拒绝）。
+`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 只属于基线 JSON Lines（`replay`）入口；`events` 多证券事件流不接受这两种类型（按 `INVALID_EVENT` 拒绝且不占用 `event_id` 与序列），快照格式也不因其改变。`EXECUTION_REPORT` 与 `IMPACT_REPORT` 则两个入口都接受：多证券事件流中的语义分别见下文「单订单执行报告 EXECUTION_REPORT」与「盘口冲击估算 IMPACT_REPORT」两节。与之对称，跨证券的 `PORTFOLIO_REPORT`、按多价格情景重估账户持仓的 `PORTFOLIO_STRESS_REPORT`、一次核对全部证券的 `SESSION_RECONCILIATION`、按评估价补齐母单实施缺口的 `PLAN_TCA_REPORT`、按已提交序列重建历史盘口队列的 `BOOK_RECONSTRUCTION_REPORT` 与汇总当前盘口公开深度的 `BOOK_LIQUIDITY_REPORT` 只属于多证券事件流（`events`/`replay_events`/`EventReplayer`），基线单证券 JSON Lines 入口不接受这些类型（按基线 `INVALID_SCHEMA` 拒绝）。
 
 ### 撮合规则
 
@@ -245,7 +245,7 @@ IMPACT_REPORT：
 
 ## 多证券有序事件回放
 
-在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT`，VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，POV 母单命令 `POV_START`、`POV_VOLUME`、`POV_CANCEL`、`POV_REPORT`，单订单只读查询 `EXECUTION_REPORT`，按某证券当前盘口估算匿名市价单可执行量与成本的只读查询 `IMPACT_REPORT`，跨证券只读查询 `PORTFOLIO_REPORT`，按多价格情景重估账户持仓的跨证券只读查询 `PORTFOLIO_STRESS_REPORT`，一次核对全部证券成交与账户账簿的只读查询 `SESSION_RECONCILIATION`，按指定评估价补齐母单实施缺口分析的只读查询 `PLAN_TCA_REPORT`，按已提交序列重建该证券历史盘口队列的只读查询 `BOOK_RECONSTRUCTION_REPORT`，以及盘中涨跌停调整 `PRICE_LIMIT_UPDATE`（不重新定义任何订单类型的撮合规则；`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟：TWAP/VWAP 只由各自的 SLICE 事件推进，POV 只由 `POV_VOLUME` 事件喂入的市场成交量推进。
+在不改变基线撮合规则、优先级、拒绝语义与成交记录的前提下，新增一个确定性的事件回放入口：调用方一次提交一个或多个证券的有序订单事件流，得到逐事件结果、最终盘口、成交明细和可继续回放的内存快照。事件覆盖基线已支持的 `ADD`、`CANCEL`、`REPLACE`，可恢复的 TWAP 母单命令 `TWAP_START`、`TWAP_SLICE`、`TWAP_CANCEL`、`TWAP_REPORT`，VWAP 母单命令 `VWAP_START`、`VWAP_SLICE`、`VWAP_CANCEL`、`VWAP_REPORT`，POV 母单命令 `POV_START`、`POV_VOLUME`、`POV_CANCEL`、`POV_REPORT`，单订单只读查询 `EXECUTION_REPORT`，按某证券当前盘口估算匿名市价单可执行量与成本的只读查询 `IMPACT_REPORT`，跨证券只读查询 `PORTFOLIO_REPORT`，按多价格情景重估账户持仓的跨证券只读查询 `PORTFOLIO_STRESS_REPORT`，一次核对全部证券成交与账户账簿的只读查询 `SESSION_RECONCILIATION`，按指定评估价补齐母单实施缺口分析的只读查询 `PLAN_TCA_REPORT`，按已提交序列重建该证券历史盘口队列的只读查询 `BOOK_RECONSTRUCTION_REPORT`，汇总该证券当前盘口公开深度的只读查询 `BOOK_LIQUIDITY_REPORT`，以及盘中涨跌停调整 `PRICE_LIMIT_UPDATE`（不重新定义任何订单类型的撮合规则；`ACCOUNT_REPORT`/`DAY_END_RECONCILIATION` 仍只属于基线 JSON Lines 入口）。计划不读取墙钟：TWAP/VWAP 只由各自的 SLICE 事件推进，POV 只由 `POV_VOLUME` 事件喂入的市场成交量推进。
 
 ### 命令行
 
@@ -291,6 +291,7 @@ response = replay_events(events, config=None, snapshot=None, snapshot_after="las
 - `reconciliation`：仅 `SESSION_RECONCILIATION` 的成功结果出现（`result` 为 `RECONCILED` 或 `BREAKS_FOUND` 时都附带），字段见下文「全会话对账 SESSION_RECONCILIATION」一节；其他结果不得包含该字段。
 - `plan_tca_analysis`：仅 `PLAN_TCA_REPORT` 的成功结果出现，字段见下文「母单实施缺口报告 PLAN_TCA_REPORT」一节；其他结果不得包含该字段。
 - `book_reconstruction`：仅 `BOOK_RECONSTRUCTION_REPORT` 的成功结果出现，字段见下文「历史盘口重建报告 BOOK_RECONSTRUCTION_REPORT」一节；其他结果不得包含该字段。
+- `liquidity_analysis`：仅 `BOOK_LIQUIDITY_REPORT` 的成功结果出现，字段见下文「盘口深度报告 BOOK_LIQUIDITY_REPORT」一节；其他结果不得包含该字段。
 - `active_price_limits`：仅 `PRICE_LIMIT_UPDATE` 的成功结果出现（`{"lower_price": ..., "upper_price": ...}`），回显替换后的活动区间；其他结果不得包含该字段。
 
 ### TWAP 母单
@@ -648,6 +649,33 @@ POV 计划完整状态（参与率、累计市场成交量、总量、每次正�
 
 单证券 JSON Lines 入口（`order-book-engine replay`）与 `Engine` 不接受该事件：`BOOK_RECONSTRUCTION_REPORT` 按基线 `INVALID_SCHEMA` 拒绝且不占用 `event_id`，既有事件与快照的兼容行为全部不变。
 
+### 盘口深度报告 BOOK_LIQUIDITY_REPORT
+
+`BOOK_LIQUIDITY_REPORT` 是属于多证券事件流的只读当前盘口查询：按信封 `symbol` 汇总该证券**查询时**公开盘口的前若干档深度，不撮合、不补充冰山片段，也不改变任何撮合状态。它沿用事件信封的 `event_id`、`symbol`、`sequence` 顺序与幂等语义：
+
+```json
+{"event_id": "e12", "symbol": "AAA", "sequence": 9, "type": "BOOK_LIQUIDITY_REPORT",
+ "depth": 5}
+```
+
+- 载荷只含 `event_id`、`type`、`depth`；`depth` 必须是**非布尔正整数**（布尔、浮点、字符串、空值、零、负数均非法）。字段缺失、多出或类型非法均按 `INVALID_EVENT` 拒绝，**不占用** `event_id` 且**不推进** `sequence`；支持内联与嵌套（`event` 对象必须重复相同 `event_id` 与 `type`）两种载荷形式。
+- 查询没有业务拒绝码：首次出现的证券按空盘口成功回答，并同时注册该证券、推进其序列；空盘口或请求档数多于实际档数都正常报告。
+- 查询只读取该证券的公开队列：不撮合、不补充冰山片段，不改变队列、订单、计划、账户、成交日志、成交编号及活动涨跌停区间。
+
+查询成功时 `status` 为 `ACCEPTED`、`result` 为 `REPORTED`；`trades` 与 `book_changes` 为空，外层 `bids`/`asks` 为该证券的未变盘口，并附加 `liquidity_analysis`：
+
+- `depth`：原样回显请求档数。
+- `bid_levels`：按价格**降序**的买方档位摘要；`ask_levels`：按价格**升序**的卖方档位摘要；两侧各自至多取 `depth` 档。
+- 每档含 `price`、该档公开量合计 `visible_quantity`、从最优档起逐档累加的 `cumulative_visible_quantity` 与该档公开订单数 `order_count`。统计只含公开队列：冰山储备不计入任何数量，其**当前可见片段**在所在档计为**一个**订单（普通限价单整单可见）。
+- `best_bid`/`best_ask`：两侧最优价；某一侧为空时该侧为 `null`。
+- `spread`：最优卖价减最优买价；任一侧为空时为 `null`。
+- `midpoint`：以 `{"numerator": best_ask + best_bid, "denominator": 2}` 表示的精确分数（不约分）；任一侧为空时为 `null`。
+- `imbalance`：按**返回档位**（应用 `depth` 截断后）的累计公开量计算，分子为买方公开量减卖方公开量、分母为两侧公开量之和，返回**未约分**的精确分数 `{"numerator": ..., "denominator": ...}`；分母为零（两侧返回量都为零）时为 `null`。
+
+信封、幂等与顺序规则优先适用：成功占用 `event_id` 并推进信封证券序列；其 id 只进入重放日志，不进入任何证券的引擎事件集合；相同 `event_id` 同内容的重试返回 `DUPLICATE`（不附带 `liquidity_analysis`，并回显当前盘口），同 id 不同内容或跨证券复用返回 `EVENT_ID_CONFLICT`，序列空洞/倒退仍为 `SEQUENCE_GAP`/`OUT_OF_ORDER`。查询的幂等记录进入现有快照（快照格式版本保持 `event-replay/2`）；恢复后回放与分段、连续回放产生逐字节一致的结果，其他事件及旧快照恢复行为不变。
+
+单证券 JSON Lines 入口（`order-book-engine replay`）与 `Engine` 不接受该事件：`BOOK_LIQUIDITY_REPORT` 按基线 `INVALID_SCHEMA` 拒绝且不占用 `event_id`，既有事件与快照的兼容行为全部不变。
+
 ### 提交语义与错误码
 
 - 逐事件提交：先前成功事件不会因后续失败回滚；失败事件不留下订单、成交、计数器或盘口变更。
@@ -663,6 +691,7 @@ POV 计划完整状态（参与率、累计市场成交量、总量、每次正�
 - 盘口冲击估算：`IMPACT_REPORT` 结构合法时总是成功，没有业务拒绝码——首次出现的证券按空盘口成功报告并注册该证券、推进序列；查询不触发自成交防护，也不受活动涨跌停阻断。只有结构错误才为 `INVALID_EVENT`（不占用 `event_id` 与序列）；其 id 只进入重放日志，不进入任何证券的引擎事件集合。
 - 母单实施缺口报告拒绝码：`UNKNOWN_EXECUTION_PLAN`（信封证券下无此 TWAP/VWAP/POV 计划，含只在其他证券存在的同名计划；`ACTIVE`/`COMPLETED`/`CANCELLED` 状态的计划均可查询）。同为结构合法后的业务拒绝，占用 `event_id`、推进信封证券序列并回显未变盘口；结构错误仍为 `INVALID_EVENT`，不占用 `event_id` 与序列。
 - 历史盘口重建报告拒绝码：`TARGET_SEQUENCE_NOT_FOUND`（正数 `target_sequence` 晚于查询前该证券最后已提交序列，含对未知证券查询正数）。同为结构合法后的业务拒绝，占用 `event_id`、推进信封证券序列且盘口状态不变（与其他业务拒绝一样注册该证券，其簿保持为空）；目标 `0` 总是成功（未知证券返回空盘口与会话初始涨跌停区间）；结构错误（布尔、负数、字段缺失/多出等）仍为 `INVALID_EVENT`，不占用 `event_id` 与序列。
+- 盘口深度报告：`BOOK_LIQUIDITY_REPORT` 结构合法时总是成功，没有业务拒绝码——首次出现的证券按空盘口成功报告并注册该证券、推进序列；查询不撮合、不补充冰山片段，也不改变任何撮合状态。只有结构错误（`depth` 为布尔、零、负数、浮点、字符串、空值或字段缺失/多出等）才为 `INVALID_EVENT`（不占用 `event_id` 与序列）；其 id 只进入重放日志，不进入任何证券的引擎事件集合。
 - 相同初始状态、配置和事件流产生字段顺序稳定、数值表示一致、可逐字节比较的 JSON（规范化序列化：键排序、紧凑分隔、整数不丢精度、无浮点）。
 - 静态涨跌停越界码：`PRICE_LIMIT_EXCEEDED`，见下文「静态涨跌停 `price_limits`」一节。
 

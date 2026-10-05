@@ -68,7 +68,8 @@ def replay_events(
         PORTFOLIO_STRESS_REPORT query, the read-only whole-session
         SESSION_RECONCILIATION query, the read-only per-plan
         PLAN_TCA_REPORT query, the read-only historical
-        BOOK_RECONSTRUCTION_REPORT query and the intraday PRICE_LIMIT_UPDATE
+        BOOK_RECONSTRUCTION_REPORT query, the read-only current-book
+        BOOK_LIQUIDITY_REPORT depth query and the intraday PRICE_LIMIT_UPDATE
         adjustment.
     config:
         Matching configuration summary. Defaults to :data:`DEFAULT_CONFIG`;
